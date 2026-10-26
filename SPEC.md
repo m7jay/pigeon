@@ -296,8 +296,10 @@ worse one.
   maintained independently is how FR-1203's state predicate ("has accumulated 3 within
   the hour") and the set's membership drift apart. The 3-attempt floor is what keeps a
   single bad event - one terminal `4xx`, one timeout - from counting a subscription as
-  failing, and the floor is why a breadth member may hold anywhere from 3 to 9 failures
-  in its window (the tenth pauses the subscription itself).
+  failing. A member's window therefore holds 3 or more failures: 3 to 9 while the
+  subscription is unpaused, and 10 or more once the tenth has paused it and the hour has
+  not yet trimmed the window - which is why FR-1203's breadth count includes paused
+  subscriptions, and why AC-44's second run trips only because it does.
 - **Breadth threshold.** The endpoint pauses when `pause:subs:{endpoint_id}` reaches
   `N = min(active, max(3, ceil(active/4)))`, where `active` is the number of unpaused
   subscriptions on the endpoint (and `active ≥ 2`). Ten subscriptions give 3, two give
@@ -655,8 +657,9 @@ with subscription count. It does - `N = min(active, max(3, ceil(active/4)))` in 
 directions: below ten subscriptions it cannot fire at all, since a paused subscription
 stops producing failures and caps an endpoint at ten failed attempts per subscription;
 and above ten it fires only after ten subscriptions have each exhausted their own 10
-failures, so the ten mails it was meant to replace have already gone out and all it
-still suppresses is the subscriptions that fail afterwards. One thing it still does
+failures, so the ten mails it was meant to replace have already gone out and the only
+mail it still suppresses is the notifications of subscriptions that fail afterwards.
+One thing it still does
 not decide, stated so it is not mistaken for decided: whether consumer users get a
 long-lived API token (A-5 defers it; the schema does not need to change if they do).
 
