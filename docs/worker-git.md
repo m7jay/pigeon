@@ -144,8 +144,15 @@ pass.
 GH=/opt/data/toolchain/gh
 $GH run list --repo m7jay/pigeon --branch wt/<card-id>-<slug> -L 5 \
     --json databaseId,headSha,status,conclusion
-$GH run view <run-id> --repo m7jay/pigeon --log | grep -E '^(ok|FAIL|---)'   # e.g. "ok  github.com/m7jay/pigeon/internal/store"
+$GH run view <run-id> --repo m7jay/pigeon --log \
+  | sed -E 's/^[^\t]+\t[^\t]+\t[^ ]+ //' \
+  | grep -E '^(ok|FAIL|---)'    # e.g. "ok  github.com/m7jay/pigeon/internal/store"
 ```
+
+`gh run view --log` prefixes every line with `<job>\t<step>\t<timestamp>Z `, so the
+`sed` strips that before the anchored `grep` - without it both pass and fail output are
+empty, which reads as "nothing to see". Expect one `--- PASS:`/`ok ` line per test and
+`--- FAIL:` on a red run.
 
 The `headSha` must be the commit you pushed — a green run for an earlier commit is not
 your gate, and the reviewer will check exactly that (§7 step 3).
@@ -217,7 +224,7 @@ relying on.
    ```bash
    GH=/opt/data/toolchain/gh
    $GH pr view <n> --repo m7jay/pigeon \
-       --json headRefOid,mergeable,mergeStateStatus,isDraft,title,body
+       --json headRefOid,headRefName,mergeable,mergeStateStatus,isDraft,title,body
    ```
 
 2. A defect pass over auth, tenant isolation, SQL and tests, reported as
