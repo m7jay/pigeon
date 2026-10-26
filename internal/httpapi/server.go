@@ -68,6 +68,7 @@ type Data interface {
 	// transaction so an accept can never outrun a publish intent.
 	CreateEventType(ctx context.Context, sc store.Scope, in store.NewEventType) (store.EventType, error)
 	ListEventTypes(ctx context.Context, sc store.Scope) ([]store.EventType, error)
+	PatchEventType(ctx context.Context, sc store.Scope, name string, p store.EventTypePatch) (store.EventType, error)
 	PublishEvent(ctx context.Context, sc store.Scope, in store.PublishInput) (store.PublishedEvent, error)
 }
 

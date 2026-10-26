@@ -91,6 +91,7 @@ jobs:
             TestRelayKillMidFlightRepublishes \
             TestRelayStoppedEventIsNotLost \
             TestRelayPublishesThenMarks \
+            TestPatchEventTypeLifecycle \
             TestInstanceAdminCreatesProducersAndIsAudited \
             TestSuspensionStopsIngestionAndIsReversible \
             TestMembershipSpansProducersAndRolesAreEnforced \

@@ -169,7 +169,8 @@ func toEventTypeJSON(et store.EventType) eventTypeJSON {
 }
 
 // handleCreateEventType is POST /v1/event-types. The name is immutable after this
-// (FR-302); there is no update-name path, only a later version/disable (S2b).
+// (FR-302); there is no update-name path - only version bump and disable, both
+// PATCH /v1/event-types/{name} (FR-304, FR-305).
 func (s *Server) handleCreateEventType(w http.ResponseWriter, r *http.Request) {
 	p, ok := principalFrom(r.Context())
 	if !ok {
@@ -208,4 +209,38 @@ func (s *Server) handleListEventTypes(w http.ResponseWriter, r *http.Request) {
 		out[i] = toEventTypeJSON(et)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// patchEventTypeRequest is the PATCH /v1/event-types/{name} body. An omitted (nil)
+// field is left unchanged; both are optional so {"enabled": false} and
+// {"payload_version": 2} are each valid single-field patches.
+type patchEventTypeRequest struct {
+	Enabled        *bool `json:"enabled"`
+	PayloadVersion *int  `json:"payload_version"`
+}
+
+// handlePatchEventType is PATCH /v1/event-types/{name}: disable/enable (FR-305)
+// and version bump (FR-304) on one type in the caller's environment. Name,
+// producer, env, routing_mode and event_class are immutable and cannot be named
+// here. An unknown name in the caller's environment is a 404, never a 403
+// (FR-108 + FR-103).
+func (s *Server) handlePatchEventType(w http.ResponseWriter, r *http.Request) {
+	p, ok := principalFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "no producer credential on request")
+		return
+	}
+	var in patchEventTypeRequest
+	if !s.decodeJSON(w, r, &in) {
+		return
+	}
+	et, err := s.deps.Data.PatchEventType(r.Context(), p.Scope(), r.PathValue("name"), store.EventTypePatch{
+		Enabled:        in.Enabled,
+		PayloadVersion: in.PayloadVersion,
+	})
+	if err != nil {
+		s.storeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toEventTypeJSON(et))
 }

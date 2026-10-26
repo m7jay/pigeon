@@ -108,8 +108,20 @@ func (s *Store) CreateProducer(ctx context.Context, actor Actor, in NewProducer)
 			inv.ID, p.ID, inv.Email, hashToken(token), actor.UserID, expires); err != nil {
 			return mapPgError(err, ErrConflict, ErrNotFound)
 		}
-		return insertAudit(ctx, tx, actor, ActionProducerCreated, p.ID,
-			"created via instance-admin API; first owner invited")
+		if err := insertAudit(ctx, tx, actor, ActionProducerCreated, p.ID,
+			"created via instance-admin API; first owner invited"); err != nil {
+			return err
+		}
+		// FR-306: three example event types in each environment, so the producer
+		// has a working contract to publish against from its first login. Seeded in
+		// the same transaction as the producer, so a producer never exists without
+		// its examples.
+		for _, env := range []string{"test", "live"} {
+			if err := seedExampleEventTypes(ctx, tx, p.ID, env); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return Producer{}, Invite{}, err

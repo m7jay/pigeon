@@ -212,3 +212,121 @@ func (s *Store) ListEventTypes(ctx context.Context, sc Scope) ([]EventType, erro
 	}
 	return out, nil
 }
+
+// EventTypePatch is a PATCH to an event type. A nil field is left unchanged, so
+// a body of {} is a no-op and a body of {"enabled": false} disables the type.
+// FR-305 is disable-without-deleting-history: the row and every event published
+// against it stay, only the enabled flag flips. A disabled type is refused at
+// publish (the ingest query checks it, and TestPublishDisabledTypeIsInvalid
+// pins that), so toggling enabled is the whole disable/enable contract; FR-304
+// is the independent version bump on the same row.
+type EventTypePatch struct {
+	Enabled        *bool
+	PayloadVersion *int
+}
+
+// PatchEventType applies an EventTypePatch to one type in the caller's scope and
+// returns the updated row. An unknown name, or one the caller's environment does
+// not own, is ErrNotFound (FR-108 + FR-103). It never changes name, producer,
+// env, routing_mode or event_class - those are immutable at creation.
+func (s *Store) PatchEventType(ctx context.Context, sc Scope, name string, p EventTypePatch) (EventType, error) {
+	const selectCols = `name, producer_id, env, routing_mode, event_class, payload_schema,
+		payload_version, enabled, examples, created_at`
+	var et EventType
+	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
+		scan := func(row pgx.Row) error {
+			return row.Scan(&et.Name, &et.ProducerID, &et.Env, &et.RoutingMode, &et.EventClass,
+				&et.PayloadSchema, &et.PayloadVersion, &et.Enabled, &et.Examples, &et.CreatedAt)
+		}
+		if err := scan(tx.QueryRow(ctx,
+			`select `+selectCols+` from event_types where producer_id = $1 and env = $2 and name = $3`,
+			sc.ProducerID, sc.Env, name)); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			return mapPgError(err, ErrConflict, ErrNotFound)
+		}
+
+		var sets []string
+		var args []any
+		if p.Enabled != nil {
+			sets = append(sets, fmt.Sprintf("enabled = $%d", len(sets)+1))
+			args = append(args, *p.Enabled)
+		}
+		if p.PayloadVersion != nil {
+			sets = append(sets, fmt.Sprintf("payload_version = $%d", len(sets)+1))
+			args = append(args, *p.PayloadVersion)
+		}
+		if len(sets) > 0 {
+			args = append(args, sc.ProducerID, sc.Env, name)
+			q := fmt.Sprintf(`update event_types set %s where producer_id = $%d and env = $%d and name = $%d`,
+				strings.Join(sets, ", "), len(args)-2, len(args)-1, len(args))
+			if _, err := tx.Exec(ctx, q, args...); err != nil {
+				return mapPgError(err, ErrConflict, ErrNotFound)
+			}
+		}
+		// Re-read so the returned row reflects the write, including the version the
+		// caller bumped to.
+		if err := scan(tx.QueryRow(ctx,
+			`select `+selectCols+` from event_types where producer_id = $1 and env = $2 and name = $3`,
+			sc.ProducerID, sc.Env, name)); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return EventType{}, err
+	}
+	return et, nil
+}
+
+// exampleEventType is one of the three example contracts seeded per producer
+// (FR-306). A producer gets all three in both environments so its dashboard has
+// a working contract to publish against in test and live from the first login.
+type exampleEventType struct {
+	name    string
+	schema  json.RawMessage
+	example json.RawMessage
+}
+
+// exampleEventTypes is the seeded set (FR-306). Names are deliberately distinct
+// from the market's generic "user.created" so they read as a coherent product
+// story (order → refund) rather than a placeholder.
+var exampleEventTypes = []exampleEventType{
+	{
+		name:    "order.shipped",
+		schema:  json.RawMessage(`{"type":"object","required":["order_id","tracking_number"],"properties":{"order_id":{"type":"string"},"tracking_number":{"type":"string"}}}`),
+		example: json.RawMessage(`{"order_id":"ord_01HXAQ2","tracking_number":"1Z999AA10123456784"}`),
+	},
+	{
+		name:    "order.refunded",
+		schema:  json.RawMessage(`{"type":"object","required":["order_id","amount"],"properties":{"order_id":{"type":"string"},"amount":{"type":"integer"}}}`),
+		example: json.RawMessage(`{"order_id":"ord_01HXAQ2","amount":49900}`),
+	},
+	{
+		name:    "refund.processed",
+		schema:  json.RawMessage(`{"type":"object","required":["refund_id","amount"],"properties":{"refund_id":{"type":"string"},"amount":{"type":"integer"}}}`),
+		example: json.RawMessage(`{"refund_id":"ref_7F3091","amount":49900}`),
+	},
+}
+
+// seedExampleEventTypes writes the three FR-306 example types for one environment.
+// It runs inside the producer-creation transaction, after the producer row and
+// its scope are set, so a producer and its examples commit or fail together. The
+// caller must have set the producer scope on the transaction; this sets the env
+// for the duration of the insert.
+func seedExampleEventTypes(ctx context.Context, tx pgx.Tx, producerID, env string) error {
+	if _, err := tx.Exec(ctx, `select set_config('pigeon.env', $1, true)`, env); err != nil {
+		return err
+	}
+	for _, ex := range exampleEventTypes {
+		if _, err := tx.Exec(ctx, `
+			insert into event_types
+				(id, producer_id, env, name, routing_mode, event_class, payload_schema, payload_version, examples)
+			values ($1, $2, $3, $4, 'broadcast', 'normal', $5, 1, $6)`,
+			id.New("et"), producerID, env, ex.name, ex.schema, []json.RawMessage{ex.example}); err != nil {
+			return fmt.Errorf("seed example event type %s: %w", ex.name, err)
+		}
+	}
+	return nil
+}

@@ -91,10 +91,13 @@ func (s *Server) routes() []route {
 		{http.MethodGet, "/v1/whoami", kindProducerKey, s.handleWhoami},
 
 		// Event types and ingest (§11). A producer registers the contracts it may
-		// publish (FR-301..FR-306), then publishes events against them; each accept
-		// writes the event and its outbox row in one transaction (FR-604).
+		// publish (FR-301..FR-306): POST/GET create and list them, PATCH bumps
+		// version or disables (FR-304, FR-305). Then it publishes events against
+		// those contracts; each accept writes the event and its outbox row in one
+		// transaction (FR-604).
 		{http.MethodPost, "/v1/event-types", kindProducerKey, s.handleCreateEventType},
 		{http.MethodGet, "/v1/event-types", kindProducerKey, s.handleListEventTypes},
+		{http.MethodPatch, "/v1/event-types/{name}", kindProducerKey, s.handlePatchEventType},
 		{http.MethodPost, "/v1/events", kindProducerKey, s.handlePublish},
 
 		// Instance administration (FR-102, FR-107, MT-5).

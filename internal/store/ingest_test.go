@@ -154,6 +154,59 @@ func TestPublishDisabledTypeIsInvalid(t *testing.T) {
 	}
 }
 
+// ptr is a small generic for the optional PATCH fields.
+func ptr[T any](v T) *T { return &v }
+
+// TestPatchEventType is FR-304/FR-305 at the store layer: PATCH flips enabled
+// (and a disabled type is then refused at publish), bumps the version, preserves
+// an omitted field, and returns ErrNotFound for a name the scope does not own -
+// including the other environment, where the same name does not exist.
+func TestPatchEventType(t *testing.T) {
+	admin := testPool(t)
+	st := newAppStore(t, admin)
+	ctx := context.Background()
+	pid, _ := seedProducer(t, admin, "et-patch")
+	live := Scope{ProducerID: pid, Env: "live"}
+	test := Scope{ProducerID: pid, Env: "test"}
+
+	if _, err := st.CreateEventType(ctx, live, NewEventType{Name: "billing.invoice", PayloadSchema: json.RawMessage(`{"type":"object"}`)}); err != nil {
+		t.Fatalf("CreateEventType: %v", err)
+	}
+
+	// Disable, then a disabled type is refused at publish (FR-305).
+	disabled, err := st.PatchEventType(ctx, live, "billing.invoice", EventTypePatch{Enabled: ptr(false)})
+	if err != nil {
+		t.Fatalf("PatchEventType disable: %v", err)
+	}
+	if disabled.Enabled {
+		t.Fatalf("disabled type %+v still enabled", disabled)
+	}
+	if _, err := st.PublishEvent(ctx, live, PublishInput{EventType: "billing.invoice", Payload: json.RawMessage(`{}`)}); err == nil || !isInvalid(err) {
+		t.Fatalf("publish to a disabled type err = %v, want ErrInvalid", err)
+	}
+
+	// Version bump, and the omitted enabled field is preserved (still false, not
+	// reset to true by a patch that only names payload_version).
+	bumped, err := st.PatchEventType(ctx, live, "billing.invoice", EventTypePatch{PayloadVersion: ptr(2)})
+	if err != nil {
+		t.Fatalf("PatchEventType bump: %v", err)
+	}
+	if bumped.PayloadVersion != 2 || bumped.Enabled {
+		t.Fatalf("bumped type %+v, want v2 with enabled preserved (still false)", bumped)
+	}
+
+	// An unknown name in the caller's scope is ErrNotFound, never a write.
+	if _, err := st.PatchEventType(ctx, live, "ghost.happened", EventTypePatch{Enabled: ptr(false)}); err != ErrNotFound {
+		t.Fatalf("patch unknown err = %v, want ErrNotFound", err)
+	}
+
+	// Event types are scoped by environment: the same name in the other
+	// environment is a different (absent) resource, also ErrNotFound.
+	if _, err := st.PatchEventType(ctx, test, "billing.invoice", EventTypePatch{Enabled: ptr(false)}); err != ErrNotFound {
+		t.Fatalf("patch in the wrong env err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestPublishBroadcastWithConsumerKeyIsInvalid(t *testing.T) {
 	admin := testPool(t)
 	st := newAppStore(t, admin)
