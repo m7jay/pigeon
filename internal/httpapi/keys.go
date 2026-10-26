@@ -31,16 +31,28 @@ func newKeyJSON(k store.KeyMeta) keyJSON {
 	}
 }
 
-// handleIssueKey is FR-201..FR-204. The key is minted for the environment in
-// ?env=, so a test-plane session cannot accidentally hand out a live credential,
-// and rotation stays additive: existing keys are untouched.
+// issueKeyRequest is FR-208's optional scope. The body is optional so that the
+// common "just mint me a key" call keeps working without one.
+type issueKeyRequest struct {
+	ReplayScope bool `json:"replay_scope"`
+}
+
+// handleIssueKey is FR-201..FR-204 plus FR-208. The key is minted for the
+// environment in ?env=, so a test-plane session cannot accidentally hand out a
+// live credential, and rotation stays additive: existing keys are untouched.
 func (s *Server) handleIssueKey(w http.ResponseWriter, r *http.Request) {
 	sc, err := s.memberScope(r)
 	if err != nil {
 		s.scopeError(w, r, err)
 		return
 	}
-	issued, err := s.deps.Data.IssueKey(r.Context(), sc, actorFrom(r))
+	var req issueKeyRequest
+	if r.ContentLength != 0 {
+		if !s.decodeJSON(w, r, &req) {
+			return
+		}
+	}
+	issued, err := s.deps.Data.IssueKey(r.Context(), sc, actorFrom(r), req.ReplayScope)
 	if err != nil {
 		s.storeError(w, r, err)
 		return
