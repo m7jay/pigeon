@@ -16,11 +16,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/m7jay/pigeon/internal/broker"
 	"github.com/m7jay/pigeon/internal/config"
 	"github.com/m7jay/pigeon/internal/db"
 	"github.com/m7jay/pigeon/internal/httpapi"
 	"github.com/m7jay/pigeon/internal/identity"
 	"github.com/m7jay/pigeon/internal/ratelimit"
+	"github.com/m7jay/pigeon/internal/relay"
 	"github.com/m7jay/pigeon/internal/store"
 )
 
@@ -128,6 +130,28 @@ func run() error {
 		Addr:              cfg.HTTPAddr,
 		Handler:           api.AccessLog(api.Handler()),
 		ReadHeaderTimeout: cfg.ReadHeaderLimit,
+	}
+
+	// S2: the outbox relay. It runs only when a broker is configured; without one
+	// there is nothing to publish to and the API serves the ingest path alone.
+	// It lists on Postgres for the fast path and polls as the durable fallback
+	// (D-4), leases rows with SKIP LOCKED (FR-702), and marks a row published only
+	// after the broker acks (FR-701) - so the durability contract holds even when
+	// the relay is killed mid-delivery.
+	if cfg.RedisURL != "" {
+		br, err := broker.NewRedis(ctx, cfg.RedisURL)
+		if err != nil {
+			return fmt.Errorf("connect broker: %w", err)
+		}
+		defer br.Close()
+		w := relay.New(st, br, relay.Options{Logger: log})
+		w.SetNotifier(relay.Notifier(ctx, cfg.DatabaseURL))
+		go func() {
+			log.Info("relay started", "broker", "redis-streams")
+			if err := w.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("relay stopped unexpectedly", "error", err)
+			}
+		}()
 	}
 
 	errCh := make(chan error, 1)

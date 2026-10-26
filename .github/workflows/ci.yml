@@ -88,6 +88,9 @@ jobs:
             TestCrossProducerRequestsAreNotFound \
             TestCrossProducerSuiteCoversEveryRoute \
             TestEveryNonAnonymousRouteRejectsAnUnauthenticatedCall \
+            TestRelayKillMidFlightRepublishes \
+            TestRelayStoppedEventIsNotLost \
+            TestRelayPublishesThenMarks \
             TestInstanceAdminCreatesProducersAndIsAudited \
             TestSuspensionStopsIngestionAndIsReversible \
             TestMembershipSpansProducersAndRolesAreEnforced \
