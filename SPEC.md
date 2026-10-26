@@ -454,13 +454,17 @@ table `delivery_dedupe` copied out of each partition as the sweeper drops it (14
   "was this a duplicate for this endpoint?" is an index-only scan on an exact key.
 - The archive is filled by the sweeper (single leaseholder, D-7), which copies the
   partition's `(endpoint_id, event_id, id, created_at)` into it **before** dropping
-  that partition, `ON CONFLICT DO NOTHING`, in the same loop iteration as the drop.
+  that partition, `ON CONFLICT DO NOTHING`, in the same transaction as the drop - the
+  copy commits first, so there is no instant at which neither the `deliveries` row nor
+  the archive answers a key, and an age-driven drop therefore loses no answer at all.
   A failed copy aborts that drop. SB-3 disk pressure is the one thing that overrides
   this, in two ways, both of which lose support answers and neither of which loses a
-  delivery: a `deliveries` partition dropped before its copy ran leaves that
-  partition's tail unarchived, and a `delivery_dedupe` partition dropped ahead of its
-  retention removes the archive's oldest days whole. Both are logged at warn naming the
-  partition and the days it covered (FR-903, FR-905).
+  delivery: a `deliveries` partition dropped before its copy ran loses every key it
+  held - and because SB-3 drops on pressure *before* age, such a partition can still be
+  inside its first 14 days, so the loss is not only the 14 to 30 d portion; and a
+  `delivery_dedupe` partition dropped ahead of its retention removes the archive's
+  oldest days whole. Both are logged at warn naming the partition and the days it
+  covered (FR-903, FR-905).
 - `delivery_dedupe` is itself range-partitioned by day and dropped by partition at
   `dedupe_retention` (default 30 d), so SB-2 holds here too and there is no `DELETE`
   and no vacuum pressure. Under disk pressure these partitions are dropped *before*
@@ -472,8 +476,10 @@ table `delivery_dedupe` copied out of each partition as the sweeper drops it (14
   unique index, whose coverage is exactly as long as an outbox row can exist, which
   is the only window in which a re-fan-out is possible.
 
-**Trade-off.** Two mechanisms and a union view instead of one insert, and the archive
-lags a partition by at most one sweeper cycle. In exchange the hot path pays nothing:
+**Trade-off.** Two mechanisms and a union view instead of one insert, and the archive is
+a copy taken at the drop rather than a live second copy - a day's pairs enter it when
+its partition is dropped, not when they are written, so nothing answers from it until
+then. In exchange the hot path pays nothing:
 an inline row per delivery would add 10,000 control writes per second to the
 reference load, doubling the write amplification §8.1 spends its whole argument
 minimising - and that is what a Redis `SETNX` would have done to Redis, plus it would
