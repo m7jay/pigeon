@@ -225,4 +225,4 @@ Run on the build host when this doc landed:
 | throwaway branch `wt/t_8b5d4ad0-throwaway`, pushed with no `GH_TOKEN` and no `gh` on `PATH` | pushed, then deleted (local and remote) |
 | throwaway PR from that branch, same scrubbed environment | opened (#2), then closed with `--delete-branch` |
 | `gh api .../check-runs` | `403 Resource not accessible by personal access token` (expected) |
-| `git grep -I -l github_pat_` / `git log -p --all \| grep -c github_pat_` | clean / `0` |
+| token-prefix scan over the tree **and** the full history (`git grep -I -l <prefix>`, `git log -p --all \| grep -c <prefix>`) | clean / `0` |
