@@ -34,7 +34,13 @@ type IssuedKey struct {
 // IssueKey mints a key for the caller's environment (FR-203: one producer, one
 // environment). Rotation without downtime (FR-204) falls out of this being
 // additive: nothing here touches the producer's existing keys.
-func (s *Store) IssueKey(ctx context.Context, sc Scope, actor Actor) (IssuedKey, error) {
+//
+// replayScope is FR-208's optional scope: a publish-only credential, separate from
+// an administrative one. It is stored at issuance and reported on every read, and
+// it reaches the request as Principal.ReplayOnly. The route that enforces it (the
+// publish path) arrives with S2; until then the scope is a property of the
+// credential rather than a rule, which is stated in SPEC.md rather than implied.
+func (s *Store) IssueKey(ctx context.Context, sc Scope, actor Actor, replayScope bool) (IssuedKey, error) {
 	k, err := apikey.Generate(sc.Env)
 	if err != nil {
 		return IssuedKey{}, fmt.Errorf("%w: %s", ErrInvalid, err.Error())
@@ -44,11 +50,12 @@ func (s *Store) IssueKey(ctx context.Context, sc Scope, actor Actor) (IssuedKey,
 	err = s.scoped(ctx, sc, func(tx pgx.Tx) error {
 		out.ID = id.New("key")
 		out.Env, out.Hint, out.Plaintext = k.Env, k.Hint, k.Plaintext
+		out.ReplayScope = replayScope
 		err := tx.QueryRow(ctx, `
-			insert into api_keys (id, producer_id, env, key_hash, display_hint)
-			values ($1, $2, $3, $4, $5)
+			insert into api_keys (id, producer_id, env, key_hash, display_hint, replay_scope)
+			values ($1, $2, $3, $4, $5, $6)
 			returning created_at`,
-			out.ID, sc.ProducerID, sc.Env, k.Hash, k.Hint,
+			out.ID, sc.ProducerID, sc.Env, k.Hash, k.Hint, replayScope,
 		).Scan(&out.CreatedAt)
 		return mapPgError(err, ErrConflict, ErrNotFound)
 	})
