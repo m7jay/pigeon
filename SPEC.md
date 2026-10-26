@@ -289,10 +289,15 @@ worse one.
   `pause:subs:{endpoint_id}`, one member per *subscription* scored by its latest
   failure, trimmed to the hour, so `ZCARD` is the breadth count and a subscription
   that fails fifty times still costs one member.
-- A subscription joins `pause:subs:{endpoint_id}` when its own window first reaches
-  3 failed attempts, and leaves it when the hour trims it out or it is resumed. The
-  3-attempt floor is what keeps a single bad event - one terminal `4xx`, one timeout -
-  from counting a subscription as failing.
+- A subscription is in `pause:subs:{endpoint_id}` exactly while its own attempt window
+  holds 3 or more failures. The set is a projection of those windows, not a separate
+  state machine: a subscription is added when its window reaches 3, and removed when
+  the hour trims it below 3 or when a resume clears the window. Writing it as a set
+  maintained independently is how FR-1203's state predicate ("has accumulated 3 within
+  the hour") and the set's membership drift apart. The 3-attempt floor is what keeps a
+  single bad event - one terminal `4xx`, one timeout - from counting a subscription as
+  failing, and the floor is why a breadth member may hold anywhere from 3 to 9 failures
+  in its window (the tenth pauses the subscription itself).
 - **Breadth threshold.** The endpoint pauses when `pause:subs:{endpoint_id}` reaches
   `N = min(active, max(3, ceil(active/4)))`, where `active` is the number of unpaused
   subscriptions on the endpoint (and `active ≥ 2`). Ten subscriptions give 3, two give
@@ -315,10 +320,19 @@ worse one.
   they tripped for their own reason or they did not - so resuming an endpoint is one
   flag clear that restores every subscription which had not tripped its own threshold,
   and leaves those that did paused, with the email that said which.
-- Resume clears the flag and deletes that key's windows: the subscription's own set
-  and its membership in `pause:subs:{endpoint_id}`. Without the delete the failures
-  are still inside the hour and the next one re-pauses immediately, which would make
-  AC-14's "resume works" false.
+- Resume clears the flag and that key's counter state in one action, and the branch
+  matters. Resuming a *subscription* deletes its own window and its membership in
+  `pause:subs:{endpoint_id}`. Resuming an *endpoint* deletes the breadth set **and the
+  attempt window of every subscription that was in it**, so each former member
+  re-qualifies only after accumulating 3 fresh failures; subscriptions that were not
+  members are untouched. Clearing the set alone would leave those windows at or above
+  the 3-attempt floor, FR-1203's predicate would still hold, and the endpoint would
+  re-pause after one further failure per subscription - exactly the recurrence FR-1211
+  says resume prevents. The cost is that an endpoint resume also forgives up to 9 depth
+  failures per former member, which is what an operator pressing "resume" is asking
+  for: a clean hour for the receivers that were being hammered. Without any delete the
+  failures are still inside the hour and the next one re-pauses immediately, which
+  would make AC-14's "resume works" false.
 - Redis loss is safe in exactly one direction: the counters vanish, so a pause can be
   delayed by up to an hour but can never be invented, and the pause flags survive, so
   AC-10's `FLUSHALL` cannot silently unpause a dead endpoint and resume the hammering
