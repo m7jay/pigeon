@@ -12,9 +12,11 @@ test:
 
 # AC-20's harness: needs a disposable Postgres. The tests skip without it, so
 # `make test` stays green on a laptop and CI fails loudly if the DB is missing.
+#
+# -p 1 because the integration packages share one database.
 test-integration:
 	@test -n "$$PIGEON_TEST_DATABASE_URL" || (echo "set PIGEON_TEST_DATABASE_URL" && exit 1)
-	go test -count=1 ./...
+	go test -count=1 -p 1 ./...
 
 vet:
 	go vet ./...

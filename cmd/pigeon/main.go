@@ -15,12 +15,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/m7jay/pigeon/internal/config"
 	"github.com/m7jay/pigeon/internal/db"
 	"github.com/m7jay/pigeon/internal/httpapi"
 	"github.com/m7jay/pigeon/internal/identity"
+	"github.com/m7jay/pigeon/internal/ratelimit"
 	"github.com/m7jay/pigeon/internal/store"
 )
 
@@ -65,6 +65,19 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// OPS-8: the budget is arithmetic, and it is checked against the server's real
+	// max_connections rather than a documented default. Ten replicas with a
+	// ten-connection pool each will take Postgres down in a way no single replica
+	// can see.
+	var serverMaxConns int32
+	if err := pool.QueryRow(ctx, `select current_setting('max_connections')::int`).Scan(&serverMaxConns); err != nil {
+		return fmt.Errorf("read max_connections: %w", err)
+	}
+	if err := cfg.ValidateBudget(serverMaxConns); err != nil {
+		return err
+	}
+	st := store.New(pool)
+
 	if cfg.MigrationsOn {
 		if err := db.Migrate(ctx, pool, cfg.MigrateWaitDL); err != nil {
 			return fmt.Errorf("migrate: %w", err)
@@ -82,23 +95,21 @@ func run() error {
 
 	api := httpapi.New(httpapi.Deps{
 		Lookup: func(ctx context.Context, plaintext string) (store.Principal, error) {
-			p, err := store.LookupAPIKey(ctx, pool, plaintext)
-			if err != nil {
-				return p, err
-			}
-			// FR-206: last_used_at is evidence, not control state, so it must
-			// never delay or fail the request that carries it.
-			go func() {
-				touchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-				defer cancel()
-				if err := store.TouchKey(touchCtx, pool, p.KeyID); err != nil {
-					log.Debug("touch api key", "error", err)
-				}
-			}()
-			return p, nil
+			return store.LookupAPIKey(ctx, pool, plaintext)
 		},
-		Ready:   func(ctx context.Context) error { return pool.Ping(ctx) },
-		Version: version,
+		Sessions: func(ctx context.Context, token string) (store.Session, error) {
+			return st.LookupSession(ctx, token)
+		},
+		Data: st,
+		// FR-206: last_used_at is an evidence write and runs off the request path,
+		// inside the middleware that authenticated the key.
+		TouchKey:         st.TouchKey,
+		Ready:            func(ctx context.Context) error { return pool.Ping(ctx) },
+		Version:          version,
+		SessionTTL:       cfg.SessionTTL,
+		KeyLimiter:       ratelimit.New(cfg.RateLimitPerKeyRPS, cfg.RateLimitPerKeyBurst),
+		ProducerLimiter:  ratelimit.New(cfg.RateLimitPerProducerRPS, cfg.RateLimitPerProducerBurst),
+		SelfRegistration: cfg.SelfRegistration,
 	}, log)
 
 	httpServer := &http.Server{
