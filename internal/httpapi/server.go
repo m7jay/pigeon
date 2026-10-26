@@ -10,11 +10,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/m7jay/pigeon/internal/metrics"
 	"github.com/m7jay/pigeon/internal/ratelimit"
 	"github.com/m7jay/pigeon/internal/store"
 )
@@ -54,6 +57,16 @@ type Data interface {
 	ListConsumers(ctx context.Context, sc store.Scope) ([]store.Consumer, error)
 	CreateConsumer(ctx context.Context, sc store.Scope, ref, name string) (store.Consumer, error)
 	GetConsumer(ctx context.Context, sc store.Scope, consumerID string) (store.Consumer, error)
+	RekeyConsumer(ctx context.Context, sc store.Scope, consumerID, newRef string) (store.Consumer, error)
+	ListEndpointsForConsumer(ctx context.Context, sc store.Scope, consumerID string) ([]store.Endpoint, error)
+	CreateEndpoint(ctx context.Context, sc store.Scope, in store.NewEndpoint) (store.EndpointCreated, error)
+	GetEndpoint(ctx context.Context, sc store.Scope, endpointID string) (store.Endpoint, error)
+	SetEndpointPaused(ctx context.Context, sc store.Scope, endpointID string, paused bool) (store.Endpoint, error)
+	DeleteEndpoint(ctx context.Context, sc store.Scope, endpointID string) error
+	VerifyEndpoint(ctx context.Context, sc store.Scope, endpointID, token string) error
+	ListSubscriptionsForEndpoint(ctx context.Context, sc store.Scope, endpointID string) ([]store.Subscription, error)
+	CreateSubscription(ctx context.Context, sc store.Scope, in store.NewSubscription) (store.Subscription, error)
+	DeleteSubscription(ctx context.Context, sc store.Scope, endpointID, eventType string) error
 	InviteConsumerUser(ctx context.Context, sc store.Scope, actor store.Actor, consumerID, email string) (store.Invite, error)
 	ListConsumerUsers(ctx context.Context, sc store.Scope, consumerID string) ([]store.ConsumerUser, error)
 	RevokeConsumerUser(ctx context.Context, sc store.Scope, consumerID, userID string) error
@@ -99,6 +112,10 @@ type Deps struct {
 	// config"). Off by default: an internet-facing instance must not let
 	// strangers create tenants.
 	SelfRegistration bool
+
+	// Metrics, when set, exposes the fan-out non-delivery counters (FR-508) at
+	// GET /metrics. Nil disables the route, which the unit tests want.
+	Metrics *metrics.Metrics
 }
 
 // Server holds the router and its dependencies.
@@ -171,6 +188,37 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 		"replay_only": p.ReplayOnly,
 		"suspended":   p.Suspended,
 	})
+}
+
+// handleMetrics renders the fan-out non-delivery counters (FR-508) in a minimal
+// Prometheus text format. Each §7.5a reason is its own series label, so an
+// operator can see an un-onboarded consumer separate from a paused endpoint. The
+// route is anonymous but unauthenticated: it leaks only counter values, never
+// producer data, and the cross-producer suite proves it says the same thing to
+// everyone.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Metrics == nil {
+		writeError(w, http.StatusNotFound, "not_found", "metrics disabled")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	snap := s.deps.Metrics.NonDeliverySnapshot()
+	_, _ = fmt.Fprintf(w, "# HELP pigeon_non_deliveries_total Fan-out events that produced no delivery, by reason.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE pigeon_non_deliveries_total counter\n")
+	for _, reason := range sortedReasons(snap) {
+		_, _ = fmt.Fprintf(w, "pigeon_non_deliveries_total{reason=%q} %d\n", reason, snap[reason])
+	}
+}
+
+// sortedReasons gives the series a stable, deterministic order so the scrape is
+// byte-stable across calls (a test can assert on it).
+func sortedReasons(snap map[string]int64) []string {
+	reasons := make([]string, 0, len(snap))
+	for r := range snap {
+		reasons = append(reasons, r)
+	}
+	sort.Strings(reasons)
+	return reasons
 }
 
 func bearerToken(header string) (string, bool) {

@@ -20,6 +20,7 @@ import (
 
 	"github.com/m7jay/pigeon/internal/broker"
 	"github.com/m7jay/pigeon/internal/envelope"
+	"github.com/m7jay/pigeon/internal/metrics"
 	"github.com/m7jay/pigeon/internal/store"
 )
 
@@ -29,21 +30,25 @@ type Options struct {
 	// crashed relay lets the lease lapse and another relay re-claims the row
 	// (D-6, FR-809). Defaults to 30 s.
 	Lease time.Duration
-	// Poll is the fallback scan interval when no notification arrives. Defaults
+	// Poll   is the fallback scan interval when no notification arrives. Defaults
 	// to 1 s (D-4). Zero disables polling, leaving only the listen fast path.
 	Poll   time.Duration
 	Logger *slog.Logger
+	// Metrics records the fan-out non-delivery reasons (FR-508). A nil Metrics
+	// disables recording, which the tests that care only about delivery want.
+	Metrics *metrics.Metrics
 }
 
 // Worker leases, publishes, and marks outbox rows. It is safe to construct once
 // and Run for the life of the process; tests drive ProcessPending directly.
 type Worker struct {
-	store  *store.Store
-	broker broker.Broker
-	notify <-chan string
-	lease  time.Duration
-	poll   time.Duration
-	log    *slog.Logger
+	store   *store.Store
+	broker  broker.Broker
+	notify  <-chan string
+	lease   time.Duration
+	poll    time.Duration
+	log     *slog.Logger
+	metrics *metrics.Metrics
 }
 
 // New builds a Worker. A nil logger is replaced rather than panicked on.
@@ -57,12 +62,16 @@ func New(st *store.Store, br broker.Broker, opts Options) *Worker {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.Metrics == nil {
+		opts.Metrics = metrics.New()
+	}
 	return &Worker{
-		store:  st,
-		broker: br,
-		lease:  opts.Lease,
-		poll:   opts.Poll,
-		log:    opts.Logger,
+		store:   st,
+		broker:  br,
+		lease:   opts.Lease,
+		poll:    opts.Poll,
+		log:     opts.Logger,
+		metrics: opts.Metrics,
 	}
 }
 
@@ -133,10 +142,13 @@ func (w *Worker) ProcessPending(ctx context.Context) (int, error) {
 	}
 }
 
-// deliver is one row's whole lifecycle: build the §10 envelope, publish it, and
-// only then mark the row published. The order is the durability contract - the
-// mark is the claim that the broker holds the message, so it can never precede
-// the publish (FR-701).
+// deliver is one row's whole lifecycle: build the §10 envelope, publish it,
+// fan the event out to its deliveries, and only then mark the row published. The
+// order is the durability contract - the mark is the claim that the broker holds
+// the message, so it can never precede the publish (FR-701); fan-out sits between
+// because a delivery set that must be created is part of honouring the message,
+// and if it fails the row stays pending to be re-leased and re-fanned-out
+// (idempotent on (event_id, endpoint_id), FR-704).
 func (w *Worker) deliver(ctx context.Context, row store.LeasedOutbox) error {
 	ev := buildEnvelope(row)
 	if err := w.broker.Publish(ctx, &ev); err != nil {
@@ -144,10 +156,43 @@ func (w *Worker) deliver(ctx context.Context, row store.LeasedOutbox) error {
 			"event_id", row.EventID, "error", err)
 		return err
 	}
+	if err := w.fanOut(ctx, row); err != nil {
+		w.log.Warn("relay: fan-out failed; row left pending for retry",
+			"event_id", row.EventID, "error", err)
+		return err
+	}
 	if err := w.store.MarkOutboxPublished(ctx, row.OutboxID); err != nil {
 		return fmt.Errorf("relay: mark published for %s: %w", row.EventID, err)
 	}
 	return nil
+}
+
+// fanOut resolves the just-published event to its delivery rows (FR-703) and
+// records the non-delivery reasons (FR-508). It runs inside the relay's lease
+// iteration, so a crash between publish and mark re-leases and re-fans-out rather
+// than losing the delivery set.
+func (w *Worker) fanOut(ctx context.Context, row store.LeasedOutbox) error {
+	result, err := w.store.FanOutEvent(ctx, store.Scope{ProducerID: row.ProducerID, Env: row.Env}, row.EventID)
+	if err != nil {
+		return err
+	}
+	recordFanout(w.metrics, result)
+	return nil
+}
+
+// recordFanout advances one counter per distinct non-delivery reason in the
+// result: the single event-level reason (unroutable, or no matching
+// subscription), plus one per skipped endpoint. Each reason is its own metric
+// label (FR-508, FR-509), so "an un-onboarded consumer" and "a paused endpoint"
+// are separable in the counter. It is a free function so the label mapping is
+// testable without a broker.
+func recordFanout(m *metrics.Metrics, r store.FanOutResult) {
+	if r.EventReason != "" {
+		m.RecordNonDelivery(r.EventReason)
+	}
+	for _, s := range r.Skipped {
+		m.RecordNonDelivery(s.Reason)
+	}
 }
 
 // buildEnvelope renders the leased row into the §10 wire shape. The event id is

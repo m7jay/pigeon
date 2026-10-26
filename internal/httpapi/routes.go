@@ -107,6 +107,9 @@ func (s *Server) routes() []route {
 		{http.MethodPost, "/v1/admin/producers/{producerID}/suspend", kindAdmin, s.handleSuspendProducer},
 		{http.MethodPost, "/v1/admin/producers/{producerID}/resume", kindAdmin, s.handleResumeProducer},
 		{http.MethodGet, "/v1/admin/producers/{producerID}/audit", kindAdmin, s.handleProducerAudit},
+		// FR-508: the fan-out non-delivery counters, one series per reason. Operator
+		// telemetry over the whole platform, so it is not tenant-scoped (admin only).
+		{http.MethodGet, "/metrics", kindAdmin, s.handleMetrics},
 
 		// Producer membership and invitations (FR-104, FR-105, FR-109).
 		{http.MethodGet, "/v1/producer/members", kindMember, s.handleListMembers},
@@ -118,6 +121,20 @@ func (s *Server) routes() []route {
 		{http.MethodGet, "/v1/producer/consumers", kindMember, s.handleListConsumers},
 		{http.MethodPost, "/v1/producer/consumers", kindMember, s.handleCreateConsumer},
 		{http.MethodGet, "/v1/producer/consumers/{consumerID}", kindMember, s.handleGetConsumer},
+		// FR-506: the ref is immutable everywhere but this one re-key operation.
+		{http.MethodPost, "/v1/producer/consumers/{consumerID}/rekey", kindMember, s.handleRekeyConsumer},
+		// FR-401..FR-408: a consumer's endpoints. Registered under the consumer the
+		// URL belongs to; SSRF-checked, challenge-gated before live delivery.
+		{http.MethodGet, "/v1/producer/consumers/{consumerID}/endpoints", kindMember, s.handleListEndpoints},
+		{http.MethodPost, "/v1/producer/consumers/{consumerID}/endpoints", kindMember, s.handleCreateEndpoint},
+		{http.MethodGet, "/v1/producer/consumers/{consumerID}/endpoints/{endpointID}", kindMember, s.handleGetEndpoint},
+		{http.MethodPatch, "/v1/producer/consumers/{consumerID}/endpoints/{endpointID}", kindMember, s.handlePatchEndpoint},
+		{http.MethodDelete, "/v1/producer/consumers/{consumerID}/endpoints/{endpointID}", kindMember, s.handleDeleteEndpoint},
+		{http.MethodPost, "/v1/producer/consumers/{consumerID}/endpoints/{endpointID}/verify", kindMember, s.handleVerifyEndpoint},
+		// FR-501..FR-512: the (endpoint, event_type) subscriptions.
+		{http.MethodGet, "/v1/producer/endpoints/{endpointID}/subscriptions", kindMember, s.handleListSubscriptions},
+		{http.MethodPost, "/v1/producer/endpoints/{endpointID}/subscriptions", kindMember, s.handleCreateSubscription},
+		{http.MethodDelete, "/v1/producer/endpoints/{endpointID}/subscriptions/{eventType}", kindMember, s.handleDeleteSubscription},
 		{http.MethodPost, "/v1/producer/consumers/{consumerID}/invites", kindOwner, s.handleInviteConsumerUser},
 		{http.MethodGet, "/v1/producer/consumers/{consumerID}/users", kindMember, s.handleListConsumerUsers},
 		{http.MethodDelete, "/v1/producer/consumers/{consumerID}/users/{userID}", kindOwner, s.handleRevokeConsumerUser},

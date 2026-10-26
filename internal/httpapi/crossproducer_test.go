@@ -155,6 +155,68 @@ var crossProducerCases = map[string]cpCase{
 		},
 		want: http.StatusNotFound,
 	},
+	"POST /v1/producer/consumers/{consumerID}/rekey": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/consumers/" + b.ConsumerID + "/rekey?env=live", map[string]string{"ref": "cp-rekey-probe"}
+		},
+		want: http.StatusNotFound,
+	},
+	"GET /v1/producer/consumers/{consumerID}/endpoints": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/consumers/" + b.ConsumerID + "/endpoints?env=live", nil
+		},
+		want:  http.StatusOK,
+		leaks: func(a, b *tenant) []string { return []string{b.EndpointID} },
+	},
+	"POST /v1/producer/consumers/{consumerID}/endpoints": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/consumers/" + b.ConsumerID + "/endpoints?env=live", map[string]string{"name": "Probe", "url": "https://1.1.1.1/hook"}
+		},
+		want: http.StatusNotFound,
+	},
+	"GET /v1/producer/consumers/{consumerID}/endpoints/{endpointID}": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/consumers/" + b.ConsumerID + "/endpoints/" + b.EndpointID + "?env=live", nil
+		},
+		want: http.StatusNotFound,
+	},
+	"PATCH /v1/producer/consumers/{consumerID}/endpoints/{endpointID}": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/consumers/" + b.ConsumerID + "/endpoints/" + b.EndpointID + "?env=live", map[string]bool{"paused": true}
+		},
+		want: http.StatusNotFound,
+	},
+	"DELETE /v1/producer/consumers/{consumerID}/endpoints/{endpointID}": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/consumers/" + b.ConsumerID + "/endpoints/" + b.EndpointID + "?env=live", nil
+		},
+		want: http.StatusNotFound,
+	},
+	"POST /v1/producer/consumers/{consumerID}/endpoints/{endpointID}/verify": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/consumers/" + b.ConsumerID + "/endpoints/" + b.EndpointID + "/verify?env=live", map[string]string{"token": b.EndpointVerifyToken}
+		},
+		want: http.StatusNotFound,
+	},
+	"GET /v1/producer/endpoints/{endpointID}/subscriptions": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/endpoints/" + b.EndpointID + "/subscriptions?env=live", nil
+		},
+		want:  http.StatusOK,
+		leaks: func(a, b *tenant) []string { return []string{b.EventTypeName} },
+	},
+	"POST /v1/producer/endpoints/{endpointID}/subscriptions": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/endpoints/" + b.EndpointID + "/subscriptions?env=live", map[string]string{"event_type": b.EventTypeName}
+		},
+		want: http.StatusNotFound,
+	},
+	"DELETE /v1/producer/endpoints/{endpointID}/subscriptions/{eventType}": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/endpoints/" + b.EndpointID + "/subscriptions/" + b.EventTypeName + "?env=live", nil
+		},
+		want: http.StatusNotFound,
+	},
 	"POST /v1/producer/keys": {
 		build: func(a, b *tenant) (string, any) { return "/v1/producer/keys?env=live", nil },
 		want:  http.StatusCreated,
@@ -329,6 +391,7 @@ var notProducerScoped = map[string]string{
 	"POST /v1/admin/producers/{producerID}/suspend": "instance-admin surface: suspends any tenant (FR-107)",
 	"POST /v1/admin/producers/{producerID}/resume":  "instance-admin surface: resumes any tenant (FR-107)",
 	"GET /v1/admin/producers/{producerID}/audit":    "instance-admin surface: the audit log is not tenant data (MT-5)",
+	"GET /metrics":                                  "platform telemetry: aggregate non-delivery counters over every tenant, so it is operator (admin) telemetry, not tenant-scoped (FR-508)",
 	"POST /v1/producers":                            "FR-102 self-registration: exists only when enabled, and by definition has no tenant yet",
 }
 
