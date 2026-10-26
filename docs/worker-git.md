@@ -70,6 +70,8 @@ cd /opt/data/workspace/projects/pigeon
 git worktree remove --force "$HERMES_KANBAN_WORKSPACE/wt" 2>/dev/null || true
 git fetch origin wt/<card-id>-<slug>
 git worktree prune
+rm -rf "$HERMES_KANBAN_WORKSPACE/wt"     # a leftover directory is not a registered worktree
+                                      # and makes `worktree add` fail with 'already exists'
 git worktree add -B wt/<card-id>-<slug> "$HERMES_KANBAN_WORKSPACE/wt" origin/wt/<card-id>-<slug>
 cd "$HERMES_KANBAN_WORKSPACE/wt"
 git status -sb        # must show wt/<card-id>-<slug> in sync with origin, not a stale local ref
@@ -239,9 +241,9 @@ relying on.
    $GH api "repos/m7jay/pigeon/contents/<path>?ref=<headRefOid>" --jq .content | base64 -d
    ```
 
-   `pr diff` follows the live PR head, so re-read `headRefOid` after it; a `contents`
-   read with `?ref=<headRefOid>` cannot drift. Reviewing from the PR title and body is
-   not a review.
+   `pr diff` follows the live PR head, so re-read `headRefOid` after it and, if it moved,
+   restart this step with the new SHA; a `contents` read with `?ref=<headRefOid>` cannot
+   drift. Reviewing from the PR title and body is not a review.
 
 2. A defect pass over auth, tenant isolation, SQL and tests, reported as
    `file:line - problem - fix`. Restating the diff is not a review.
@@ -257,12 +259,16 @@ relying on.
    `conclusion: success`, and a `headSha` equal to the `headRefOid` from step 1. A run
    whose `headSha` differs is not the gate, however green it is. While the run for
    `headRefOid` reports any status other than `completed` - `queued`, `pending`,
-   `requested`, `waiting`, `in_progress` all occur - wait and re-run this step; never
-   merge on the strength of a previous commit's run. A `completed` run whose conclusion is
+   `requested`, `waiting`, `in_progress` all occur - wait and re-run this step, polling
+   every ~30 s; never merge on the strength of a previous commit's run. If it has not
+   completed after ~15 minutes, stop waiting and send the card back with
+   `kanban_request_changes` naming the stuck run id - an unattended worker must not sit on
+   a run that never starts. A `completed` run whose conclusion is
    anything but `success` goes back to the implementer: never merge around a red check,
    never disable one.
 4. GitHub reports the PR mergeable: `mergeable: MERGEABLE` - if it is `UNKNOWN`, GitHub is
-   still computing, so re-read until it settles - and the PR is not a draft. The block
+   still computing, so re-read every ~15 s for up to ~2 minutes and send the card back if
+   it never settles - and the PR is not a draft. The block
    is step 3, not the summary badge: `mergeStateStatus` reads `UNSTABLE` whenever any check
    on the head has not concluded `success`, including one still running, so it is never
    on its own a reason to refuse - and a `completed` non-success run for the reviewed
@@ -324,7 +330,7 @@ That completion is the only thing that moves the card to `done`.
 
 **If the PR is `BEHIND`,** merge anyway. There is no branch protection on this repo and
 rebase merges are allowed, so a branch whose base moved is still mergeable; re-check
-`mergeable`/`mergeStateStatus` right before merging and nothing else. Do not try to
+`mergeable` right before merging and nothing else. Do not try to
 re-run step 3 after the merge: a rebase merge rewrites the commits and creates new SHAs
 by design, and the branch ref is gone, so there is no run to match. The gate is the CI
 run for the reviewed `headRefOid`, and that is the value `metadata["head_sha"]` keeps -
