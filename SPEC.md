@@ -248,52 +248,55 @@ Decisions taken in place of gaps, each with the mechanism that makes it
 implementable and the trade-off it accepts, because a decision without its mechanism
 gets relitigated the moment somebody implements the other one.
 
-### A-5 — Consumer sessions are opaque Postgres-backed tokens in an `HttpOnly` cookie
+### A-6 — `pigeon doctor` is a subcommand of the core binary with a scripted contract
 
-**Decision.** A consumer user's session is an opaque 256-bit random token, stored
-hashed in a `sessions` row that carries the `consumer_id` binding, delivered to the
-browser as `__Host-pigeon_session` and presented to the API as a bearer. No JWT, no
-client-held claim, no signed cookie.
+**Decision.** `doctor` is a subcommand of `cmd/pigeon`: no second image, no cobra, no
+shell script. It is read-only, prints one line per check under a stable id, offers
+`--json`, and exits 0/1/2/3 by outcome.
 
 **Mechanism.**
 
-- Login mints the token and stores `sha256(token)` with `user_id`, `producer_id`,
-  `env`, `consumer_id`, `csrf_secret`, `expires_at` (absolute TTL, default 12 h) and
-  `last_seen_at` (idle TTL default 30 min, written at most once a minute through the
-  `EvidenceTx` class so it costs no fsync). The cookie is `HttpOnly; Secure;
-  SameSite=Lax; Path=/` per FR-1009 and carries no data beyond the token.
-- The portal is a server-side API client: its handlers call the core over the network
-  with `Authorization: Bearer <that token>`, `X-Request-Id`, and a double-submit CSRF
-  token on mutations. The browser never holds a credential it can replay at another
-  host, and the API performs the filtering, so a compromised or buggy portal cannot
-  widen a result set it was handed.
-- The same token is a plain bearer, so AC-39's "a consumer user calls the API
-  directly" is testable with the value from the cookie and without inventing a second
-  credential type. A copyable long-lived consumer API token is not in v1.0; if it is
-  ever wanted it is another row in the same table with the same binding columns and
-  no schema change.
-- Revocation is `UPDATE sessions SET revoked_at = now()`: immediate, one row,
-  independent of the consumer record (FR-109). Each instance caches a binding for at
-  most 5 s, so revocation takes effect inside 5 s, comfortably inside FR-205's 60 s.
-- Producer-portal sessions reuse the table with `consumer_id` null and a producer
-  role. §8.4's "signed cookie session" is corrected in the same breath: signed means
-  stateless, and stateless means a revocation list, which is this table.
+- `main` dispatches on `os.Args[1] == "doctor"` before `flag.Parse`, the way
+  `-healthcheck` and `-version` already live in this binary. The runtime image is
+  `scratch`: there is no shell, no `curl`, no `ulimit` binary, so anything an operator
+  must run to diagnose the box has to be in the image that is already on the box.
+- Checks, each with a stable id and a fix string: `config.valid` (the OPS-7 refusals,
+  reported rather than thrown), `postgres.reachable`, `postgres.migrations_current`,
+  `redis.reachable`, `redis.appendonly` (`appendonly yes` **and** `appendfsync
+  everysec`, D-5), `clock.skew`, `disk.headroom`, `ulimit.nofile` (its own
+  `RLIMIT_NOFILE` soft limit against the configured per-process cap plus pool,
+  FR-816), and `db.connection_budget` (OPS-10's arithmetic, printed with the numbers
+  substituted: `replicas × pool_max + reserved` against `SHOW max_connections`).
+- `doctor` is the one path allowed to run with a broken config, because a broken
+  config is the most common reason to run it. It parses what it can and reports
+  `config.valid` as a failing check instead of exiting early with a single message.
+- `ulimit.nofile` reads `getrlimit(RLIMIT_NOFILE)` in-process. There is no other
+  option in a `scratch` image, and it is also the more correct one: the limit that
+  matters is the limit of the process making the connections, not of the operator's
+  shell.
+- Format: `STATUS  check-id  observed  required  fix` on stdout, both machine fields
+  always printed. `--json` emits
+  `{"ok":bool,"checks":[{"id","status","observed","required","fix"}]}` with
+  `status ∈ pass|warn|fail|skip`. Exit: `0` nothing failed, `1` at least one failure,
+  `2` warnings only, `3` doctor could not run (unknown flag, unreadable env).
+  `--strict` promotes a warning to exit 1 for CI. Every check is bounded at 5 s and
+  the run at 20 s so it fits a healthcheck; no secret is ever printed (FR-1008); there
+  is no `--fix` in v1.0.
+- `clock.skew` measures against Postgres `now()` when the two are co-located and
+  against `PIGEON_DOCTOR_CLOCK_REF_URL`'s HTTPS `Date` header when that is configured.
+  With neither available it reports `skip` with the reason instead of passing, because
+  a check that cannot measure must not claim to have.
 
-**Trade-off.** One indexed read per authenticated request where a JWT needs none,
-mitigated by the 5 s cache; a session table on the auth path where a JWT needs
-nothing. In exchange: revocation is a row update rather than a deny-list with its own
-expiry, there is no signing key to rotate or leak, no claim that disagrees with the
-database after a role change, no clock-skew window, and no way for a stale token to
-keep a revoked consumer user alive for the life of its `exp`. A JWT earns its place
-when a stateless edge validates tokens at a scale where the lookup hurts; v1.0 has one
-core binary, and its authorization question is a row lookup either way.
+**Trade-off.** Exit 2 for warnings-only is a Nagios-style reading some operators will
+have to look up, and the alternative - anything nonzero is 1 - leaves a CI gate unable
+to distinguish "disk at 81%" from "appendonly off", which is the distinction AC-22 is
+about. Shipping doctor inside the core binary means diagnosing a binary that will not
+start still needs images and logs; that is acceptable because doctor's scope (OPS-4,
+OPS-10, AC-22) is the box, not the process. And there is no automatic repair, on
+purpose: fixing `appendonly` means rewriting `redis.conf` and restarting Redis, which
+is an operator decision about data the app does not own.
 
-**Also corrected here:** SPEC previously cited "a scoped token per FR-514", and no
-FR-514 existed - the scoped-token sentence was §14's prose only. The requirement is
-now FR-112 and FR-113; FR-514 is assigned to A-3's id-resolution rule, and this
-amendment no longer refers to it.
-
-**Encoded by.** FR-110 (rewritten), FR-112, FR-113, AC-47.
+**Encoded by.** OPS-4 (amended), OPS-10 (amended), OPS-11, AC-48.
 
 ## Gap list — where `REQUIREMENTS.md` is silent or inconsistent
 
