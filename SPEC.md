@@ -248,39 +248,62 @@ Decisions taken in place of gaps, each with the mechanism that makes it
 implementable and the trade-off it accepts, because a decision without its mechanism
 gets relitigated the moment somebody implements the other one.
 
-### A-3 — The envelope carries the resolved `consumer_ref` and never `consumer_id`
+### A-4 — Dedupe keys are a Postgres archive, not a Redis TTL and not a hot-path row
 
-**Decision.** Routing input and envelope output are decoupled. A producer may publish
-with `consumer_id` or `consumer_ref` (FR-505), and every `consumer`-routed event
-leaves the platform carrying the **resolved `consumer_ref`**. `consumer_id` does not
-appear in the envelope at all.
+**Decision.** FR-903's 30-day dedupe answer is served from Postgres twice over: from
+the `deliveries` row while its partition exists (0 to 14 days), and from an archive
+table `delivery_dedupe` copied out of each partition as the sweeper drops it (14 to
+30 days). Nothing about dedupe lives in Redis.
 
-**Mechanism.** `consumers.ref` is `not null` and unique per `(producer, env)`
-(FR-506, `0001_init.sql`), so the case the gap feared - a producer publishes by
-opaque id and the receiver is handed nothing - cannot arise: id to consumer row to
-ref always resolves at fan-out, and the resolved ref is written into the envelope
-once, from the same lookup FR-511 already caches. For `broadcast` events neither
-field is present, as §10 already said. S3's struct is therefore
-`ConsumerRef *string`, nil only for broadcast, with no `ConsumerID` field: a field
-that is always absent, or always ignored, is worse than no field.
+**Mechanism.**
 
-The resolution rule for the id form is FR-514, and it is deliberately the same rule
-as the ref form: an unknown, deleted, or other-producer's `consumer_id` is
-`unroutable:consumer_not_registered` in live (`202`) and `422` in test, exactly as
-FR-508 treats an unknown ref. Two different outcomes for "the reference did not
-resolve" would be a silent data-loss asymmetry, and answering a cross-tenant id probe
-with a distinct response would hand out an id-enumeration oracle.
+- `delivery_dedupe(endpoint_id, event_id, first_delivery_id, first_seen_at)`,
+  primary key `(endpoint_id, event_id)` and no surrogate id, so the support question
+  "was this a duplicate for this endpoint?" is an index-only scan on an exact key.
+- The archive is filled by the sweeper (single leaseholder, D-7), which copies the
+  partition's `(endpoint_id, event_id, id, created_at)` into it **before** dropping
+  that partition, `ON CONFLICT DO NOTHING`, in the same loop iteration as the drop.
+  A failed copy aborts that drop. The one exception is SB-3's disk-pressure drop,
+  which is logged at warn and leaves that partition's tail unarchived - a support
+  answer lost, never a delivery.
+- `delivery_dedupe` is itself range-partitioned by day and dropped by partition at
+  `dedupe_retention` (default 30 d), so SB-2 holds here too and there is no `DELETE`
+  and no vacuum pressure. Under disk pressure these partitions are dropped *before*
+  delivery partitions, because they are derived.
+- One view, `delivery_dedupe_all`, unions live `deliveries` with the archive, so the
+  support path - and the API that answers it - reads one name and does not care which
+  side answered.
+- Fan-out idempotency does **not** depend on the archive. It is the `deliveries`
+  unique index, whose coverage is exactly as long as an outbox row can exist, which
+  is the only window in which a re-fan-out is possible.
 
-**Trade-off.** The receiver sees only an identifier it already understands: the
-producer's own name for it, which a shared endpoint can route on without a lookup -
-which is why §10 carries it. The cost is that `consumer_id` is the one identifier
-that survives FR-506's re-key, so a consumer that must survive a re-key cannot key on
-the ref; it keys on `id` per event, or on a field in `data` its producer controls -
-the same guidance §10 already gives for replays. Emitting both would have handed
-receivers an internal identifier whose stability we would then owe them, and a spec
-gap is a poor reason to take on a compatibility promise.
+**Trade-off.** Two mechanisms and a union view instead of one insert, and the archive
+lags a partition by at most one sweeper cycle. In exchange the hot path pays nothing:
+an inline row per delivery would add 10,000 control writes per second to the
+reference load, doubling the write amplification §8.1 spends its whole argument
+minimising - and that is what a Redis `SETNX` would have done to Redis, plus it would
+have been lost on the wipe AC-10 exercises, breaking P3 for the one question FR-903
+exists to answer.
 
-**Encoded by.** FR-513, FR-514, §10's field table, AC-23 (extended to id mode).
+The honest cost is disk: the archive only ever holds the 16 days between the two
+retentions, about 64 B per pair, roughly 48 M rows and 3 GB at the reference box's
+sustained 35 deliveries/s. That is real on a 40 GB disk, which is why its retention
+is a knob, why its partitions go first under pressure, and why FR-905 states the
+per-row cost so an operator can size it instead of guessing.
+
+**Adjacent, found here and decided with it: I-3's uniqueness is partial.** I-3 says
+`(event_id, endpoint_id)` is unique "so fan-out and replay are idempotent", but
+FR-1106 requires a replay to *create* a second delivery for that same pair. Both
+cannot be a table constraint. The delivery index is therefore
+`UNIQUE (event_id, endpoint_id) WHERE replay_of_delivery_id IS NULL` - first fan-out
+only - and replay idempotency comes from its own request key (FR-1107). The archive
+records the pair's first delivery and a replay does not touch it. Cost: one invariant
+in two places, which is one more thing a reviewer holds in their head; the
+alternatives were an index that makes FR-1106 unimplementable or dropping the index
+and letting a retried fan-out batch create duplicates.
+
+**Encoded by.** FR-903 (rewritten), FR-905, §6's two dedupe rows, I-3 (amended),
+AC-46.
 
 ## Gap list — where `REQUIREMENTS.md` is silent or inconsistent
 

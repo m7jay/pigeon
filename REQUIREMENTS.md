@@ -275,7 +275,7 @@ erDiagram
 
 - **I-1** Every entity except `producer` carries `producer_id`, and no query path exists that does not filter on it.
 - **I-2** A `delivery` row is created before the first attempt and is not removed before its retention window. It is the durable record that this event was owed to this endpoint.
-- **I-3** `(event_id, endpoint_id)` is unique, so fan-out and replay are idempotent by construction.
+- **I-3** `(event_id, endpoint_id)` is unique for **first fan-out**, so fan-out is idempotent by construction. A replay is deliberately a second delivery for the same pair, linked by `replay_of_delivery_id` and made idempotent by its own request key (FR-1106, FR-1107); the uniqueness is a partial index over rows where `replay_of_delivery_id IS NULL`.
 - **I-4** A delivery is terminal only in `delivered`, `failed_terminal`, `cancelled`. Everything else is in flight and MUST be visible as in-flight.
 - **I-5** Event type names are unique per producer, not globally.
 - **I-6** A delivery's lease is the only authority on whether it is being worked on. Status is never inferred from the attempt log.
@@ -293,6 +293,8 @@ erDiagram
 | Delivery record at fan-out | Postgres, batched insert | ≤ 200 ms; rebuildable by re-fan-out | none — unique `(event_id, endpoint_id)` makes re-fan-out idempotent |
 | Attempt record + response body | Redis list → Postgres batches | **0 on worker crash**; ≤ 1 s if Redis itself dies uncleanly | evidence gap only; the delivery is still driven by its lease |
 | Terminal delivery state | same batch | ≤ 200 ms | delivery re-attempted → duplicate, deduped by the consumer on `event_id` |
+| Dedupe key `(endpoint, event_id)`, first 14 d | the `deliveries` row itself | bounded by partition drop | a support answer is missing; never a delivery |
+| Dedupe key, 14 to 30 d tail | Postgres `delivery_dedupe`, copied from a partition as the sweeper drops it (FR-905) | one sweeper cycle for that partition; nothing at all if the drop was forced by disk pressure (SB-3) | a support answer is missing; never a delivery |
 | Signing secret, config | Postgres, synchronous | none | — |
 
 **Rules**
@@ -476,8 +478,9 @@ The class is declared on the event type, not chosen per event, so a payload cann
 |---|---|---|
 | FR-901 | Every event MUST carry a globally unique `event_id` (ULID). | P0 |
 | FR-902 | The envelope MUST carry `delivery_id`, distinct from `event_id`, plus `attempt`. | P1 |
-| FR-903 | The platform SHOULD store `(endpoint, event_id)` dedupe keys with a 30-day TTL and expose them, so support can answer "was this a duplicate?". | P1 |
+| FR-903 | Support MUST be able to answer "was this event a duplicate for this endpoint?" for 30 days after delivery, and the answer MUST survive a Redis wipe and outlive delivery retention. | P1 |
 | FR-904 | The integration guide MUST state the idempotency requirement and name both keys. | P0 |
+| FR-905 | The dedupe answer MUST be served from Postgres: from the `deliveries` row while its partition exists, and otherwise from a range-partitioned archive table copied at partition drop, with configurable archive retention (default 30 d, so the archive holds only the difference between the two retentions). Nothing about dedupe MAY live in Redis, and the archive MUST be dropped by partition, never by `DELETE`. | P1 |
 
 ### 7.10 Security (FR-10)
 
@@ -1015,6 +1018,7 @@ paragraph - S10 MUST NOT implement a second token beside this one.
 | AC-43 | Scale 1 → 2 → 4 replicas at fixed load below the DB ceiling | Throughput scales ≥ 80% per doubling; above the ceiling, throughput does not improve and p99 worsens, matching §8.4 |
 | AC-44 | 10 subscriptions on one endpoint all failing, 100 failed attempts within an hour | Endpoint paused once, by the endpoint threshold evaluated first; one email naming the endpoint; per-subscription emails suppressed; every subscription stops receiving; one resume restores each one that had not tripped its own threshold |
 | AC-45 | Ingest-only load on 2 vCPU / 4 GB: 1,000 events/s for 30 minutes with the relay stopped, warm-up excluded | Every request `202`; p99 ≤ 100 ms over the last 10 minutes; zero `429` and zero `5xx`; `events` + `outbox` rows equal the accepted count; commit rate ≤ 100/s; RSS ≤ 1.5 GB per service (NFR-4, §12 load protocol) |
+| AC-46 | With `deliveries` retention set to 1 h, deliver an event, let the sweeper drop the partition, then flush Redis and ask the dedupe question for that `(endpoint, event_id)` | The answer is present, served from `delivery_dedupe`, with its `first_delivery_id` and original timestamp; nothing about the answer came from Redis (FR-905) |
 | AC-49 | Every `Set-Cookie` a portal emits (session, flash, CSRF) | Carries `HttpOnly`, `Secure` and `SameSite=Lax`; no portal cookie lacks any of the three |
 | AC-50 | A state-changing `POST` to a portal route - the anonymous `/login` and `/invite` included - with the CSRF token absent or not matching the session cookie: a cross-origin form, or a same-origin request with the hidden field stripped | `403` and no state change; the same `POST` carrying the token the page rendered succeeds |
 | AC-51 | Core `PIGEON_SESSION_TTL=24h`, then log in to a portal; repeat at `15m` | The session cookie's `Max-Age` is the 24 h / 15 m the core issued (from the login response's `expires_at`), not the 12 h constant the portal used to hardcode |
