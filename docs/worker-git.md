@@ -65,6 +65,7 @@ push non-fast-forward. Check out the branch that has the PR on it:
 
 ```bash
 cd /opt/data/workspace/projects/pigeon
+git worktree remove --force "$HERMES_KANBAN_WORKSPACE/wt" 2>/dev/null || true
 git fetch origin wt/<card-id>-<slug>
 git worktree prune
 git worktree add "$HERMES_KANBAN_WORKSPACE/wt" wt/<card-id>-<slug>
@@ -87,7 +88,8 @@ wt/<card-id>-<slug>
 Examples: `wt/t_8b5d4ad0-worker-git-docs`, `wt/t_f78a96c3-s0-postgres-evidence`.
 
 Rules: one branch per card, branched from the repo's current default branch
-(`$GH repo view m7jay/pigeon --json defaultBranchRef` — today `feat/m0-skeleton`).
+(`/opt/data/toolchain/gh repo view m7jay/pigeon --json defaultBranchRef` — today
+`feat/m0-skeleton`).
 Never push to `master` or the default branch directly. Never force-push a branch
 under review, and never rewrite one that another person has looked at.
 
@@ -139,9 +141,14 @@ CI: check the run for your head commit, and read the log — a skipped test is n
 pass.
 
 ```bash
-$GH run list --branch wt/<card-id>-<slug> -L 5
+GH=/opt/data/toolchain/gh
+$GH run list --repo m7jay/pigeon --branch wt/<card-id>-<slug> -L 5 \
+    --json databaseId,headSha,status,conclusion
 $GH run view <run-id> --log | grep -E '^(ok|FAIL|---)'   # e.g. "ok  github.com/m7jay/pigeon/internal/store"
 ```
+
+The `headSha` must be the commit you pushed — a green run for an earlier commit is not
+your gate, and the reviewer will check exactly that (§7 step 3).
 
 Put the run id and its conclusion in the review request, naming every key:
 
@@ -246,8 +253,8 @@ relying on.
    the earlier ones are stale by definition.
 6. Re-read `headRefOid`, as the last control step before merging. If it moved since step
    1, the implementer pushed: go back to step 1 with the new SHA and review that one -
-   do not write a verdict, and do not carry the earlier verdict over. Never merge a SHA
-   you did not review.
+   do not write a verdict for the SHA you have not reviewed, and do not carry the
+   earlier verdict over. Never merge a SHA you did not review.
 7. Merge - rebase, never squash and never a merge bubble:
 
 ```bash
@@ -351,6 +358,7 @@ branch directly, and it still does not merge a PR whose review or CI it has not 
 | helper prints nothing | `gh` unresolvable inside the git helper | keep the helper path absolute in `.gitconfig` |
 | commits show `Jayachandra` | repo-local `user.name` wins over `~/.gitconfig` | set `GIT_AUTHOR_*`/`GIT_COMMITTER_*` for the command (§6) |
 | `403` on `check-runs` | token has no `checks:read` | expected — verify CI by hand (§5) |
+| `GraphQL: Head branch was modified` on `pr merge` | GitHub's cached head lagged a push that just landed (seen after a fast follow-up commit) | `git fetch origin`, confirm `git ls-remote origin refs/heads/<branch>` matches `headRefOid`, retry the merge once — do not drop `--match-head-commit` to get past it |
 
 ## 10. Rollback and revocation
 
