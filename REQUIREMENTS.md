@@ -292,7 +292,7 @@ erDiagram
 | Publish intent | Postgres `outbox` | none | — |
 | Delivery record at fan-out | Postgres, batched insert | ≤ 200 ms; rebuildable by re-fan-out | none — the partial `(event_id, endpoint_id)` unique index over first fan-out makes re-fan-out idempotent (I-3) |
 | Attempt record + response body | Redis list → Postgres batches | **0 on worker crash**; ≤ 1 s if Redis itself dies uncleanly | evidence gap only; the delivery is still driven by its lease |
-| Terminal delivery state | same batch | ≤ 200 ms | delivery re-attempted → duplicate, deduped by the consumer on `event_id` |
+| Terminal delivery state | Postgres, control batch (`synchronous_commit=on`) | none | — |
 | Dedupe key `(endpoint, event_id)`, first 14 d | the `deliveries` row itself | none while the partition exists; under SB-3 disk pressure a partition dropped before its copy ran loses every key it held, logged at warn (FR-903) | a support answer is missing; never a delivery |
 | Dedupe key, 14 to 30 d tail | Postgres `delivery_dedupe`, copied from a partition as the sweeper drops it (FR-905) | none on an ordinary drop - the copy and the drop commit in one transaction and a failed copy aborts both (FR-905); under SB-3 disk pressure either that partition's 14 to 30 d tail (dropped before its copy ran) or whole archived day-ranges (dropped oldest-first ahead of `dedupe_retention`), or both in one pressure event, each logged at warn with the partition and days (FR-903) | a support answer is missing; never a delivery |
 | Signing secret, config | Postgres, synchronous | none | — |
