@@ -456,10 +456,11 @@ table `delivery_dedupe` copied out of each partition as the sweeper drops it (14
   "was this a duplicate for this endpoint?" is an index-only scan on an exact key.
 - The archive is filled by the sweeper (single leaseholder, D-7), which copies the
   partition's `(endpoint_id, event_id, id, created_at)` into it **before** dropping
-  that partition, `ON CONFLICT DO NOTHING`, in the same transaction as the drop - the
-  copy commits first, so there is no instant at which neither the `deliveries` row nor
-  the archive answers a key, and an age-driven drop therefore loses no answer at all.
-  A failed copy aborts that drop. SB-3 disk pressure is the one thing that overrides
+  that partition, `ON CONFLICT DO NOTHING`, **in the same transaction that drops it**,
+  so the copy and the drop commit together or neither does: there is no instant at
+  which neither the `deliveries` row nor the archive answers a key, and an age-driven
+  drop therefore loses no answer at all. A failed copy aborts that transaction, and
+  with it the drop. SB-3 disk pressure is the one thing that overrides
   this, in two ways, both of which lose support answers and neither of which loses a
   delivery: a `deliveries` partition dropped before its copy ran loses every key it
   held - and because SB-3 drops on pressure *before* age, such a partition can still be
@@ -471,7 +472,8 @@ table `delivery_dedupe` copied out of each partition as the sweeper drops it (14
   `dedupe_retention` (default 30 d), so SB-2 holds here too and there is no `DELETE`
   and no vacuum pressure. Under disk pressure these partitions are dropped *before*
   delivery partitions, because they are derived.
-- One view, `delivery_dedupe_all`, unions live `deliveries` with the archive, so the
+- One view, `delivery_dedupe_all`, unions live `deliveries` with the archive (a `UNION`,
+  not a `UNION ALL`, so a key answerable from both sides counts once), so the
   support path - and the API that answers it - reads one name and does not care which
   side answered.
 - Fan-out idempotency does **not** depend on the archive. It is the `deliveries`
@@ -487,6 +489,18 @@ reference load, doubling the write amplification §8.1 spends its whole argument
 minimising - and that is what a Redis `SETNX` would have done to Redis, plus it would
 have been lost on the wipe AC-10 exercises, breaking P3 for the one question FR-903
 exists to answer.
+
+The price of that atomicity is a wide lock and a longer sweeper step: one transaction
+copies one day's partition - about 3 M pairs at the reference 35 deliveries/s, ~600 MB -
+and drops it, so the `DROP` waits behind the insert and the transaction holds the archive
+partition it writes for that whole span. The alternative is two transactions with the
+copy committed first: the archive query then also has to be duplicate-insensitive, because
+the window between the two commits answers a key from both sides at once (`delivery_dedupe_all`
+is a `UNION`, so that is one keyword rather than a mechanism), and the window has to be
+driven to zero by retrying the drop. Both orders satisfy FR-903 at every instant; atomic
+is chosen because it is one thing to reason about and leaves no state in which the same
+key has two answers, and the sweeper is a background leaseholder on a nightly slice, so
+it can afford the longer span.
 
 The honest cost is disk, and the first draft of this amendment understated it by
 roughly three times by counting payload only. Every identifier in `0001_init.sql` is
