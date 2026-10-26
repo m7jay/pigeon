@@ -144,7 +144,7 @@ pass.
 GH=/opt/data/toolchain/gh
 $GH run list --repo m7jay/pigeon --branch wt/<card-id>-<slug> -L 5 \
     --json databaseId,headSha,status,conclusion
-$GH run view <run-id> --log | grep -E '^(ok|FAIL|---)'   # e.g. "ok  github.com/m7jay/pigeon/internal/store"
+$GH run view <run-id> --repo m7jay/pigeon --log | grep -E '^(ok|FAIL|---)'   # e.g. "ok  github.com/m7jay/pigeon/internal/store"
 ```
 
 The `headSha` must be the commit you pushed — a green run for an earlier commit is not
@@ -358,7 +358,7 @@ branch directly, and it still does not merge a PR whose review or CI it has not 
 | helper prints nothing | `gh` unresolvable inside the git helper | keep the helper path absolute in `.gitconfig` |
 | commits show `Jayachandra` | repo-local `user.name` wins over `~/.gitconfig` | set `GIT_AUTHOR_*`/`GIT_COMMITTER_*` for the command (§6) |
 | `403` on `check-runs` | token has no `checks:read` | expected — verify CI by hand (§5) |
-| `GraphQL: Head branch was modified` on `pr merge` | GitHub's cached head lagged a push that just landed (seen after a fast follow-up commit) | `git fetch origin`, confirm `git ls-remote origin refs/heads/<branch>` matches `headRefOid`, retry the merge once — do not drop `--match-head-commit` to get past it |
+| `GraphQL: Head branch was modified` on `pr merge` | `--match-head-commit` found the head was not the SHA you supplied — usually a push landed between your read and the merge, occasionally a stale cached head right after a fast push | Read the head without a checkout: `GH=/opt/data/toolchain/gh; $GH api repos/m7jay/pigeon/git/ref/heads/<branch> --jq .object.sha`. **If it equals the SHA you supplied**, retry the merge once. **If it does not**, stop — the head moved: go back to §7 step 1 and review the new head. Never retry against a SHA that is no longer the head, and never drop `--match-head-commit` to get past the error |
 
 ## 10. Rollback and revocation
 
