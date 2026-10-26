@@ -1,0 +1,77 @@
+# Pigeon — reference deployment (OPS-1, §2.1).
+#
+# Five containers on one modest host: core, producer portal, consumer portal,
+# Postgres, Redis. The portals are separate deployables (§14) and arrive in M2a
+# and M2b; until then this file brings up the three that exist, so `compose up`
+# is always a working command rather than an aspirational one.
+
+name: pigeon
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pigeon
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pigeon}
+      POSTGRES_DB: pigeon
+    command:
+      # OPS-8: the pool budget is documented arithmetic, so the server must
+      # accept it. 100 leaves room for 4 replicas × 10 + reserved.
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pigeon -d pigeon"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # D-5: AOF is mandatory. RDB-only loses the queue, which loses accepted
+    # events' delivery work, and OPS-7 refuses to start against it.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PIGEON_DATABASE_URL: postgres://pigeon:${POSTGRES_PASSWORD:-pigeon}@postgres:5432/pigeon?sslmode=disable
+      PIGEON_REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/pigeon", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # producer-portal:   # M2a — UI-1…UI-11
+  # consumer-portal:   # M2b — UI-12…UI-19
+
+volumes:
+  pgdata:
+  redisdata:
