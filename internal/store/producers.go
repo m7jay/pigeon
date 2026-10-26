@@ -203,16 +203,20 @@ func (s *Store) SetProducerSuspended(ctx context.Context, actor Actor, producerI
 		// A no-op request still writes an audit row: an admin asking twice is
 		// information (an automated caller is stuck in a loop, or a human is
 		// unsure) and the actor trail should show it.
-		return insertAudit(ctx, tx, actor, action, producerID, reason)
+		if err := insertAudit(ctx, tx, actor, action, producerID, reason); err != nil {
+			return err
+		}
+
+		// Re-read rather than compute the new value: an idempotent suspend keeps
+		// the original suspended_at, and a response carrying a fresh `now` would
+		// disagree with the row every later read returns.
+		return tx.QueryRow(ctx, `
+			select id, slug, name, suspended_at, created_at
+			  from producers where id = $1`, producerID,
+		).Scan(&p.ID, &p.Slug, &p.Name, &p.SuspendedAt, &p.CreatedAt)
 	})
 	if err != nil {
 		return Producer{}, err
-	}
-	if suspended {
-		now := time.Now().UTC()
-		p.SuspendedAt = &now
-	} else {
-		p.SuspendedAt = nil
 	}
 	return p, nil
 }
