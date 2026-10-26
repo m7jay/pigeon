@@ -143,6 +143,68 @@ second acceptance for one email fails as a conflict (409) instead of silently
 rebinding. Revoking the binding deletes only `consumer_users`; the consumer row,
 its endpoints and its history stay, and the session stops resolving.
 
+**An invitation never changes an existing account.** 0004's acceptance function
+overwrote the password of whatever user already owned the invited address. Because
+there is no mailer yet and the invitation token is returned to the *inviter*, that
+was an account takeover: any producer owner could invite `admin@pigeon.local`,
+take the token out of the API response, accept it with a chosen password and log in
+as the instance admin. 0005 replaces the function with two rules: (a) acceptance
+never writes `password_hash`, `must_change_password` or `password_changed_at` for an
+existing user, and (b) an invitation addressed to an address that already has an
+account is only redeemable by that account's own session (`POST /v1/invites/accept`
+takes an optional session, and the store answers `403 session_required` without
+one). The token is then a routing hint, not a credential.
+
+The alternative the review suggested — refuse to mint invitations for addresses
+that already have an account — was not taken because FR-105 (a user in more than
+one producer) has no other path in the API: every second membership is an
+invitation for an existing account. Requiring the invitee's own session closes the
+same hole without deleting an in-scope requirement. A regression test
+(`TestInviteAcceptanceCannotRewriteAnExistingAccount`) asserts both halves: the old
+password still works, the attempted new one does not, and the membership is added.
+
+**`pigeon_invite_lookup` runs before bcrypt.** `POST /v1/invites/accept` is the only
+anonymous write in the API. Hashing the supplied password before looking the token
+up turned a random well-formed token into ~250 ms of CPU per request, which is a
+cheap exhaustion vector. The store now resolves the invitation first (one indexed
+read through a `SECURITY DEFINER` function) and hashes only when it is about to
+create a new account.
+
+**Two database roles.** PostgreSQL exempts a table's owner from row-level security,
+so a deployment that migrates and serves as one role has no tenant isolation — the
+policies run for nobody, and the suite would still be green because it connects as
+a non-owner. `compose.yaml` therefore runs migrations as `pigeon_migrator` (the
+owner) and serves as `pigeon_app` (no `SUPERUSER`, no `BYPASSRLS`, no ownership),
+`deploy/postgres/01-roles.sql` creates the runtime role and its default privileges,
+`config.Validate` refuses a configuration that points `PIGEON_MIGRATE_DATABASE_URL`
+at the same role as `PIGEON_DATABASE_URL`, and two tests assert it: one reads the
+shipped artifacts, one asks PostgreSQL whether every tenant table is protected from
+the runtime role. `FORCE ROW LEVEL SECURITY` is deliberately *not* used: the
+`SECURITY DEFINER` authentication functions run as the table owner, so forcing the
+policies would break every pre-authentication lookup.
+
+**FR-208's replay scope is issued and reported; enforcement waits for publish.**
+`POST /v1/producer/keys` accepts `{"replay_scope": true}`, the column is written,
+every read reports it, and the auth path carries it into the request as
+`Principal.ReplayOnly` / `whoami.replay_only`. What a replay-scoped key may *not*
+do cannot be expressed until there is a route to forbid it on: the publish path
+(`POST /events`) arrives in S2, and that is where the scope becomes a rule.
+
+**FR-106 (optional OIDC) is deferred to S9, with password auth staying default.**
+No config key, route or dependency exists for it in S1, and inventing one here would
+mean shipping an unreviewed OIDC integration to satisfy a table row. The portals
+(S9) are where a second login method becomes user-visible. Recorded in PLAN.md's
+slice table, and the earlier "one acceptance test per FR-101…FR-111" claim is
+corrected there: FR-106 has no test because it has no code.
+
+**FR-101's deviation from "printed once to stdout".** `REQUIREMENTS.md` asks for the
+bootstrap credential to be printed once. The implementation reads it from
+`PIGEON_INSTANCE_ADMIN_PASSWORD` and never prints it: a secret on stdout ends up in
+container logs and CI transcripts, which is a worse failure than a documented env
+var. It is still single-use in effect — the first login must change it, and an
+existing admin is never overwritten. This is a deliberate, recorded deviation, not
+an oversight.
+
 **The audit log is append-only by policy.** `admin_audit_log` has insert and select
 policies gated on `pigeon.instance_admin = 'on'` and no update or delete policy, so
 the application role can record and read admin actions but not rewrite them. Rows
@@ -212,3 +274,13 @@ block S0.
    OPS-4, OPS-10 and AC-22 assume a command that checks Postgres, Redis AOF, clock
    skew, disk headroom and `ulimit -n`. Its output format, exit codes and whether it
    runs in the core binary or beside it are open. Affects S10.
+7. **A user with no claims cannot log in, so cannot redeem an invitation.**
+   `CreateSession` refuses a user who has no producer membership, no admin flag and
+   no consumer binding ("an authenticated identity that can do nothing is a support
+   ticket"). That is reasonable, but it means an account that lost its last binding
+   — a consumer user whose access was revoked, or a member removed from a producer —
+   cannot sign in, and since 0005 an invitation for an existing account must be
+   redeemed with that account's own session. Re-inviting such a user is therefore a
+   dead end until there is a mailer (S9) or a password-reset flow (FR-111 names one;
+   no slice owns it). Affects S9, not the S1 acceptance criteria: every S1 flow
+   starts from an account that has a claim.
