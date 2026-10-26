@@ -1,0 +1,132 @@
+package httpapi
+
+import "net/http"
+
+// routeKind is the credential a route requires. It is the whole authorization
+// policy of the service: each handler says what it needs, and authorize() is the
+// only place that decides whether the caller has it.
+//
+// The kinds are ordered from least to most specific so that "which routes are
+// reachable without a producer scope" is answerable by reading this list.
+type routeKind int
+
+const (
+	// kindAnonymous needs no credential. Only /health, the login form and the
+	// invitation-acceptance form are anonymous: accepting an invitation *is* the
+	// credential, and login is how one is obtained.
+	kindAnonymous routeKind = iota
+	// kindSession needs any valid session, and is refused while FR-101's forced
+	// password change is pending.
+	kindSession
+	// kindPasswordChange is the one route a session with a pending forced change
+	// may still call.
+	kindPasswordChange
+	// kindAdmin needs an instance-admin session. Anything less is 404, not 403:
+	// a producer owner must not learn that /v1/admin exists.
+	kindAdmin
+	// kindProducerKey needs a producer API key (FR-201) and is rate limited
+	// (FR-207). This is the ingest credential.
+	kindProducerKey
+	// kindMember needs a session whose claims name a producer and a role
+	// (FR-104): any owner or developer.
+	kindMember
+	// kindOwner needs the same, with role owner.
+	kindOwner
+	// kindConsumer needs a session carrying FR-110's consumer_id claim.
+	kindConsumer
+)
+
+func (k routeKind) String() string {
+	switch k {
+	case kindAnonymous:
+		return "anonymous"
+	case kindSession:
+		return "session"
+	case kindPasswordChange:
+		return "password_change"
+	case kindAdmin:
+		return "admin"
+	case kindProducerKey:
+		return "producer_key"
+	case kindMember:
+		return "member"
+	case kindOwner:
+		return "owner"
+	case kindConsumer:
+		return "consumer"
+	}
+	return "unknown"
+}
+
+// route is one entry of the service's surface.
+type route struct {
+	Method  string
+	Path    string
+	Kind    routeKind
+	Handler http.HandlerFunc
+}
+
+// pattern is what net/http's mux is given: "POST /v1/admin/producers".
+func (r route) pattern() string { return r.Method + " " + r.Path }
+
+// routes is the single source of truth for the HTTP surface. The mux is built
+// from it (Handler), the AC-20 cross-producer suite is generated from it, and
+// the route-inventory test asserts that no route escapes the two.
+//
+// Adding a route means adding it here and adding it to the suite; a route that
+// appears here without a suite case fails TestCrossProducerSuiteCoversEveryRoute.
+func (s *Server) routes() []route {
+	rs := []route{
+		{http.MethodGet, "/health", kindAnonymous, s.handleLiveness},
+		{http.MethodGet, "/health/ready", kindAnonymous, s.handleReadiness},
+
+		// Identity (FR-101, FR-104, FR-110, FR-111).
+		{http.MethodPost, "/v1/session", kindAnonymous, s.handleLogin},
+		{http.MethodDelete, "/v1/session", kindSession, s.handleLogout},
+		{http.MethodGet, "/v1/session", kindSession, s.handleSession},
+		{http.MethodPost, "/v1/session/password", kindPasswordChange, s.handleChangePassword},
+		{http.MethodPost, "/v1/invites/accept", kindAnonymous, s.handleAcceptInvite},
+
+		// The ingest credential (FR-201..FR-207).
+		{http.MethodGet, "/v1/whoami", kindProducerKey, s.handleWhoami},
+
+		// Instance administration (FR-102, FR-107, MT-5).
+		{http.MethodPost, "/v1/admin/producers", kindAdmin, s.handleCreateProducer},
+		{http.MethodGet, "/v1/admin/producers", kindAdmin, s.handleListProducers},
+		{http.MethodGet, "/v1/admin/producers/{producerID}", kindAdmin, s.handleGetProducer},
+		{http.MethodPost, "/v1/admin/producers/{producerID}/suspend", kindAdmin, s.handleSuspendProducer},
+		{http.MethodPost, "/v1/admin/producers/{producerID}/resume", kindAdmin, s.handleResumeProducer},
+		{http.MethodGet, "/v1/admin/producers/{producerID}/audit", kindAdmin, s.handleProducerAudit},
+
+		// Producer membership and invitations (FR-104, FR-105, FR-109).
+		{http.MethodGet, "/v1/producer/members", kindMember, s.handleListMembers},
+		{http.MethodPost, "/v1/producer/invites", kindOwner, s.handleInviteMember},
+		{http.MethodGet, "/v1/producer/invites", kindMember, s.handleListInvites},
+		{http.MethodDelete, "/v1/producer/invites/{inviteID}", kindOwner, s.handleRevokeInvite},
+
+		// Consumers and their users (FR-109, FR-110).
+		{http.MethodGet, "/v1/producer/consumers", kindMember, s.handleListConsumers},
+		{http.MethodPost, "/v1/producer/consumers", kindMember, s.handleCreateConsumer},
+		{http.MethodGet, "/v1/producer/consumers/{consumerID}", kindMember, s.handleGetConsumer},
+		{http.MethodPost, "/v1/producer/consumers/{consumerID}/invites", kindOwner, s.handleInviteConsumerUser},
+		{http.MethodGet, "/v1/producer/consumers/{consumerID}/users", kindMember, s.handleListConsumerUsers},
+		{http.MethodDelete, "/v1/producer/consumers/{consumerID}/users/{userID}", kindOwner, s.handleRevokeConsumerUser},
+
+		// API keys (FR-201..FR-207).
+		{http.MethodPost, "/v1/producer/keys", kindOwner, s.handleIssueKey},
+		{http.MethodGet, "/v1/producer/keys", kindMember, s.handleListKeys},
+		{http.MethodGet, "/v1/producer/keys/{keyID}", kindMember, s.handleGetKey},
+		{http.MethodDelete, "/v1/producer/keys/{keyID}", kindOwner, s.handleRevokeKey},
+
+		// The consumer portal's own scope (FR-110).
+		{http.MethodGet, "/v1/consumer/me", kindConsumer, s.handleConsumerMe},
+	}
+
+	if s.deps.SelfRegistration {
+		// FR-102: self-registration is off by default and enabled by config. When
+		// it is off the route does not exist at all, which is a stronger answer
+		// than a 403 that advertises the feature.
+		rs = append(rs, route{http.MethodPost, "/v1/producers", kindAnonymous, s.handleSelfRegister})
+	}
+	return rs
+}

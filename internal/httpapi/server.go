@@ -1,8 +1,9 @@
-// Package httpapi is the ingest and read API.
+// Package httpapi is the management and ingest API.
 //
-// M0 ships only the surface that proves the skeleton is honest: liveness,
-// readiness, and an authenticated route whose response is filtered by the key
-// that made the request (FR-108). Event and delivery endpoints arrive in M1/M2.
+// Every route is declared once, in routes(), together with the kind of
+// credential it needs. The mux is built from that list, and the tests assert
+// against the same list, so "a route exists that nothing proves" is a failing
+// test rather than a review question (FR-108's done-condition for S1).
 package httpapi
 
 import (
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/m7jay/pigeon/internal/ratelimit"
 	"github.com/m7jay/pigeon/internal/store"
 )
 
@@ -21,12 +23,74 @@ import (
 // tests can exercise the middleware without a database.
 type Lookup func(ctx context.Context, plaintext string) (store.Principal, error)
 
+// SessionLookup resolves a session token. Same reasoning as Lookup.
+type SessionLookup func(ctx context.Context, token string) (store.Session, error)
+
+// Data is the slice of the store the handlers use. It is an interface so the
+// routing and authentication tests can run with no database, and so the handler
+// layer cannot accidentally grow a query of its own: anything not in here is not
+// reachable from HTTP.
+//
+// The concrete implementation is *store.Store, which enforces the tenant scope
+// in SQL as well as in RLS (MT-1).
+type Data interface {
+	CreateProducer(ctx context.Context, actor store.Actor, in store.NewProducer) (store.Producer, store.Invite, error)
+	ListProducers(ctx context.Context) ([]store.Producer, error)
+	GetProducer(ctx context.Context, producerID string) (store.Producer, error)
+	SetProducerSuspended(ctx context.Context, actor store.Actor, producerID string, suspended bool, reason string) (store.Producer, error)
+	ListAudit(ctx context.Context, producerID string) ([]store.AuditEntry, error)
+	SelfRegisterProducer(ctx context.Context, slug, name, email, password string) (store.Producer, error)
+
+	CreateSession(ctx context.Context, in store.LoginInput, ttl time.Duration) (store.Session, string, error)
+	RevokeSession(ctx context.Context, token string) error
+	ChangePassword(ctx context.Context, userID, oldPassword, newPassword string) error
+	AcceptInvite(ctx context.Context, token, password string) (store.AcceptedInvite, error)
+
+	ListMembers(ctx context.Context, sc store.Scope) ([]store.Member, error)
+	InviteMember(ctx context.Context, sc store.Scope, actor store.Actor, email, role string) (store.Invite, error)
+	ListInvites(ctx context.Context, sc store.Scope) ([]store.InviteMeta, error)
+	RevokeInvite(ctx context.Context, sc store.Scope, inviteID string) error
+
+	ListConsumers(ctx context.Context, sc store.Scope) ([]store.Consumer, error)
+	CreateConsumer(ctx context.Context, sc store.Scope, ref, name string) (store.Consumer, error)
+	GetConsumer(ctx context.Context, sc store.Scope, consumerID string) (store.Consumer, error)
+	InviteConsumerUser(ctx context.Context, sc store.Scope, actor store.Actor, consumerID, email string) (store.Invite, error)
+	ListConsumerUsers(ctx context.Context, sc store.Scope, consumerID string) ([]store.ConsumerUser, error)
+	RevokeConsumerUser(ctx context.Context, sc store.Scope, consumerID, userID string) error
+
+	IssueKey(ctx context.Context, sc store.Scope, actor store.Actor) (store.IssuedKey, error)
+	ListKeys(ctx context.Context, sc store.Scope) ([]store.KeyMeta, error)
+	GetKey(ctx context.Context, sc store.Scope, keyID string) (store.KeyMeta, error)
+	RevokeKey(ctx context.Context, sc store.Scope, keyID string) error
+}
+
 // Deps are the collaborators the handlers need. Nil Ready means "nothing to
 // check", which is what the unit tests want.
 type Deps struct {
-	Lookup  Lookup
-	Ready   func(ctx context.Context) error
-	Version string
+	Lookup   Lookup
+	Sessions SessionLookup
+	Data     Data
+	Ready    func(ctx context.Context) error
+	Version  string
+
+	// SessionTTL is how long a login lasts (PIGEON_SESSION_TTL).
+	SessionTTL time.Duration
+
+	// KeyLimiter and ProducerLimiter implement FR-207's two ceilings. A nil
+	// limiter means "no limit", which is what the tests use.
+	KeyLimiter      *ratelimit.Limiter
+	ProducerLimiter *ratelimit.Limiter
+
+	// TouchKey records FR-206's last_used_at. The middleware calls it on a
+	// goroutine after a successful authentication, so a slow or failing evidence
+	// write can never delay or fail the request that carried the key. Nil disables
+	// it (unit tests only).
+	TouchKey func(ctx context.Context, keyID string) error
+
+	// SelfRegistration enables POST /v1/producers (FR-102's "enableable by
+	// config"). Off by default: an internet-facing instance must not let
+	// strangers create tenants.
+	SelfRegistration bool
 }
 
 // Server holds the router and its dependencies.
@@ -41,17 +105,18 @@ func New(deps Deps, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
+	if deps.SessionTTL <= 0 {
+		deps.SessionTTL = 12 * time.Hour
+	}
 	return &Server{deps: deps, log: log}
 }
 
 // Handler returns the fully wrapped router.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /health", s.handleLiveness)
-	mux.HandleFunc("GET /health/ready", s.handleReadiness)
-	mux.Handle("GET /v1/whoami", s.authenticate(http.HandlerFunc(s.handleWhoami)))
-
+	for _, rt := range s.routes() {
+		mux.Handle(rt.pattern(), s.authorize(rt.Kind, rt.Handler))
+	}
 	return s.withRequestID(s.recoverer(mux))
 }
 
@@ -80,9 +145,11 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-// handleWhoami returns the principal the key proved. It exists because it is the
-// smallest route that exercises auth, the RLS scope variable, and the 404 policy
-// end to end, which is what M0's exit criteria test.
+// handleWhoami returns the principal the key proved. It is the smallest route
+// that exercises auth, the RLS scope variables and the 404 policy end to end,
+// which is what M0's exit criteria test; S1 adds the suspension flag, because a
+// suspended producer's key still authenticates and must be told why it is being
+// refused rather than seeing a mystery 403 elsewhere.
 func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 	p, ok := principalFrom(r.Context())
 	if !ok {
@@ -94,28 +161,7 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 		"producer_id": p.ProducerID,
 		"env":         p.Env,
 		"replay_only": p.ReplayOnly,
-	})
-}
-
-// authenticate resolves the bearer key and attaches the principal. Every failure
-// is 401 with the same body: whether a key is unknown, revoked, or malformed is
-// information an attacker would like and an operator does not need.
-func (s *Server) authenticate(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token, ok := bearerToken(r.Header.Get("Authorization"))
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "Authorization: Bearer <key> is required")
-			return
-		}
-		p, err := s.deps.Lookup(r.Context(), token)
-		if err != nil {
-			if !errors.Is(err, store.ErrNotFound) {
-				s.log.Error("api key lookup failed", "error", err, "request_id", requestIDFrom(r.Context()))
-			}
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "invalid api key")
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(withPrincipal(r.Context(), p)))
+		"suspended":   p.Suspended,
 	})
 }
 
@@ -143,4 +189,49 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]string{"code": code, "message": message},
 	})
+}
+
+// maxBody bounds every request body. S1 has no payload larger than a few hundred
+// bytes; the ingest limit (64 KB, FR-606) lands with the ingest path.
+const maxBody = 64 << 10
+
+// decodeJSON reads one JSON body into dst, answering 400 itself when the body is
+// not JSON. It returns false when the caller should stop.
+//
+// Unknown fields are rejected rather than ignored: a typo in `role` or `env` must
+// not silently become a default, because those two fields decide permissions.
+func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "request body must be a JSON object: "+err.Error())
+		return false
+	}
+	return true
+}
+
+// storeError maps the store's sentinel errors onto the API's status codes. The
+// important line is ErrNotFound: every tenant-scoped miss is a 404, never a 403
+// (FR-108), so a wrong producer id is indistinguishable from a nonexistent one.
+func (s *Server) storeError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		// AC-15 says "404, logged". Logging the miss is what makes enumeration
+		// visible instead of indistinguishable from a typo (MT-2); the line
+		// deliberately carries the path and the caller's tenant so an operator can
+		// tell a probe from a bug without another query.
+		s.logProbe(r, err)
+		writeError(w, http.StatusNotFound, "not_found", "no such resource")
+	case errors.Is(err, store.ErrConflict):
+		writeError(w, http.StatusConflict, "conflict", "that resource already exists")
+	case errors.Is(err, store.ErrInvalid), errors.Is(err, store.ErrInvalidEnv):
+		msg := strings.TrimPrefix(err.Error(), store.ErrInvalid.Error()+": ")
+		writeError(w, http.StatusUnprocessableEntity, "invalid", msg)
+	case errors.Is(err, store.ErrAmbiguousProducer):
+		writeError(w, http.StatusBadRequest, "producer_required",
+			"this user belongs to several producers; send producer_slug to choose one")
+	default:
+		s.log.Error("request failed", "error", err, "path", r.URL.Path, "request_id", requestIDFrom(r.Context()))
+		writeError(w, http.StatusInternalServerError, "internal", "internal error")
+	}
 }
