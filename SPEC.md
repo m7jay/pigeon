@@ -482,8 +482,9 @@ roughly three times by counting payload only. Every identifier in `0001_init.sql
 `text` holding a 26-character ULID, so an archive row is a 24 B tuple header plus
 three 27 B text values plus an 8 B `timestamptz`, aligned and line-pointed: about
 124 B in the heap. The `(endpoint_id, event_id)` primary key adds a 62 B btree entry,
-about 76 B once the default `fillfactor = 0.9` is counted, so a pair costs roughly
-200 B all in. At the reference box's sustained 35 deliveries/s the archive holds
+about 73 B once the default `fillfactor = 0.9` is counted and the 4 B item pointer is
+added to the 69 B it yields (62 / 0.9), so a pair costs roughly 200 B all in. At the
+reference box's sustained 35 deliveries/s the archive holds
 48.4 M pairs - the 16 days between the two retentions - which is **about 10 GB**, a
 quarter of SB-8's 40 GB disk rather than the 3 GB the payload count suggested.
 
