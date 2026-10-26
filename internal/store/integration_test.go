@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -41,7 +42,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(admin.Close)
-	if err := db.Migrate(ctx, admin, 30); err != nil {
+	if err := db.Migrate(ctx, admin, 30*time.Second); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return admin
