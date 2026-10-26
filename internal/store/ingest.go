@@ -115,6 +115,20 @@ func (s *Store) PublishEvent(ctx context.Context, sc Scope, in PublishInput) (Pu
 			switch {
 			case in.ConsumerRef != nil:
 				consumerRef = *in.ConsumerRef
+				// FR-508 / AC-23: a consumer_ref that names no consumer is accepted
+				// in live (fan-out records unroutable:consumer_not_registered, zero
+				// deliveries) but refused in test, so an integration bug surfaces
+				// before go-live rather than silently shedding events.
+				if _, err := resolveConsumerByRef(ctx, tx, sc, consumerRef); err != nil {
+					if errors.Is(err, ErrNotFound) {
+						if sc.Env == EnvTest {
+							return fmt.Errorf("%w: no consumer registered with consumer_ref %q in the test environment (FR-508)", ErrInvalid, consumerRef)
+						}
+						// live: accept and let fan-out record the unroutable outcome.
+					} else {
+						return err
+					}
+				}
 			case in.ConsumerID != nil:
 				r, err := resolveConsumerRef(ctx, tx, sc, *in.ConsumerID)
 				if err != nil {
@@ -272,6 +286,27 @@ func resolveConsumerRef(ctx context.Context, tx pgx.Tx, sc Scope, consumerID str
 		return "", err
 	}
 	return ref, nil
+}
+
+// resolveConsumerByRef is the transaction-local form of GetConsumerByRef, used
+// inside PublishEvent so the ref existence check and the event write share one
+// snapshot. A miss is ErrNotFound, which the caller turns into the env-dependent
+// FR-508 answer.
+func resolveConsumerByRef(ctx context.Context, tx pgx.Tx, sc Scope, ref string) (Consumer, error) {
+	var c Consumer
+	err := tx.QueryRow(ctx, `
+		select id, ref, name, env, created_at
+		  from consumers
+		 where producer_id = $1 and env = $2 and ref = $3`,
+		sc.ProducerID, sc.Env, ref,
+	).Scan(&c.ID, &c.Ref, &c.Name, &c.Env, &c.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Consumer{}, ErrNotFound
+	}
+	if err != nil {
+		return Consumer{}, err
+	}
+	return c, nil
 }
 
 func validateOccurredAt(t time.Time) error {
