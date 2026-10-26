@@ -57,6 +57,21 @@ git worktree add "$HERMES_KANBAN_WORKSPACE/wt" -b wt/<card-id>-<slug> origin/<de
 cd "$HERMES_KANBAN_WORKSPACE/wt"
 ```
 
+**Second and later rounds take the existing branch, not a new one.** The branch outlives
+the worktree - `git worktree remove` deletes the directory, not the ref - so `-b` fails
+with `fatal: a branch named 'wt/<card-id>-<slug>' already exists`, and re-cutting it from
+`origin/<default-branch>` would leave you without the commits under review and make your
+push non-fast-forward. Check out the branch that has the PR on it:
+
+```bash
+cd /opt/data/workspace/projects/pigeon
+git fetch origin wt/<card-id>-<slug>
+git worktree prune
+git worktree add "$HERMES_KANBAN_WORKSPACE/wt" wt/<card-id>-<slug>
+cd "$HERMES_KANBAN_WORKSPACE/wt"
+git status -sb        # must show ...origin/wt/<card-id>-<slug>, not a fresh branch
+```
+
 `HERMES_KANBAN_WORKSPACE/wt` is the worktree to use; the scratch workspace root is
 yours and is discarded, so nothing important may live outside `wt/`.
 
@@ -178,15 +193,17 @@ Pass the reviewer explicitly every time: a re-review with no recorded reviewer
 provenance is refused. The card moves to `review` and the dispatcher spawns
 `pigeon-rev`. A review that finds defects calls `kanban_request_changes(task_id,
 reason=...)`, which requeues the card to `pigeon-dev` with a `changes_requested` event
-and re-spawns the implementer. That repeats until the reviewer approves. Only
+and re-spawns the implementer - who checks out the existing branch on the second round
+(§2) rather than re-cutting it. That repeats until the reviewer approves. Only
 `pigeon-rev` calls `kanban_complete` on a code card, and there is no "this team has no
 reviewer" shortcut. None of that is enforced by the tool - nothing refuses an
 implementer that calls `kanban_complete` straight from `running` - so it is a protocol
 the profiles and this file agree on, auditable after the fact from the card's events.
 
 **What the reviewer does, in this order.** Every step is against one head SHA, and that
-SHA is named in the artifact from step 5. Each block sets `GH` itself: a shell variable
-does not survive to the next tool call, and `gh` is not on `PATH` (§8).
+SHA is named in the artifact from step 5. Each block sets `GH` itself so it also runs
+in a fresh shell: `gh` is not on `PATH` (§8), and an inherited variable is not worth
+relying on.
 
 1. Read the head the implementer named. Review that SHA, not whatever is in a worktree.
 
@@ -214,7 +231,8 @@ does not survive to the next tool call, and `gh` is not on `PATH` (§8).
    `mergeStateStatus: CLEAN` (a head that is behind the base still reports `CLEAN` on
    this repo, because protection cannot exist here - if GitHub ever reports `BEHIND`,
    treat it as mergeable, see below), and the PR is not a draft.
-5. **Record the verdict before merging.** `kanban_comment` with the reviewed
+5. **Record the verdict before merging - once, and only for a SHA you have reviewed.**
+   `kanban_comment` with the reviewed
    `headRefOid`, the `ci` run id and its `headSha`, and either `no findings` or the
    finding list. Be plain about what this is: kanban does not enforce it - a
    completion out of the review column needs no evidence at all
@@ -222,12 +240,14 @@ does not survive to the next tool call, and `gh` is not on `PATH` (§8).
    review exempt), and completion metadata is free-form. The comment and the metadata
    are the record a human reads when they ask whether a card was ever really reviewed.
    A completion without them is a protocol violation even though nothing rejects it.
-6. Re-read `headRefOid`. If it moved since step 1, the implementer pushed: go back to
-   step 1 with the new SHA and post a fresh verdict comment naming the new SHA and
-   saying it supersedes the earlier verdict. `kanban_comment` is append-only - there is
-   no edit or delete - so earlier verdicts stay on the card; the newest one is the
-   record and every earlier one is stale by definition. Never merge a SHA you did not
-   review.
+   If the card already carries a verdict from an earlier round, this comment names the
+   reviewed `headRefOid` and says it supersedes every earlier verdict: `kanban_comment`
+   is append-only, there is no edit or delete, so the newest comment is the record and
+   the earlier ones are stale by definition.
+6. Re-read `headRefOid`, as the last control step before merging. If it moved since step
+   1, the implementer pushed: go back to step 1 with the new SHA and review that one -
+   do not write a verdict, and do not carry the earlier verdict over. Never merge a SHA
+   you did not review.
 7. Merge - rebase, never squash and never a merge bubble:
 
 ```bash
@@ -264,14 +284,19 @@ kanban_complete(summary="...", metadata={
 
 That completion is the only thing that moves the card to `done`.
 
-**If the PR is `BEHIND`,** merge anyway. There is no branch protection on this repo
-and rebase merges are allowed, so a branch whose base moved is still mergeable; only
-re-check `mergeable`/`mergeStateStatus` right before the merge and redo step 3 if the
-merge rewrites the head.
+**If the PR is `BEHIND`,** merge anyway. There is no branch protection on this repo and
+rebase merges are allowed, so a branch whose base moved is still mergeable; re-check
+`mergeable`/`mergeStateStatus` right before merging and nothing else. Do not try to
+re-run step 3 after the merge: a rebase merge rewrites the commits and creates new SHAs
+by design, and the branch ref is gone, so there is no run to match. The gate is the CI
+run for the reviewed `headRefOid`, and that is the value `metadata["head_sha"]` keeps -
+the landed commits are the same tree under new SHAs and will not have runs of their
+own.
 
 **If the PR is `DIRTY`,** the branch really conflicts, and neither worker rewrites it:
-§3 and §4 forbid rebasing a branch that has been reviewed, and the force-push that
-would need is refused by the guard. Send it back with `kanban_request_changes`: the
+§3 forbids rewriting a branch another worker has reviewed, §4's "unless the card asks
+for it" exception stops applying once a verdict names the head, and the force-push
+either would need is refused by the guard (§8). Send it back with `kanban_request_changes`: the
 implementer merges the default branch **into** its own branch
 (`git merge origin/<default-branch>`), resolves, and pushes forward. That is a new head
 SHA, so the reviewer starts again at step 1. A replacement PR is only for the
