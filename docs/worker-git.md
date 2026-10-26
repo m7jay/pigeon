@@ -67,11 +67,13 @@ or a push from somewhere else) cannot leave you reviewing a stale base:
 
 ```bash
 cd /opt/data/workspace/projects/pigeon
+: "${HERMES_KANBAN_WORKSPACE:?}"          # never let the rm -rf below run on an empty var
+git worktree unlock "$HERMES_KANBAN_WORKSPACE/wt" 2>/dev/null || true
 git worktree remove --force "$HERMES_KANBAN_WORKSPACE/wt" 2>/dev/null || true
 git fetch origin wt/<card-id>-<slug>
-git worktree prune
-rm -rf "$HERMES_KANBAN_WORKSPACE/wt"     # a leftover directory is not a registered worktree
-                                      # and makes `worktree add` fail with 'already exists'
+rm -rf "$HERMES_KANBAN_WORKSPACE/wt"      # a leftover directory is not a registered worktree
+git worktree prune                        # after the delete: prune only clears registrations
+                                          # whose directory is already gone
 git worktree add -B wt/<card-id>-<slug> "$HERMES_KANBAN_WORKSPACE/wt" origin/wt/<card-id>-<slug>
 cd "$HERMES_KANBAN_WORKSPACE/wt"
 git status -sb        # must show wt/<card-id>-<slug> in sync with origin, not a stale local ref
@@ -260,15 +262,24 @@ relying on.
    whose `headSha` differs is not the gate, however green it is. While the run for
    `headRefOid` reports any status other than `completed` - `queued`, `pending`,
    `requested`, `waiting`, `in_progress` all occur - wait and re-run this step, polling
-   every ~30 s; never merge on the strength of a previous commit's run. If it has not
-   completed after ~15 minutes, stop waiting and send the card back with
-   `kanban_request_changes` naming the stuck run id - an unattended worker must not sit on
-   a run that never starts. A `completed` run whose conclusion is
-   anything but `success` goes back to the implementer: never merge around a red check,
-   never disable one.
+   every ~30 s; never merge on the strength of a previous commit's run. Two different
+   stalls, two different bounds:
+
+   - **never started** (`queued`, `requested`, `waiting`, `pending`): nothing after ~15
+     minutes is a real stall. Stop and send the card back with `kanban_request_changes`,
+     naming the run id and the status it was stuck in.
+   - **`in_progress`**: the workflow's own `timeout-minutes` is the authority
+     (`.github/workflows/ci.yml`), so wait past queue time plus that timeout - about 25
+     minutes - before calling it stuck. Do not bounce a run that the workflow itself is
+     about to resolve.
+
+   A `completed` run whose conclusion is anything but `success` goes back to the
+   implementer: never merge around a red check, never disable one. If runners are
+   unavailable, that is still a send-back - the card waits for a human, it does not
+   merge.
 4. GitHub reports the PR mergeable: `mergeable: MERGEABLE` - if it is `UNKNOWN`, GitHub is
-   still computing, so re-read every ~15 s for up to ~2 minutes and send the card back if
-   it never settles - and the PR is not a draft. The block
+   still computing, so re-read every ~15 s for up to ~2 minutes and then send the card
+   back with `kanban_request_changes` - and the PR is not a draft. The block
    is step 3, not the summary badge: `mergeStateStatus` reads `UNSTABLE` whenever any check
    on the head has not concluded `success`, including one still running, so it is never
    on its own a reason to refuse - and a `completed` non-success run for the reviewed
@@ -330,7 +341,9 @@ That completion is the only thing that moves the card to `done`.
 
 **If the PR is `BEHIND`,** merge anyway. There is no branch protection on this repo and
 rebase merges are allowed, so a branch whose base moved is still mergeable; re-check
-`mergeable` right before merging and nothing else. Do not try to
+`mergeable` before merging - step 6's head re-read and step 7's `--match-head-commit`
+still apply, and do not re-run step 3. A `mergeable: UNKNOWN` here is a wait, not a
+bounce: it is what a just-moved base looks like while GitHub recomputes. Do not try to
 re-run step 3 after the merge: a rebase merge rewrites the commits and creates new SHAs
 by design, and the branch ref is gone, so there is no run to match. The gate is the CI
 run for the reviewed `headRefOid`, and that is the value `metadata["head_sha"]` keeps -
