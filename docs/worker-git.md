@@ -8,10 +8,18 @@ this file is wrong only after it is changed in a PR.
 
 | Thing | Location | Notes |
 |---|---|---|
-| `GH_TOKEN` | each worker profile's `.env` (`pigeon-dev`, `pigeon-rev`, `pigeon-ops`, `pigeon-arch`), mode `600` | Profiles live outside the repo, so the token cannot be committed by accident |
-| git credential helper | `<profile>/home/.gitconfig` → `helper = !/opt/data/toolchain/gh auth git-credential` | No token in this file, in a remote URL, or in any repo config |
-| `gh` CLI | `/opt/data/toolchain/gh` (v2.103.2) | On the worker `PATH` via `PATH=/opt/data/toolchain:${PATH}` in the same `.env` |
+| `GH_TOKEN` | each worker profile's `.env` (`pigeon-dev`, `pigeon-rev`, `pigeon-ops`, `pigeon-arch`), mode `600` | Read by anything that looks at the environment; profiles live outside the repo |
+| `gh` credential store | `<profile>/home/.config/gh/hosts.yml`, mode `600` | **The layer that actually carries auth**: written by `gh auth login --with-token`, needs no environment variable |
+| git credential helper | `<profile>/home/.gitconfig` → `helper = !/opt/data/toolchain/gh auth git-credential` | Absolute path on purpose; no token in this file, in a remote URL, or in any repo config |
+| `gh` CLI | `/opt/data/toolchain/gh` (v2.103.2) | **Not on `PATH`** and cannot be made so — see §8 |
 | commit identity | `GIT_AUTHOR_*` / `GIT_COMMITTER_*` in the same `.env` | See §6 — the shared checkout pins `user.name` locally |
+
+Two layers exist because they fail differently. `hosts.yml` is per-profile state
+read from `$HOME` and works in any shell, including one with a scrubbed
+environment — that is what `git push` and `gh pr create` rely on. `GH_TOKEN` in
+`.env` covers the agent process itself and anything else that reads the
+environment. Neither is in the repository, so a leaked token is never a git-history
+rewrite.
 
 The token is a fine-grained PAT owned by `m7jay`. It can push, open PRs, and read
 Actions runs. It **cannot** read check runs:
@@ -23,17 +31,18 @@ gh: Resource not accessible by personal access token (HTTP 403)   # no checks:re
 
 Because of that, kanban's built-in completion-contract gate cannot verify CI, so
 **cards stay `local-only`** and a worker verifies CI by hand (§5). Do not switch a
-card to a PR-URL completion contract — the gate will block forever on a 403.
+card to a PR-URL completion contract — the gate will block forever on that 403.
 
-Verify credentials are wired before you start:
+Check the wiring before you start. Neither command prints the token:
 
 ```bash
-gh auth status                 # "Logged in to github.com account m7jay (GH_TOKEN)"
+GH=/opt/data/toolchain/gh
+$GH auth status            # ✓ Logged in to github.com account m7jay (.../hosts.yml)
 git config --get credential.https://github.com.helper
 ```
 
-Neither command prints the token. Never `echo $GH_TOKEN`, never put it in a URL,
-never write it into a file under the repo.
+Never `echo $GH_TOKEN`, never put it in a URL, never write it into a file under
+the repo.
 
 ## 2. Pick a workspace
 
@@ -63,7 +72,7 @@ wt/<card-id>-<slug>
 Examples: `wt/t_8b5d4ad0-worker-git-docs`, `wt/t_f78a96c3-s0-postgres-evidence`.
 
 Rules: one branch per card, branched from the repo's current default branch
-(`gh repo view m7jay/pigeon --json defaultBranchRef` — today `feat/m0-skeleton`).
+(`$GH repo view m7jay/pigeon --json defaultBranchRef` — today `feat/m0-skeleton`).
 Never push to `master` or the default branch directly. Never force-push a branch
 that has an open PR.
 
@@ -87,12 +96,15 @@ and never persisted. RLS policy limits reads to the owning producer.
   `REQUIREMENTS.md`, and the slice from `PLAN.md` when the commit closes one.
 - Signing is not required. Do not amend or rebase a branch that already has an
   open PR unless the card asks for it; add commits instead.
+- Check authorship before pushing (`git log -1 --format='%an <%ae>'`); if it says
+  `Jayachandra`, the environment did not load — see §6.
 
 ## 5. Push, PR and CI
 
 ```bash
+GH=/opt/data/toolchain/gh
 git push -u origin wt/<card-id>-<slug>      # credential helper supplies the token
-gh pr create --base <default-branch> \
+$GH pr create --base <default-branch> \
   --title "feat(api): issue producer API keys (FR-201)" \
   --body-file /tmp/pr-body.md
 ```
@@ -104,8 +116,8 @@ CI: check the run for your head commit, and read the log — a skipped test is n
 pass.
 
 ```bash
-gh run list --branch wt/<card-id>-<slug> -L 5
-gh run view <run-id> --log | grep -E '^(ok|FAIL|---)'   # e.g. "ok  github.com/m7jay/pigeon/internal/store"
+$GH run list --branch wt/<card-id>-<slug> -L 5
+$GH run view <run-id> --log | grep -E '^(ok|FAIL|---)'   # e.g. "ok  github.com/m7jay/pigeon/internal/store"
 ```
 
 Put the run id and its conclusion in `kanban_complete(summary=..., metadata=...)`,
@@ -113,9 +125,11 @@ together with `metadata["published_pr"] = "<PR URL>"`.
 
 ## 6. Identity: commits are authored by the worker, not by Jay
 
-The shared checkout pins `user.name = Jayachandra` in `.git/config`, which beats
-`~/.gitconfig`, so a worker must not rely on the profile config for authorship.
-Each profile sets its own identity in `.env`:
+The shared checkout pins `user.name = Jayachandra` in `.git/config`, which outranks
+`~/.gitconfig` in every worktree of that repo (`git config --list --show-origin`
+shows `file:.git/config user.name=Jayachandra`). A worker therefore cannot rely on
+the profile `.gitconfig` for authorship. Each profile sets its own identity in
+`.env`:
 
 ```
 GIT_AUTHOR_NAME=pigeon-dev (agent)
@@ -124,8 +138,17 @@ GIT_COMMITTER_NAME=pigeon-dev (agent)
 GIT_COMMITTER_EMAIL=pigeon-dev.agent@users.noreply.github.com
 ```
 
-Do not override these to impersonate a human, and do not set a different identity
-per commit.
+Those reach the tool shell for dispatcher-spawned workers — a worker process
+snapshots the profile `.env` at startup (other `.env` keys such as
+`TERMINAL_TIMEOUT=60` are visible in its shell). In any shell where they did not
+load, pin them on the command instead of committing as Jay:
+
+```bash
+git -c user.name='pigeon-dev (agent)' \
+    -c user.email='pigeon-dev.agent@users.noreply.github.com' commit -m "..."
+```
+
+Do not impersonate a human, and do not set a different identity per commit.
 
 ## 7. Never merge
 
@@ -137,28 +160,69 @@ After a PR is merged, the branch is deleted by Jay (or the next worker); a worke
 may delete its own branch only after it has confirmed the merge:
 
 ```bash
-gh pr view <n> --json state,mergedAt
+$GH pr view <n> --json state,mergedAt
 git push origin --delete wt/<card-id>-<slug>
 git worktree remove "$HERMES_KANBAN_WORKSPACE/wt"
 ```
 
-## 8. Troubleshooting
+To discard a throwaway branch locally, use `git update-ref -d refs/heads/<branch>`
+— `git branch -D` is refused by the worker's command guard.
+
+## 8. What does not work here (measured, not guessed)
+
+- **`gh` is not on `PATH`.** `/usr/local/bin` and the other baseline `PATH` entries
+  are not writable. `PATH` is also on Hermes' `.env` writer denylist ("fix tool
+  lookup with absolute paths instead"), and the tool shell's `PATH` comes from the
+  process environment, not from `.env`. So: always call `$GH`
+  = `/opt/data/toolchain/gh`, or prefix `export PATH=/opt/data/toolchain:$PATH`
+  inside a single command. Adding `PATH=` to `.env` is inert at best and grows the
+  variable on every reload at worst — do not do it.
+- **A routed `hermes -p <profile> -z` run does not load that profile's `.env`.**
+  Measured with a throwaway marker (`PIGEON_ENV_PROBE=loaded` in the profile
+  `.env`): the child printed `PROBE=unset`, `GH_TOKEN=MISSING`, baseline `PATH`,
+  with and without `--cli`. Those sessions are served by the long-lived
+  multiplexer, which keeps the environment it started with. This is exactly why
+  auth lives in `hosts.yml` rather than in the environment: `git push` and
+  `gh pr create` work in such a shell, `$GH_TOKEN` does not.
+- **Profile `.env` changes reach the *next* worker process, not a running one.**
+  A worker process snapshots `.env` at startup; to give a long-lived surface new
+  environment values, restart the gateway it runs under
+  (`hermes gateway restart`) — never in the middle of another worker's run.
+
+## 9. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `gh: command not found` | profile `.env` missing the `PATH` line | add `PATH=/opt/data/toolchain:${PATH}` to the profile `.env`, or call `/opt/data/toolchain/gh` |
-| `Authentication failed` on push | `GH_TOKEN` absent/empty in the worker's env | check `gh auth status`; the token comes from `<profile>/.env`, mode 600 |
-| helper prints nothing | `gh` not resolvable inside the git helper (PATH differs under git) | the helper uses the absolute path on purpose — keep it absolute |
-| commits show `Jayachandra` | repo-local `user.name` wins over `~/.gitconfig` | the `GIT_AUTHOR_*`/`GIT_COMMITTER_*` lines in `.env` are missing |
-| `403` on `check-runs` | token has no `checks:read` | expected — verify CI by hand with `gh run list` / `gh run view --log` |
+| `gh: command not found` | `gh` is not on `PATH` (§8) | call `/opt/data/toolchain/gh`, or export `PATH` inline for that one command |
+| `Authentication failed` on push | profile `hosts.yml` missing, or `$HOME` not the profile home | `GH=/opt/data/toolchain/gh; HOME=$HOME $GH auth status` |
+| helper prints nothing | `gh` unresolvable inside the git helper | keep the helper path absolute in `.gitconfig` |
+| commits show `Jayachandra` | repo-local `user.name` wins over `~/.gitconfig` | set `GIT_AUTHOR_*`/`GIT_COMMITTER_*` for the command (§6) |
+| `403` on `check-runs` | token has no `checks:read` | expected — verify CI by hand (§5) |
 
-## 9. Rollback and revocation
+## 10. Rollback and revocation
 
-- The whole publishing setup is three files per profile: `.env` (token + PATH +
-  identity), `home/.gitconfig` (credential helper). Delete those lines and the
-  profile can no longer push; nothing else in the environment changes.
-- To revoke access, rotate the PAT at GitHub (Settings → Developer settings →
-  Fine-grained tokens) and rewrite `GH_TOKEN` in the four `.env` files. The old
-  token dies everywhere at once, including any shell that still holds it.
+- The whole publishing setup is three things per profile: the `.env` block
+  (`GH_TOKEN`, identity), `home/.gitconfig` (credential helper), and
+  `home/.config/gh/hosts.yml` (credential store). Remove the `hosts.yml` and the
+  `.gitconfig` helper and that profile can no longer push; nothing else in the
+  environment changes.
+- To revoke access everywhere at once, rotate the PAT at GitHub (Settings →
+  Developer settings → Fine-grained tokens), then rewrite `GH_TOKEN` in the four
+  `.env` files and re-run
+  `HOME=<profile>/home /opt/data/toolchain/gh auth login --with-token < tokenfile`
+  for each profile.
 - Nothing in this setup is stored in the repository, so a leaked-token incident is
   never a git-history rewrite.
+
+## Verified
+
+Run on the build host when this doc landed:
+
+| Check | Result |
+|---|---|
+| `git credential fill` in four profiles, `env -i` with no `GH_TOKEN` | `username` present, `password_len=93` each |
+| `gh auth status` per profile, `env -i` | ✓ logged in as `m7jay` from `<profile>/home/.config/gh/hosts.yml` |
+| throwaway branch `wt/t_8b5d4ad0-throwaway`, pushed with no `GH_TOKEN` and no `gh` on `PATH` | pushed, then deleted (local and remote) |
+| throwaway PR from that branch, same scrubbed environment | opened (#2), then closed with `--delete-branch` |
+| `gh api .../check-runs` | `403 Resource not accessible by personal access token` (expected) |
+| `git grep -I -l github_pat_` / `git log -p --all \| grep -c github_pat_` | clean / `0` |
