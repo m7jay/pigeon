@@ -72,6 +72,28 @@ statements outside a transaction, or `LISTEN` on a pooled connection. (The relay
 `LISTEN/NOTIFY` in S2 will need its own dedicated, non-pooled connection — noted
 here so the pooler decision does not silently break it.)
 
+## Database roles
+
+Two roles, and the split is a security property rather than tidiness:
+
+| Role | Owns objects | Used by | Privileges |
+|---|---|---|---|
+| `pigeon_migrator` | yes | the migration path (`PIGEON_MIGRATE_DATABASE_URL`), `psql` during an incident | owns the schema; creates every table and function |
+| `pigeon_app` | no | the core's request path (`PIGEON_DATABASE_URL`) | `select/insert/update/delete` on tables, `execute` on functions, no `SUPERUSER`, no `BYPASSRLS`, no ownership |
+
+PostgreSQL exempts a table's owner from row-level security. If one role both
+migrates and serves, every policy in `internal/db/migrations` is inert in the
+deployed system — the suite can still prove isolation against `pigeon_app` while
+production has none. That is why `compose.yaml` carries two URLs, why
+`deploy/postgres/01-roles.sql` creates `pigeon_app` without privileges, and why
+`config.Validate` refuses a configuration that points both URLs at the same role.
+
+`pigeon_app` may still `set_config('pigeon.instance_admin', 'on')`; that GUC is a
+bug-and-misrouting gate, not a privilege boundary (SPEC.md), and the tenant
+policies do not consult it. What the split guarantees is that the tenant policies
+apply at all, and that the runtime role cannot create or alter the objects it is
+constrained by.
+
 ## Stateless and singleton processes (OPS-9)
 
 | Process | Scale | Why |

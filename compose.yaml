@@ -12,9 +12,16 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: pigeon
+      # The bootstrap role owns the database and everything the migrations create.
+      # It is the *migrator*, not the application: PostgreSQL exempts a table owner
+      # from row-level security, so a process serving requests on this connection
+      # would have no tenant isolation at all. The runtime role (pigeon_app) is
+      # created unprivileged by deploy/postgres/01-roles.sql before the core starts.
+      POSTGRES_USER: pigeon_migrator
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pigeon}
       POSTGRES_DB: pigeon
+      # Password for the runtime role. Rotate it like any other credential.
+      PIGEON_APP_PASSWORD: ${PIGEON_APP_PASSWORD:-pigeon_app}
     command:
       # OPS-8: the pool budget is documented arithmetic, so the server must
       # accept it. 100 leaves room for 4 replicas × 10 + reserved.
@@ -27,8 +34,9 @@ services:
       - effective_cache_size=1536MB
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres/01-roles.sql:/docker-entrypoint-initdb.d/01-roles.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pigeon -d pigeon"]
+      test: ["CMD-SHELL", "pg_isready -U pigeon_migrator -d pigeon"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -54,7 +62,12 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      PIGEON_DATABASE_URL: postgres://pigeon:${POSTGRES_PASSWORD:-pigeon}@postgres:5432/pigeon?sslmode=disable
+      # Two URLs, two roles, on purpose (docs/topology.md, "Database roles"):
+      #   PIGEON_DATABASE_URL         — serves requests; unprivileged, so RLS applies
+      #   PIGEON_MIGRATE_DATABASE_URL — owns the schema; used only by the migration
+      #                                 path at boot
+      PIGEON_DATABASE_URL: postgres://pigeon_app:${PIGEON_APP_PASSWORD:-pigeon_app}@postgres:5432/pigeon?sslmode=disable
+      PIGEON_MIGRATE_DATABASE_URL: postgres://pigeon_migrator:${POSTGRES_PASSWORD:-pigeon}@postgres:5432/pigeon?sslmode=disable
       PIGEON_REDIS_URL: redis://redis:6379/0
     ports:
       - "8080:8080"
