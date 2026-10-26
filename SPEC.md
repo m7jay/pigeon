@@ -455,9 +455,12 @@ table `delivery_dedupe` copied out of each partition as the sweeper drops it (14
 - The archive is filled by the sweeper (single leaseholder, D-7), which copies the
   partition's `(endpoint_id, event_id, id, created_at)` into it **before** dropping
   that partition, `ON CONFLICT DO NOTHING`, in the same loop iteration as the drop.
-  A failed copy aborts that drop. The one exception is SB-3's disk-pressure drop,
-  which is logged at warn and leaves that partition's tail unarchived - a support
-  answer lost, never a delivery.
+  A failed copy aborts that drop. SB-3 disk pressure is the one thing that overrides
+  this, in two ways, both of which lose support answers and neither of which loses a
+  delivery: a `deliveries` partition dropped before its copy ran leaves that
+  partition's tail unarchived, and a `delivery_dedupe` partition dropped ahead of its
+  retention removes the archive's oldest days whole. Both are logged at warn naming the
+  partition and the days it covered (FR-903, FR-905).
 - `delivery_dedupe` is itself range-partitioned by day and dropped by partition at
   `dedupe_retention` (default 30 d), so SB-2 holds here too and there is no `DELETE`
   and no vacuum pressure. Under disk pressure these partitions are dropped *before*
