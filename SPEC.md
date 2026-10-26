@@ -515,9 +515,13 @@ client-held claim, no signed cookie.
 - Revocation is `UPDATE sessions SET revoked_at = now()`: immediate, one row,
   independent of the consumer record (FR-109). Each instance caches a binding for at
   most 5 s, so revocation takes effect inside 5 s, comfortably inside FR-205's 60 s.
-- Producer-portal sessions reuse the table with `consumer_id` null and a producer
-  role. §8.4's "signed cookie session" is corrected in the same breath: signed means
-  stateless, and stateless means a revocation list, which is this table.
+- Producer-portal sessions reuse the same table with `consumer_id` null and a producer
+  role (FR-112). §8.4's compose table is edited to match: its "signed cookie session"
+  and "scoped token" cells now read `opaque session token (FR-112)`, and the two
+  sentences in §14 that called the portal credential a "scoped token" now name the
+  session bearer. Signed means stateless, stateless means a revocation list, and the
+  revocation list is this table - so a signed cookie here would have been a second
+  mechanism for the row that already exists.
 
 **Trade-off.** One indexed read per authenticated request where a JWT needs none,
 mitigated by the 5 s cache; a session table on the auth path where a JWT needs

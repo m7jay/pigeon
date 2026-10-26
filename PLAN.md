@@ -26,7 +26,7 @@ disagree, the requirements win and this file is wrong.
 | S6 | Attempt buffer + flusher, `synchronous_commit` split, evidence retention | AC-29, AC-33 | S4 | — |
 | S7 | Replay (bounded, idempotent), inspect API, event-level rollup | AC-12, AC-13, AC-32 | S4 | — |
 | S8 | Partitioning, retention-by-disk, partition drop under the sweeper lease | AC-10, AC-18, AC-42 | S4 | — |
-| S9 | Portals — consumer portal (M2b) landed as `t_0eea0b84`; producer portal (M2a) is S9a `t_c0144baa` — scoped tokens, branding; **FR-106 optional OIDC login** and FR-111's password-reset flow (both deferred here — a second login method is a portal-visible feature, and neither exists in S1) | AC-38, AC-39, AC-40 (AC-01 → S9a) | S3 | — |
+| S9 | Portals — consumer portal (M2b) landed as `t_0eea0b84`; producer portal (M2a) is S9a `t_c0144baa` — scoped tokens, branding; **FR-106 optional OIDC login** and FR-111's password-reset flow (both deferred here — a second login method is a portal-visible feature, and neither exists in S1) | AC-38, AC-39, AC-40, AC-47 (AC-01 → S9a) | S3 | — |
 | S10 | Hardening: SSRF at three points, secret rotation, `doctor`, load test, fault-injection matrix in CI; **portal session security (FR-1009)** — `HttpOnly`/`Secure`/`SameSite=Lax` on every portal cookie, a CSRF token on every state-changing POST, cookie lifetime read from the core's `expires_at` | AC-19, AC-22, AC-30, AC-31, AC-34, AC-43, AC-49, AC-50, AC-51 | S5…S9 | — |
 
 Two items are in S2/S3 rather than later, for the reason §17 gives: the outbox
