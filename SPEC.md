@@ -248,6 +248,239 @@ Decisions taken in place of gaps, each with the mechanism that makes it
 implementable and the trade-off it accepts, because a decision without its mechanism
 gets relitigated the moment somebody implements the other one.
 
+### A-1 — Pause thresholds: two sliding windows over failed *attempts*
+
+**Decision.** FR-1202 and FR-1203 are both right; AC-14 is the wrong document. Two
+independent thresholds stay - 10 failed attempts for one `(endpoint, event_type)` in
+a sliding hour pauses that subscription, 100 failed attempts for one endpoint in a
+sliding hour pauses the endpoint - and there is no third level at 50. 50 sits
+between the two thresholds and so triggers neither, which is the only reading that
+explains AC-14 as written: it is the stale number from a single-level draft.
+
+**Mechanism.**
+
+- A *failure* is one attempt that did not return `2xx`: transport error, timeout, or
+  a non-2xx response, retriable or terminal. Successes never touch a counter.
+  Counting attempts rather than terminal deliveries is the point - the pause exists
+  to stop hammering a receiver, and at §9's default backoff a single dead delivery
+  produces 7 failing attempts in its first hour, so a subscription with steady
+  traffic pauses within minutes while a quiet one pauses only once it has genuinely
+  accumulated 10.
+- Each failure updates two Redis sorted sets, `pause:sub:{endpoint_id}:{event_type}`
+  and `pause:ep:{endpoint_id}`, scored by attempt time: `ZADD`, `ZREMRANGEBYSCORE`
+  to trim the window, `ZCARD` to read it, in one pipeline. Each set is trimmed to
+  `threshold+1` members, so an outage that runs for a week still costs 11 entries.
+- The **endpoint threshold is evaluated first**. When it trips, the endpoint pause is
+  written and per-subscription notifications for that endpoint are suppressed for
+  the duration of the pause; otherwise a fully dead endpoint with 10 subscriptions
+  emails once per subscription and then once more, which is the mail storm OBS-10
+  exists to prevent.
+- The pause itself is a column, not a Redis key: `endpoints.pause_reason`/`paused_at`
+  and `subscriptions.pause_reason`/`paused_at`, written in a `ControlTx`
+  (`synchronous_commit=on`). Fan-out requires the endpoint *and* the subscription to
+  be unpaused. There are no cascade rows, so resuming an endpoint is one flag clear
+  and leaves individually paused subscriptions paused - they tripped for their own
+  reason, and the email said which.
+- Resume clears the flag and deletes that key's window. Without the delete the 10
+  failures are still inside the hour and the next one re-pauses immediately, which
+  would make AC-14's "resume works" false.
+- Redis loss is safe in exactly one direction: the counters vanish, so a pause can be
+  delayed by up to an hour but can never be invented, and the pause flags survive, so
+  AC-10's `FLUSHALL` cannot silently unpause a dead endpoint and resume the hammering
+  the pause stopped.
+
+**Trade-off.** A sorted set costs two Redis operations per failure and none per
+success, so the cost tracks the failure rate rather than throughput. A tumbling
+`INCR`+`EXPIRE` window would cost one operation and would also let a window boundary
+deliver twice the threshold inside a few seconds, which is precisely what the
+threshold exists to prevent.
+
+The endpoint threshold has an arithmetic worth stating before someone waits for its
+email: a subscription stops producing failures the moment it pauses, so an endpoint
+can accumulate at most 10 failures per subscription, and 100 is reachable only on an
+endpoint carrying 10 or more subscriptions where *every* one of them is failing.
+Below 10 subscriptions the endpoint level is unreachable and the subscription level
+is the only latch. That is the level's purpose - the subscription threshold catches
+the ordinary single-broken-type case, the endpoint threshold catches total eclipse -
+but it means FR-1203 is deliberately not a second chance for a producer with three
+subscribers.
+
+**Encoded by.** FR-1202, FR-1203 (unchanged), FR-1209, FR-1210, FR-1211, D-8,
+AC-14 (rewritten), AC-44.
+
+### A-2 — NFR-4 was two claims wearing one number
+
+**Decision.** Restate NFR-4 as three claims, each naming its machine and its
+workload, and measure each where it is claimed:
+
+| Claim | Machine | Workload | Pass |
+|---|---|---|---|
+| ingest write path | 2 vCPU / 4 GB (reference) | 1,000 events/s with the relay stopped, so nothing fans out | all `202`, p99 ≤ 100 ms, zero `429`/`5xx`, RSS ≤ 1.5 GB per service, commit rate ≤ 100/s |
+| end-to-end rated load | 2 vCPU / 4 GB (reference) | 250 events/s × 10 subscriptions = 2,500 deliveries/s | NFR-1/NFR-2 hold, queue drains per NFR-6 |
+| end-to-end rated load | 8 vCPU / 16 GB | 1,000 events/s × 10 subscriptions = 10,000 deliveries/s | NFR-1/NFR-2 hold (AC-16) |
+
+The original sentence asserted the third row's workload on the first row's machine.
+That is not an unmeasured claim, it is an impossible one: 10,000 delivery inserts
+plus 10,000 completion updates per second is four times what §8.1 rates the
+reference box for, and §8.1's own table says so a page later.
+
+**Mechanism.** AC-45 is the new test of claim 1, and the load protocol now written
+into §12 is what makes any of the three numbers mean something: 5 minutes of warm-up
+excluded, 30 minutes measured, pass criteria evaluated over the last 10 minutes,
+`attempt_log.mode=buffered`, accepted events reconciled against `events` and `outbox`
+rows rather than against the generator's own counter, and `pg_stat_database`
+sampled to prove FR-815's batching. Claim 1 stops the relay on purpose, because
+delivery amplification is the only thing that separates it from claim 2; the
+end-to-end claims follow in AC-31 and AC-16.
+
+**Trade-off.** Claim 1 is a stronger statement about ingest than this tree has ever
+demonstrated, and if S10 measures below 1,000 events/s the answer is either a defect
+to fix or an amendment to §8.1 recorded as one - never a tolerance quietly added to
+the test. Claim 2 is a smaller headline number than the old NFR-4 advertised (250
+events/s, not 1,000), and it is the number an operator can actually size capacity
+against, which the inflated one was not: §8.1.1 already says so, and an operator who
+plans against 1,000 events/s on a 2 vCPU box discovers the truth at 3 a.m., which is
+the failure mode §8 exists to prevent. Neither claim addresses *sustained* weeks-long
+throughput, which §8.1.1 shows is a disk and retention question, not a CPU one.
+
+### A-3 — The envelope carries the resolved `consumer_ref` and never `consumer_id`
+
+**Decision.** Routing input and envelope output are decoupled. A producer may publish
+with `consumer_id` or `consumer_ref` (FR-505), and every `consumer`-routed event
+leaves the platform carrying the **resolved `consumer_ref`**. `consumer_id` does not
+appear in the envelope at all.
+
+**Mechanism.** `consumers.ref` is `not null` and unique per `(producer, env)`
+(FR-506, `0001_init.sql`), so the case the gap feared - a producer publishes by
+opaque id and the receiver is handed nothing - cannot arise: id to consumer row to
+ref always resolves at fan-out, and the resolved ref is written into the envelope
+once, from the same lookup FR-511 already caches. For `broadcast` events neither
+field is present, as §10 already said. S3's struct is therefore
+`ConsumerRef *string`, nil only for broadcast, with no `ConsumerID` field: a field
+that is always absent, or always ignored, is worse than no field.
+
+The resolution rule for the id form is FR-514, and it is deliberately the same rule
+as the ref form: an unknown, deleted, or other-producer's `consumer_id` is
+`unroutable:consumer_not_registered` in live (`202`) and `422` in test, exactly as
+FR-508 treats an unknown ref. Two different outcomes for "the reference did not
+resolve" would be a silent data-loss asymmetry, and answering a cross-tenant id probe
+with a distinct response would hand out an id-enumeration oracle.
+
+**Trade-off.** The receiver sees only an identifier it already understands: the
+producer's own name for it, which a shared endpoint can route on without a lookup -
+which is why §10 carries it. The cost is that `consumer_id` is the one identifier
+that survives FR-506's re-key, so a consumer that must survive a re-key cannot key on
+the ref; it keys on `id` per event, or on a field in `data` its producer controls -
+the same guidance §10 already gives for replays. Emitting both would have handed
+receivers an internal identifier whose stability we would then owe them, and a spec
+gap is a poor reason to take on a compatibility promise.
+
+**Encoded by.** FR-513, FR-514, §10's field table, AC-23 (extended to id mode).
+
+### A-4 — Dedupe keys are a Postgres archive, not a Redis TTL and not a hot-path row
+
+**Decision.** FR-903's 30-day dedupe answer is served from Postgres twice over: from
+the `deliveries` row while its partition exists (0 to 14 days), and from an archive
+table `delivery_dedupe` copied out of each partition as the sweeper drops it (14 to
+30 days). Nothing about dedupe lives in Redis.
+
+**Mechanism.**
+
+- `delivery_dedupe(endpoint_id, event_id, first_delivery_id, first_seen_at)`,
+  primary key `(endpoint_id, event_id)` and no surrogate id, so the support question
+  "was this a duplicate for this endpoint?" is an index-only scan on an exact key.
+- The archive is filled by the sweeper (single leaseholder, D-7), which copies the
+  partition's `(endpoint_id, event_id, id, created_at)` into it **before** dropping
+  that partition, `ON CONFLICT DO NOTHING`, in the same loop iteration as the drop.
+  A failed copy aborts that drop. The one exception is SB-3's disk-pressure drop,
+  which is logged at warn and leaves that partition's tail unarchived - a support
+  answer lost, never a delivery.
+- `delivery_dedupe` is itself range-partitioned by day and dropped by partition at
+  `dedupe_retention` (default 30 d), so SB-2 holds here too and there is no `DELETE`
+  and no vacuum pressure. Under disk pressure these partitions are dropped *before*
+  delivery partitions, because they are derived.
+- One view, `delivery_dedupe_all`, unions live `deliveries` with the archive, so the
+  support path - and the API that answers it - reads one name and does not care which
+  side answered.
+- Fan-out idempotency does **not** depend on the archive. It is the `deliveries`
+  unique index, whose coverage is exactly as long as an outbox row can exist, which
+  is the only window in which a re-fan-out is possible.
+
+**Trade-off.** Two mechanisms and a union view instead of one insert, and the archive
+lags a partition by at most one sweeper cycle. In exchange the hot path pays nothing:
+an inline row per delivery would add 10,000 control writes per second to the
+reference load, doubling the write amplification §8.1 spends its whole argument
+minimising - and that is what a Redis `SETNX` would have done to Redis, plus it would
+have been lost on the wipe AC-10 exercises, breaking P3 for the one question FR-903
+exists to answer.
+
+The honest cost is disk: the archive only ever holds the 16 days between the two
+retentions, about 64 B per pair, roughly 48 M rows and 3 GB at the reference box's
+sustained 35 deliveries/s. That is real on a 40 GB disk, which is why its retention
+is a knob, why its partitions go first under pressure, and why FR-905 states the
+per-row cost so an operator can size it instead of guessing.
+
+**Adjacent, found here and decided with it: I-3's uniqueness is partial.** I-3 says
+`(event_id, endpoint_id)` is unique "so fan-out and replay are idempotent", but
+FR-1106 requires a replay to *create* a second delivery for that same pair. Both
+cannot be a table constraint. The delivery index is therefore
+`UNIQUE (event_id, endpoint_id) WHERE replay_of_delivery_id IS NULL` - first fan-out
+only - and replay idempotency comes from its own request key (FR-1107). The archive
+records the pair's first delivery and a replay does not touch it. Cost: one invariant
+in two places, which is one more thing a reviewer holds in their head; the
+alternatives were an index that makes FR-1106 unimplementable or dropping the index
+and letting a retried fan-out batch create duplicates.
+
+**Encoded by.** FR-903 (rewritten), FR-905, §6's two dedupe rows, I-3 (amended),
+AC-46.
+
+### A-5 — Consumer sessions are opaque Postgres-backed tokens in an `HttpOnly` cookie
+
+**Decision.** A consumer user's session is an opaque 256-bit random token, stored
+hashed in a `sessions` row that carries the `consumer_id` binding, delivered to the
+browser as `__Host-pigeon_session` and presented to the API as a bearer. No JWT, no
+client-held claim, no signed cookie.
+
+**Mechanism.**
+
+- Login mints the token and stores `sha256(token)` with `user_id`, `producer_id`,
+  `env`, `consumer_id`, `csrf_secret`, `expires_at` (absolute TTL, default 12 h) and
+  `last_seen_at` (idle TTL default 30 min, written at most once a minute through the
+  `EvidenceTx` class so it costs no fsync). The cookie is `HttpOnly; Secure;
+  SameSite=Lax; Path=/` per FR-1009 and carries no data beyond the token.
+- The portal is a server-side API client: its handlers call the core over the network
+  with `Authorization: Bearer <that token>`, `X-Request-Id`, and a double-submit CSRF
+  token on mutations. The browser never holds a credential it can replay at another
+  host, and the API performs the filtering, so a compromised or buggy portal cannot
+  widen a result set it was handed.
+- The same token is a plain bearer, so AC-39's "a consumer user calls the API
+  directly" is testable with the value from the cookie and without inventing a second
+  credential type. A copyable long-lived consumer API token is not in v1.0; if it is
+  ever wanted it is another row in the same table with the same binding columns and
+  no schema change.
+- Revocation is `UPDATE sessions SET revoked_at = now()`: immediate, one row,
+  independent of the consumer record (FR-109). Each instance caches a binding for at
+  most 5 s, so revocation takes effect inside 5 s, comfortably inside FR-205's 60 s.
+- Producer-portal sessions reuse the table with `consumer_id` null and a producer
+  role. §8.4's "signed cookie session" is corrected in the same breath: signed means
+  stateless, and stateless means a revocation list, which is this table.
+
+**Trade-off.** One indexed read per authenticated request where a JWT needs none,
+mitigated by the 5 s cache; a session table on the auth path where a JWT needs
+nothing. In exchange: revocation is a row update rather than a deny-list with its own
+expiry, there is no signing key to rotate or leak, no claim that disagrees with the
+database after a role change, no clock-skew window, and no way for a stale token to
+keep a revoked consumer user alive for the life of its `exp`. A JWT earns its place
+when a stateless edge validates tokens at a scale where the lookup hurts; v1.0 has one
+core binary, and its authorization question is a row lookup either way.
+
+**Also corrected here:** SPEC previously cited "a scoped token per FR-514", and no
+FR-514 existed - the scoped-token sentence was §14's prose only. The requirement is
+now FR-112 and FR-113; FR-514 is assigned to A-3's id-resolution rule, and this
+amendment no longer refers to it.
+
+**Encoded by.** FR-110 (rewritten), FR-112, FR-113, AC-47.
+
 ### A-6 — `pigeon doctor` is a subcommand of the core binary with a scripted contract
 
 **Decision.** `doctor` is a subcommand of `cmd/pigeon`: no second image, no cobra, no
@@ -298,38 +531,42 @@ is an operator decision about data the app does not own.
 
 **Encoded by.** OPS-4 (amended), OPS-10 (amended), OPS-11, AC-48.
 
-## Gap list — where `REQUIREMENTS.md` is silent or inconsistent
+## Gap list — six decided, one open
 
-These are the things to settle before the slice that depends on them. None of them
-block S0.
+Six gaps, each now a decision with a mechanism and a named trade-off. Row 4b is a
+seventh contradiction found while resolving the fourth, recorded here instead of being
+left for S3 to guess at. The seventh numbered item below was found after the
+amendment and is not one of them; it stays open.
 
-1. **AC-14 contradicts FR-1202/FR-1203.** The acceptance criterion pauses a
-   subscription after **50** failures for one endpoint in an hour; the requirements
-   pause a *subscription* at 10 failures per `(endpoint, event_type)` and an
-   *endpoint* at 100. 50 triggers neither. Either AC-14 means "10 failures on one
-   subscription, then 90 more on other types to reach the endpoint threshold", or
-   one of the numbers is stale. Blocks S5.
-2. **NFR-4 has no acceptance criterion on the reference machine.** NFR-4 claims
-   1,000 events/s ingest at 2 vCPU / 4 GB. AC-16 measures 1,000 events/s on
-   8 vCPU / 16 GB, and AC-31 measures 250 events/s on the reference box. So the
-   one number that defines "modest machine" is never tested where it is claimed.
-   Blocks S10's load test, not the build.
-3. **The envelope has no `consumer_id` field.** §10 carries `consumer_ref` only,
-   but FR-505 allows routing by opaque `consumer_id` instead. What does the
-   receiver see in that mode — nothing, or a field that means nothing to them?
-   Affects S3's envelope struct.
-4. **FR-903's 30-day dedupe TTL has no store.** `(endpoint, event_id)` dedupe keys
-   outlive delivery retention (14 d) and are read on the support path. Redis with a
-   TTL, a Postgres table, or a query over `deliveries` — the choice changes whether
-   dedupe survives a Redis wipe, which §6 does not cover. Affects S7.
-5. **Consumer-user session format is unspecified.** FR-110 says the session carries
-   a `consumer_id` claim and every request is filtered server-side, but not whether
-   the portal holds a JWT, an opaque token, or a cookie session, nor how it calls
-   the API (scoped token per FR-514). Affects S9.
-6. **`pigeon doctor` is referenced by three requirements and specified by none.**
-   OPS-4, OPS-10 and AC-22 assume a command that checks Postgres, Redis AOF, clock
-   skew, disk headroom and `ulimit -n`. Its output format, exit codes and whether it
-   runs in the core binary or beside it are open. Affects S10.
+| # | Gap | Decision | Contract changed | Unblocks |
+|---|---|---|---|---|
+| 1 | AC-14 contradicted FR-1202/FR-1203 | A-1 | AC-14 rewritten; FR-1209…FR-1211, D-8 added | S5 |
+| 2 | NFR-4 untestable on the reference machine | A-2 | NFR-1, NFR-4 restated; load protocol in §12; AC-45 added | S10 |
+| 3 | Envelope had no `consumer_id` | A-3 | FR-513, FR-514 added; §10 field table | S3 |
+| 4 | FR-903's 30-day TTL had no store | A-4 | FR-903 rewritten, FR-905 added; two §6 rows; AC-46 | S7 |
+| 4b | I-3 said replay was unique with fan-out (found during 4) | A-4 | I-3 amended to a partial unique index | S3, S7 |
+| 5 | Consumer session format unspecified | A-5 | FR-110 rewritten; FR-112, FR-113 added; AC-47 | S9 |
+| 6 | `pigeon doctor` unspecified | A-6 | OPS-4 and OPS-10 amended; OPS-11 added; AC-48 | S10 |
+
+**They do not contradict each other**, checked pairwise where they touch: A-1's pause
+flags and A-4's archive both ride the control/evidence split in §6 (D-8, FR-812); A-2's
+numbers are §8.1's own table, not new ones; A-3 decides what the envelope shows while
+A-4 decides what Postgres remembers, and dedupe keys on ids so neither reaches the
+other; A-5's sessions are control-state rows read
+most of the time, written at most once a minute; A-6 reads the same environment config
+that A-5's session TTL and A-1's thresholds come from, and its `db.connection_budget`
+check is OPS-8's formula, not a second one.
+
+Two things this list does **not** decide, stated so they are not mistaken for decided:
+whether the endpoint pause threshold should scale with subscription count (A-1 argues
+against it, but it is a product question, and 100 with fewer than 10 subscriptions is
+deliberately unreachable), and whether consumer users get a long-lived API token (A-5
+defers it; the schema does not need to change if they do).
+
+**Item 7 predates nothing and decides nothing here: it was found after this
+amendment and is not one of the six, so it stays open.** It keeps its number so
+`PLAN.md`'s citation of it still resolves.
+
 7. **A user with no claims cannot log in, so cannot redeem an invitation.**
    `CreateSession` refuses a user who has no producer membership, no admin flag and
    no consumer binding ("an authenticated identity that can do nothing is a support
