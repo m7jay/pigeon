@@ -188,6 +188,9 @@ func TestCrossProducerReadsAreEmpty(t *testing.T) {
 			if err := db.SetProducerScope(ctx, tx, producerID); err != nil {
 				return err
 			}
+			if err := db.SetEnvScope(ctx, tx, "live"); err != nil {
+				return err
+			}
 			return tx.QueryRow(ctx, `select count(*) from consumers where id = $1`, consumerID).Scan(&n)
 		})
 		if err != nil {
@@ -201,6 +204,22 @@ func TestCrossProducerReadsAreEmpty(t *testing.T) {
 	}
 	if got := countScoped(aID, "con_delta"); got != 0 {
 		t.Fatalf("producer %s can see %d of producer %s's rows; RLS is not enforcing isolation", aID, got, bID)
+	}
+
+	// FR-103, enforced by the same policy: the producer scope without an
+	// environment scope sees nothing at all, so a query that forgets the
+	// environment fails closed instead of reading both planes.
+	var withoutEnv int
+	if err := db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+		if err := db.SetProducerScope(ctx, tx, aID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `select count(*) from consumers where id = $1`, "con_gamma").Scan(&withoutEnv)
+	}); err != nil {
+		t.Fatalf("read without env scope: %v", err)
+	}
+	if withoutEnv != 0 {
+		t.Fatalf("a transaction with a producer scope but no environment scope saw %d rows; FR-103 is not enforced in SQL", withoutEnv)
 	}
 }
 
@@ -275,5 +294,107 @@ func TestProducersAreAdminOnly(t *testing.T) {
 		return err
 	}); err != nil {
 		t.Fatalf("instance-admin insert failed: %v", err)
+	}
+}
+
+// TestAuditLogIsAppendOnly is MT-5's integrity half: the application role can
+// insert and read audit rows on the admin path, and cannot rewrite them. A log a
+// compromised app role can edit records nothing.
+func TestAuditLogIsAppendOnly(t *testing.T) {
+	admin := testPool(t)
+	app := appPool(t, admin)
+	ctx := context.Background()
+
+	producerID, _ := seedProducer(t, admin, "auditlog")
+	var actorID string
+	if err := admin.QueryRow(ctx, `
+		insert into users (id, email, password_hash) values ('usr_auditor', 'auditor@example.test', 'x')
+		on conflict (id) do update set email = excluded.email returning id`).Scan(&actorID); err != nil {
+		t.Fatalf("seed actor: %v", err)
+	}
+
+	insert := func() error {
+		return db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+			if err := db.SetInstanceAdmin(ctx, tx); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `
+				insert into admin_audit_log (id, actor_user_id, action, target_producer_id, reason)
+				values ('aud_t1', $1, 'producer.suspended', $2, 'testing')`, actorID, producerID)
+			return err
+		})
+	}
+	if err := insert(); err != nil {
+		t.Fatalf("admin path could not write an audit row: %v", err)
+	}
+
+	// No update or delete policy exists, so RLS refuses both silently (0 rows)
+	// rather than erroring: assert the row survives either way.
+	for _, stmt := range []string{
+		`update admin_audit_log set action = 'producer.resumed' where id = 'aud_t1'`,
+		`delete from admin_audit_log where id = 'aud_t1'`,
+	} {
+		_ = db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+			if err := db.SetInstanceAdmin(ctx, tx); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, stmt)
+			return err
+		})
+	}
+
+	var action string
+	if err := admin.QueryRow(ctx, `select action from admin_audit_log where id = 'aud_t1'`).Scan(&action); err != nil {
+		t.Fatalf("audit row disappeared: %v", err)
+	}
+	if action != "producer.suspended" {
+		t.Fatalf("audit row was rewritten to %q; the log must be append-only", action)
+	}
+}
+
+// TestAuthLookupReportsSuspension is FR-107 at the authentication boundary: the
+// key stays valid, and the lookup says the producer is suspended so the caller can
+// answer 403 rather than 401.
+func TestAuthLookupReportsSuspension(t *testing.T) {
+	admin := testPool(t)
+	app := appPool(t, admin)
+	ctx := context.Background()
+
+	producerID, key := seedProducer(t, admin, "suspendedco")
+
+	p, err := LookupAPIKey(ctx, app, key)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if p.Suspended {
+		t.Fatal("a fresh producer is reported suspended")
+	}
+
+	if _, err := admin.Exec(ctx, `update producers set suspended_at = now() where id = $1`, producerID); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	p, err = LookupAPIKey(ctx, app, key)
+	if err != nil {
+		t.Fatalf("lookup after suspension: %v", err)
+	}
+	if !p.Suspended {
+		t.Fatal("a suspended producer's key authenticates without the suspension flag (FR-107)")
+	}
+}
+
+// TestRevokedKeyStopsAuthenticating is FR-205 at the SQL layer, with no cache and
+// no delay: the very next lookup returns nothing.
+func TestRevokedKeyStopsAuthenticating(t *testing.T) {
+	admin := testPool(t)
+	app := appPool(t, admin)
+	ctx := context.Background()
+
+	producerID, key := seedProducer(t, admin, "revokedco")
+	if _, err := admin.Exec(ctx,
+		`update api_keys set revoked_at = now() where producer_id = $1`, producerID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := LookupAPIKey(ctx, app, key); err != ErrNotFound {
+		t.Fatalf("a revoked key still authenticates: err = %v", err)
 	}
 }

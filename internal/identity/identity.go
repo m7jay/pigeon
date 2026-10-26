@@ -4,14 +4,13 @@ package identity
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/m7jay/pigeon/internal/id"
 )
 
 // bcryptCost is 12: the admin credential is checked rarely (at login), so a
@@ -57,24 +56,17 @@ func EnsureInstanceAdmin(ctx context.Context, pool *pgxpool.Pool, password strin
 	}
 
 	// ON CONFLICT DO NOTHING makes two replicas booting together safe: exactly
-	// one insert wins and neither errors.
+	// one insert wins and neither errors. must_change_password is FR-101's forced
+	// change: the bootstrap credential arrives through an environment variable,
+	// which means it also sits in an operator's shell history and possibly a
+	// process listing, so it must not survive first login.
 	tag, err := pool.Exec(ctx, `
-		insert into users (id, email, password_hash, is_instance_admin)
-		values ($1, $2, $3, true)
+		insert into users (id, email, password_hash, is_instance_admin, must_change_password)
+		values ($1, $2, $3, true, true)
 		on conflict (id) do nothing`,
-		newID("usr"), "admin@pigeon.local", hash)
+		id.New("usr"), "admin@pigeon.local", hash)
 	if err != nil {
 		return false, fmt.Errorf("insert instance admin: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
-}
-
-// newID returns a prefixed identifier. ULIDs arrive with the event path in M1;
-// the tenant tables only need uniqueness that sorts lexically per prefix.
-func newID(prefix string) string {
-	var b [12]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("crypto/rand unavailable: " + err.Error())
-	}
-	return prefix + "_" + strings.ToLower(hex.EncodeToString(b[:]))
 }
