@@ -18,7 +18,7 @@ disagree, the requirements win and this file is wrong.
 | # | Slice | Turns green | Depends on | State |
 |---|---|---|---|---|
 | S0 | Repo, module, config, migrations, RLS, API-key auth, `/health` + `/health/ready`, bootstrap admin, cross-producer harness | AC-15 ✅ (SQL layer), AC-20 ✅ (harness runs in CI) | — | **done** — CI run 40307423507 |
-| S1 | Producers, users, environments, instance-admin API, key issue/revoke, rate limits | AC-15 ✅ (HTTP layer), AC-20 ✅ (suite covers every route) | S0 | **done** — CI run 40311482804 |
+| S1 | Producers, users, environments, instance-admin API, key issue/revoke, rate limits | AC-15 ✅ (HTTP layer), AC-20 ✅ (every route classified) | S0 | **done** — CI run 40317878772 (after review round 1) |
 | S2 | Event types (JSON Schema, name regex, payload version), `POST /events` + outbox in one transaction, relay with `SKIP LOCKED` + `LISTEN/NOTIFY` + 1 s poll | AC-08, AC-09 | S1 | — |
 | S3 | Consumers, routing (`consumer_id` / `consumer_ref`), fan-out, delivery rows with `(event_id, endpoint_id)` uniqueness | AC-02, AC-03, AC-23, AC-24, AC-25, AC-27 | S2 | — |
 | S4 | Delivery worker: signing, 5 s timeout, status classification, lease at fan-out, sweeper | AC-04, AC-05, AC-06, AC-07, AC-21, AC-28 | S3 | — |
@@ -26,7 +26,7 @@ disagree, the requirements win and this file is wrong.
 | S6 | Attempt buffer + flusher, `synchronous_commit` split, evidence retention | AC-29, AC-33 | S4 | — |
 | S7 | Replay (bounded, idempotent), inspect API, event-level rollup | AC-12, AC-13, AC-32 | S4 | — |
 | S8 | Partitioning, retention-by-disk, partition drop under the sweeper lease | AC-10, AC-18, AC-42 | S4 | — |
-| S9 | Portals — producer (M2a) and consumer (M2b), scoped tokens, branding | AC-01, AC-38, AC-39, AC-40 | S3 | — |
+| S9 | Portals — producer (M2a) and consumer (M2b), scoped tokens, branding; **FR-106 optional OIDC login** and FR-111's password-reset flow (both deferred here — a second login method is a portal-visible feature, and neither exists in S1) | AC-01, AC-38, AC-39, AC-40 | S3 | — |
 | S10 | Hardening: SSRF at three points, secret rotation, `doctor`, load test, fault-injection matrix in CI | AC-19, AC-22, AC-30, AC-31, AC-34, AC-43 | S5…S9 | — |
 
 Two items are in S2/S3 rather than later, for the reason §17 gives: the outbox
@@ -106,37 +106,37 @@ live database, in CI and on the build host. The admin policy hole is filled; the
 remaining admin surface (HTTP API, separate admin role) is S1's, as listed above.
 Nothing in this section is a claim that was not run.
 
-## Current state (S1) — closed
+## Current state (S1) — closed after review round 1
 
-Evidence: CI run **40311482804** on head `bbc5ad29f1bd34ee6a44a5c8574d8b7878c3454f`
-(`ci`, success, PR #4). The test step ran `go test -count=1 -race -p 1 -v ./...`
-against the `postgres:16` service container and logged:
+Review round 1 (reviewer `pigeon-rev`, on head `c4248aa`) found one exploitable
+defect and three gaps between what the suite proved and what the documents
+claimed. The fixes are migration `0005_s1_invite_hardening.sql`, the database role
+split, the route classification in the AC-20 suite, and FR-208's issuance path;
+each is recorded in `SPEC.md`'s S1 decisions. The claims below were then
+re-verified rather than restated.
 
-    --- PASS: TestCrossProducerRequestsAreNotFound (30.67s)     # AC-15 at the HTTP layer
-    --- PASS: TestCrossProducerSuiteCoversEveryRoute (0.00s)    # AC-20 coverage
-    --- PASS: TestInstanceAdminCreatesProducersAndIsAudited ...  (FR-102, MT-5)
-    --- PASS: TestSuspensionStopsIngestionAndIsReversible ...    (FR-107)
-    --- PASS: TestTestAndLivePlanesAreSeparate ...               (FR-103)
-    --- PASS: TestAPIKeyLifecycleAndRevocation ...               (FR-201..FR-206)
-    --- PASS: TestRateLimitsArePerKeyAndPerProducer ...          (FR-207)
-    --- PASS: TestAuditLogIsAppendOnly ...                       (MT-5)
-    ok      github.com/m7jay/pigeon/internal/httpapi  198.588s
-    AC-15/AC-20: SQL-layer and HTTP-layer cross-producer suites executed and passed
-
-No `--- SKIP` line appeared. CI now requires thirteen named tests (S0's two plus
-eleven S1 acceptance tests) and fails if any is missing, so a rename cannot quietly
-drop an assertion.
+Evidence: CI run **40317878772** on head `2dbe96cb437b320a50317782d1a1cf1fdae364d7`
+(`ci`, success, PR #4), plus the same suite green on Postgres 16.2 on the build
+host as `pigeon_app`. The test step ran `go test -count=1 -race -p 1 -v ./...`
+against the `postgres:16` service container and required **twenty-one** named
+tests (S0's two, S1's eleven acceptance tests, and the eight regression tests this
+review round added); a rename or a removal fails the build. No `--- SKIP` line
+appeared, and CI still treats one as a failure.
 
 What that proves:
 
 - **AC-15 at the HTTP layer.** Every producer-scoped route, aimed at another
   tenant's identifiers, answers `404` with `code=not_found` (never `403`), and the
   refusal is logged as a `cross-producer attempt` naming the requested identifier
-  and the caller's tenant.
-- **AC-20 over every resource.** The suite is generated from the route table
-  (`routes()`), and `TestCrossProducerSuiteCoversEveryRoute` fails when a
-  producer-scoped route exists without a case — so "covers every resource" is a
-  property of the build, not a claim in a document.
+  and the caller's tenant. The two routes that take no identifier —
+  `GET /v1/whoami` and `GET /v1/consumer/me` — are aimed with the other tenant's
+  key and consumer session and must answer with their own scope only.
+- **AC-20 classifies every route.** `TestCrossProducerSuiteCoversEveryRoute` now
+  walks the whole table and requires each route to be either producer-scoped with a
+  cross-producer case or explicitly excluded with a reason
+  (`notProducerScoped`); it reports `30 routes classified, 16 producer-scoped with
+  a cross-producer case`. The previous version skipped every route that was neither
+  `kindMember` nor `kindOwner`, which is how the two above escaped the suite.
 - **No route is reachable without a credential.** Every non-anonymous route answers
   `401` without a bearer token, and the anonymous allow-list is asserted to be
   exactly health, login and invitation acceptance (plus self-registration only when
@@ -145,18 +145,54 @@ What that proves:
   `consumers`, `consumer_users`, `api_keys` and `invites` require
   `env = current_setting('pigeon.env')`; a transaction with a producer scope and no
   environment scope sees zero rows, asserted in `TestCrossProducerReadsAreEmpty`.
+- **Tenant isolation survives the deployed topology.** `TestTenantTablesCannotBeBypassedByTheRuntimeRole`
+  asks PostgreSQL whether every tenant table is RLS-enabled and owned by something
+  other than the runtime role; `TestComposeSplitsTheMigratorFromTheRuntimeRole`
+  reads `compose.yaml` and `deploy/postgres/01-roles.sql` so a one-line edit that
+  collapses the two roles fails the build.
+- **An invitation cannot take over an existing account.**
+  `TestInviteAcceptanceCannotRewriteAnExistingAccount` (store) and
+  `TestInvitationAcceptanceRequiresTheInviteesOwnSession` (HTTP, the reproduced
+  attack) assert that the old password still works, the attempted new one does not,
+  and only the invitee's own session can redeem the token.
+
+Per-requirement map, corrected:
+
+| Requirement | Test |
+|---|---|
+| FR-101 | `TestInstanceAdminCreatesProducersAndIsAudited` (bootstrap + forced change) |
+| FR-102 | `TestInstanceAdminCreatesProducersAndIsAudited` |
+| FR-103 | `TestTestAndLivePlanesAreSeparate`, `TestCrossProducerReadsAreEmpty` |
+| FR-104 | `TestMembershipSpansProducersAndRolesAreEnforced` |
+| FR-105 | `TestMembershipSpansProducersAndRolesAreEnforced` (second membership over the session-bound invitation path) |
+| FR-106 | **no test — deferred to S9** (see `SPEC.md`); the earlier claim of one test per FR was wrong |
+| FR-107 | `TestSuspensionStopsIngestionAndIsReversible`, `TestAuthLookupReportsSuspension` |
+| FR-108 | `TestCrossProducerRequestsAreNotFound`, `TestCrossProducerSuiteCoversEveryRoute` |
+| FR-109 | `TestConsumerUserIsBoundToOneConsumerAndRevocable` |
+| FR-110 | `TestConsumerUserIsBoundToOneConsumerAndRevocable`, `/v1/consumer/me` case |
+| FR-111 | `TestConsumerUserIsBoundToOneConsumerAndRevocable` (no self-registration route) |
+| FR-201…FR-206 | `TestAPIKeyLifecycleAndRevocation` |
+| FR-207 | `TestRateLimitsArePerKeyAndPerProducer` |
+| FR-208 | `TestReplayScopedKeyCanBeIssued` (issuance + reporting; enforcement is S2's publish path) |
+| MT-5 | `TestInstanceAdminCreatesProducersAndIsAudited`, `TestAuditLogIsAppendOnly` |
+| OPS-8 | `TestValidateBudgetIsTheOPS8Arithmetic`, `docs/topology.md` |
 
 Honest limits — the next slices own these:
 
 - **Rate limits are per process.** FR-207 is satisfied for one replica; N replicas
   allow N × the configured rate. The Redis-backed limiter belongs with the
   per-endpoint throttles in S5 (recorded in `SPEC.md`).
-- **The instance-admin DB gate is still a GUC**, not a separate database role. It
-  defends against a forgotten scope in a request path, not against a compromised
-  application role. Splitting the admin path onto its own role remains open.
+- **The instance-admin DB gate is still a GUC.** `pigeon.instance_admin = 'on'` is
+  settable by the runtime role, so it defends against a forgotten tenant scope in a
+  request path, not against a compromised application role. The role split means the
+  tenant policies now *apply* to that role; a distinct admin role that alone may set
+  the marker is still open, and would need its own connection pool.
 - **No mailer.** Invitation tokens are returned once in the API response, like API
-  keys. An operator delivers them; the product path (FR-111's emailed invitation) is
-  a notification concern for the portals.
+  keys. An invitation for an address that already has an account is therefore only
+  redeemable by that account's own session — the token is a routing hint, not a
+  credential. An account that has lost its last binding cannot log in at all, so it
+  cannot redeem one either (`SPEC.md` gap list item 7; S9 owns the mailer and the
+  password reset FR-111 names).
 - **`/v1/producer/*` is not versioned per environment in the URL**, it takes `?env=`
   for member sessions. If the portals prefer a path segment, that is a routing
   change with no data-model consequence.
