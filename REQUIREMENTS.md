@@ -327,8 +327,10 @@ Priorities: **P0** ships or nothing · **P1** in the first release, cuttable und
 | FR-107 | Suspending a producer MUST stop ingestion and non-terminal deliveries, reversibly. | P1 |
 | FR-108 | Producer-scoped resources MUST be reachable only via that producer's credential; violations MUST return `404`, never `403`. | P0 |
 | FR-109 | Producer owners MUST be able to invite a **consumer user**, bound to exactly one consumer, and revoke that access independently of the consumer record. | P0 |
-| FR-110 | A consumer user's session MUST carry a `consumer_id` claim, and every API request made with it MUST be filtered by that claim server-side. | P0 |
+| FR-110 | A consumer user's credential MUST be bound to exactly one `consumer_id` at issuance, and every API request made with it MUST be filtered by that binding server-side, never by a field the client asserts. | P0 |
 | FR-111 | Consumer users MUST authenticate by emailed invitation or password reset; they MUST NOT be able to self-register into a producer. | P0 |
+| FR-112 | A portal session MUST be an opaque random token, stored only as a hash, delivered as an `HttpOnly; Secure; SameSite=Lax` cookie (FR-1009) and accepted by the API as a bearer; the scope binding MUST live in the session record, not in the token or the client. Revocation MUST take effect within 5 s. | P0 |
+| FR-113 | The consumer portal MUST call the core API over the network as a scoped client, presenting that session's bearer and a CSRF token on mutations, and MUST NOT authorise anything itself: a request the portal could make is a request the same token could make directly. | P0 |
 
 ### 7.2 API keys (FR-2)
 
@@ -1019,6 +1021,7 @@ paragraph - S10 MUST NOT implement a second token beside this one.
 | AC-44 | 10 subscriptions on one endpoint all failing, 100 failed attempts within an hour | Endpoint paused once, by the endpoint threshold evaluated first; one email naming the endpoint; per-subscription emails suppressed; every subscription stops receiving; one resume restores each one that had not tripped its own threshold |
 | AC-45 | Ingest-only load on 2 vCPU / 4 GB: 1,000 events/s for 30 minutes with the relay stopped, warm-up excluded | Every request `202`; p99 ≤ 100 ms over the last 10 minutes; zero `429` and zero `5xx`; `events` + `outbox` rows equal the accepted count; commit rate ≤ 100/s; RSS ≤ 1.5 GB per service (NFR-4, §12 load protocol) |
 | AC-46 | With `deliveries` retention set to 1 h, deliver an event, let the sweeper drop the partition, then flush Redis and ask the dedupe question for that `(endpoint, event_id)` | The answer is present, served from `delivery_dedupe`, with its `first_delivery_id` and original timestamp; nothing about the answer came from Redis (FR-905) |
+| AC-47 | A consumer user logs in; the same token is used directly against the API for another consumer's delivery; then the session row is revoked | The cookie is `HttpOnly; Secure; SameSite=Lax` and no credential is readable by script; the direct call returns `404` exactly as through the portal; a mutation without the CSRF token is rejected; after revocation the next request is `401` within 5 s |
 | AC-49 | Every `Set-Cookie` a portal emits (session, flash, CSRF) | Carries `HttpOnly`, `Secure` and `SameSite=Lax`; no portal cookie lacks any of the three |
 | AC-50 | A state-changing `POST` to a portal route - the anonymous `/login` and `/invite` included - with the CSRF token absent or not matching the session cookie: a cross-origin form, or a same-origin request with the hidden field stripped | `403` and no state change; the same `POST` carrying the token the page rendered succeeds |
 | AC-51 | Core `PIGEON_SESSION_TTL=24h`, then log in to a portal; repeat at `15m` | The session cookie's `Max-Age` is the 24 h / 15 m the core issued (from the login response's `expires_at`), not the 12 h constant the portal used to hardcode |
