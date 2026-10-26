@@ -294,7 +294,7 @@ erDiagram
 | Attempt record + response body | Redis list → Postgres batches | **0 on worker crash**; ≤ 1 s if Redis itself dies uncleanly | evidence gap only; the delivery is still driven by its lease |
 | Terminal delivery state | same batch | ≤ 200 ms | delivery re-attempted → duplicate, deduped by the consumer on `event_id` |
 | Dedupe key `(endpoint, event_id)`, first 14 d | the `deliveries` row itself | bounded by partition drop | a support answer is missing; never a delivery |
-| Dedupe key, 14 to 30 d tail | Postgres `delivery_dedupe`, copied from a partition as the sweeper drops it (FR-905) | one sweeper cycle for that partition; nothing at all if the drop was forced by disk pressure (SB-3) | a support answer is missing; never a delivery |
+| Dedupe key, 14 to 30 d tail | Postgres `delivery_dedupe`, copied from a partition as the sweeper drops it (FR-905) | one sweeper cycle for that partition; the whole tail for that partition - every dedupe key it held - if the drop was forced by disk pressure (SB-3), logged at warn (FR-903) | a support answer is missing; never a delivery |
 | Signing secret, config | Postgres, synchronous | none | — |
 
 **Rules**
