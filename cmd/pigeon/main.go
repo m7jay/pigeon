@@ -21,6 +21,7 @@ import (
 	"github.com/m7jay/pigeon/internal/db"
 	"github.com/m7jay/pigeon/internal/httpapi"
 	"github.com/m7jay/pigeon/internal/identity"
+	"github.com/m7jay/pigeon/internal/metrics"
 	"github.com/m7jay/pigeon/internal/ratelimit"
 	"github.com/m7jay/pigeon/internal/relay"
 	"github.com/m7jay/pigeon/internal/store"
@@ -107,6 +108,9 @@ func run() error {
 		log.Warn("instance admin created from PIGEON_INSTANCE_ADMIN_PASSWORD; rotate it after first login (FR-101)")
 	}
 
+	// nonDeliveryMetrics is FR-508's counter set, shared by the relay (which
+	// advances it as events fan out) and the /metrics scrape that reads it.
+	nonDeliveryMetrics := metrics.New()
 	api := httpapi.New(httpapi.Deps{
 		Lookup: func(ctx context.Context, plaintext string) (store.Principal, error) {
 			return store.LookupAPIKey(ctx, pool, plaintext)
@@ -115,6 +119,8 @@ func run() error {
 			return st.LookupSession(ctx, token)
 		},
 		Data: st,
+		// FR-508: the fan-out non-delivery counters, exposed at GET /metrics.
+		Metrics: nonDeliveryMetrics,
 		// FR-206: last_used_at is an evidence write and runs off the request path,
 		// inside the middleware that authenticated the key.
 		TouchKey:         st.TouchKey,
@@ -144,7 +150,7 @@ func run() error {
 			return fmt.Errorf("connect broker: %w", err)
 		}
 		defer br.Close()
-		w := relay.New(st, br, relay.Options{Logger: log})
+		w := relay.New(st, br, relay.Options{Logger: log, Metrics: nonDeliveryMetrics})
 		w.SetNotifier(relay.Notifier(ctx, cfg.DatabaseURL))
 		go func() {
 			log.Info("relay started", "broker", "redis-streams")

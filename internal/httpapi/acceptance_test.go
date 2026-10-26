@@ -30,6 +30,11 @@ type tenant struct {
 	ConsumerUser  string
 	ConsumerToken string
 
+	// EndpointID is a live endpoint under the tenant's consumer, so the routing
+	// (endpoint/subscription) routes have a real id to aim at cross-producer.
+	EndpointID          string
+	EndpointVerifyToken string
+
 	KeyID    string
 	KeyPlain string
 
@@ -96,6 +101,17 @@ func (e *env) seedTenant(t *testing.T, slug string) *tenant {
 	})
 	mustStatus(t, code, raw, http.StatusCreated)
 	tn.ConsumerID = decode[consumerJSON](t, raw).ID
+
+	// An endpoint for the consumer (FR-401), so the routing routes have a real id
+	// to aim at cross-producer. The create response carries the one-time
+	// verification token, which the verify case needs.
+	code, raw = e.do(http.MethodPost, "/v1/producer/consumers/"+tn.ConsumerID+"/endpoints?env=live", tn.OwnerToken, map[string]string{
+		"name": "endpoint of " + slug, "url": "https://8.8.8.8/hook",
+	})
+	mustStatus(t, code, raw, http.StatusCreated)
+	createdEP := decode[endpointCreatedJSON](t, raw)
+	tn.EndpointID = createdEP.ID
+	tn.EndpointVerifyToken = createdEP.VerificationToken
 
 	tn.ConsumerEmail = slug + "-consumer@example.test"
 	code, raw = e.do(http.MethodPost, "/v1/producer/consumers/"+tn.ConsumerID+"/invites?env=live",

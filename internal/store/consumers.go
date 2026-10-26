@@ -113,3 +113,68 @@ func (s *Store) GetConsumer(ctx context.Context, sc Scope, consumerID string) (C
 	}
 	return c, nil
 }
+
+// GetConsumerByRef resolves the producer's own identifier (§7.5a) to a consumer.
+// It is the routing lookup: a fan-out resolves an event's consumer_ref here, and
+// a miss is the unroutable case (FR-508), not a caller error, because the
+// producer's external identifier is allowed to name a not-yet-onboarded consumer.
+// The ref is case-sensitive and unique per (producer, env) (FR-506), so the miss
+// is unambiguous.
+func (s *Store) GetConsumerByRef(ctx context.Context, sc Scope, ref string) (Consumer, error) {
+	var c Consumer
+	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `
+			select id, ref, name, env, created_at
+			  from consumers
+			 where producer_id = $1 and env = $2 and ref = $3`,
+			sc.ProducerID, sc.Env, ref,
+		).Scan(&c.ID, &c.Ref, &c.Name, &c.Env, &c.CreatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	})
+	if err != nil {
+		return Consumer{}, err
+	}
+	return c, nil
+}
+
+// RekeyConsumer changes a consumer's ref (FR-506). The ref is immutable by every
+// other path - there is no update-ref on Create or a generic Update white-listing
+// it - so this is the one explicit operation that moves the routing key. A
+// duplicate ref (another consumer in this producer+env already holds it) is
+// ErrConflict; an unknown consumer id is ErrNotFound. The re-key is a single
+// UPDATE inside the scope transaction, so it commits with the rest of the caller's
+// work or not at all.
+func (s *Store) RekeyConsumer(ctx context.Context, sc Scope, consumerID, newRef string) (Consumer, error) {
+	if !refPattern.MatchString(newRef) {
+		return Consumer{}, fmt.Errorf("%w: ref must be 1-128 characters with no surrounding whitespace", ErrInvalid)
+	}
+	var c Consumer
+	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `
+			update consumers
+			   set ref = $1
+			 where producer_id = $2 and env = $3 and id = $4`,
+			newRef, sc.ProducerID, sc.Env, consumerID)
+		if err != nil {
+			// The (producer_id, env, ref) unique constraint is FR-506's case-sensitive
+			// uniqueness; a collision is a conflict the caller can act on.
+			return mapPgError(err, ErrConflict, ErrNotFound)
+		}
+		if res.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return tx.QueryRow(ctx, `
+			select id, ref, name, env, created_at
+			  from consumers
+			 where producer_id = $1 and env = $2 and id = $3`,
+			sc.ProducerID, sc.Env, consumerID,
+		).Scan(&c.ID, &c.Ref, &c.Name, &c.Env, &c.CreatedAt)
+	})
+	if err != nil {
+		return Consumer{}, err
+	}
+	return c, nil
+}
