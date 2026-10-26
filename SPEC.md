@@ -242,6 +242,72 @@ Go 1.23+ is required. On this build host it is installed at
 normal machine the stock `go` on `PATH` is all that is needed. Docker is not
 required to build or test the core.
 
+## Amendments
+
+Decisions taken in place of gaps, each with the mechanism that makes it
+implementable and the trade-off it accepts, because a decision without its mechanism
+gets relitigated the moment somebody implements the other one.
+
+### A-1 — Pause thresholds: two sliding windows over failed *attempts*
+
+**Decision.** FR-1202 and FR-1203 are both right; AC-14 is the wrong document. Two
+independent thresholds stay - 10 failed attempts for one `(endpoint, event_type)` in
+a sliding hour pauses that subscription, 100 failed attempts for one endpoint in a
+sliding hour pauses the endpoint - and there is no third level at 50. 50 sits
+between the two thresholds and so triggers neither, which is the only reading that
+explains AC-14 as written: it is the stale number from a single-level draft.
+
+**Mechanism.**
+
+- A *failure* is one attempt that did not return `2xx`: transport error, timeout, or
+  a non-2xx response, retriable or terminal. Successes never touch a counter.
+  Counting attempts rather than terminal deliveries is the point - the pause exists
+  to stop hammering a receiver, and at §9's default backoff a single dead delivery
+  produces 7 failing attempts in its first hour, so a subscription with steady
+  traffic pauses within minutes while a quiet one pauses only once it has genuinely
+  accumulated 10.
+- Each failure updates two Redis sorted sets, `pause:sub:{endpoint_id}:{event_type}`
+  and `pause:ep:{endpoint_id}`, scored by attempt time: `ZADD`, `ZREMRANGEBYSCORE`
+  to trim the window, `ZCARD` to read it, in one pipeline. Each set is trimmed to
+  `threshold+1` members, so an outage that runs for a week still costs 11 entries.
+- The **endpoint threshold is evaluated first**. When it trips, the endpoint pause is
+  written and per-subscription notifications for that endpoint are suppressed for
+  the duration of the pause; otherwise a fully dead endpoint with 10 subscriptions
+  emails once per subscription and then once more, which is the mail storm OBS-10
+  exists to prevent.
+- The pause itself is a column, not a Redis key: `endpoints.pause_reason`/`paused_at`
+  and `subscriptions.pause_reason`/`paused_at`, written in a `ControlTx`
+  (`synchronous_commit=on`). Fan-out requires the endpoint *and* the subscription to
+  be unpaused. There are no cascade rows, so resuming an endpoint is one flag clear
+  and leaves individually paused subscriptions paused - they tripped for their own
+  reason, and the email said which.
+- Resume clears the flag and deletes that key's window. Without the delete the 10
+  failures are still inside the hour and the next one re-pauses immediately, which
+  would make AC-14's "resume works" false.
+- Redis loss is safe in exactly one direction: the counters vanish, so a pause can be
+  delayed by up to an hour but can never be invented, and the pause flags survive, so
+  AC-10's `FLUSHALL` cannot silently unpause a dead endpoint and resume the hammering
+  the pause stopped.
+
+**Trade-off.** A sorted set costs two Redis operations per failure and none per
+success, so the cost tracks the failure rate rather than throughput. A tumbling
+`INCR`+`EXPIRE` window would cost one operation and would also let a window boundary
+deliver twice the threshold inside a few seconds, which is precisely what the
+threshold exists to prevent.
+
+The endpoint threshold has an arithmetic worth stating before someone waits for its
+email: a subscription stops producing failures the moment it pauses, so an endpoint
+can accumulate at most 10 failures per subscription, and 100 is reachable only on an
+endpoint carrying 10 or more subscriptions where *every* one of them is failing.
+Below 10 subscriptions the endpoint level is unreachable and the subscription level
+is the only latch. That is the level's purpose - the subscription threshold catches
+the ordinary single-broken-type case, the endpoint threshold catches total eclipse -
+but it means FR-1203 is deliberately not a second chance for a producer with three
+subscribers.
+
+**Encoded by.** FR-1202, FR-1203 (unchanged), FR-1209, FR-1210, FR-1211, D-8,
+AC-14 (rewritten), AC-44.
+
 ## Gap list — where `REQUIREMENTS.md` is silent or inconsistent
 
 These are the things to settle before the slice that depends on them. None of them
