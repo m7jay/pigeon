@@ -128,9 +128,16 @@ $GH run list --branch wt/<card-id>-<slug> -L 5
 $GH run view <run-id> --log | grep -E '^(ok|FAIL|---)'   # e.g. "ok  github.com/m7jay/pigeon/internal/store"
 ```
 
-Put the run id and its conclusion in `kanban_request_review(summary=..., metadata=...)`
-with `reviewer="pigeon-rev"`, together with `metadata["published_pr"] = "<PR URL>"`. The
-implementer does not call `kanban_complete` on a code card - section 7.
+Put the run id and its conclusion in the review request, naming every key:
+
+```python
+kanban_request_review(task_id, summary="...", reviewer="pigeon-rev", metadata={
+    "ci_run_id": <run id>, "ci_conclusion": "success",
+    "head_sha": "<the head you pushed>", "published_pr": "<PR URL>",
+})
+```
+
+The implementer does not call `kanban_complete` on a code card - section 7.
 
 ## 6. Identity: commits are authored by the worker, not by Jay
 
@@ -162,50 +169,78 @@ Do not impersonate a human, and do not set a different identity per commit.
 ## 7. The review loop decides done, and the reviewer merges
 
 Card state is the gate, not the GitHub review pane. A code card reaches `done` only
-when `pigeon-rev` completes it, and the merge happens at that moment.
+when `pigeon-rev` calls `kanban_complete` on it. The reviewer merges the PR first and
+completes the card immediately after - in that order, in the same run.
 
 **The loop is mandatory.** `pigeon-dev` implements, opens the PR, and submits with
-`kanban_request_review(task_id, summary=..., reviewer="pigeon-rev")`. Pass the
-reviewer explicitly every time: a re-review with no recorded reviewer provenance is
-refused. The card moves to `review` and the dispatcher spawns `pigeon-rev`. A review
-that finds defects calls `kanban_request_changes(task_id, reason=...)`, which requeues
-the card to `pigeon-dev` with a `changes_requested` event and re-spawns the
-implementer. That repeats until the reviewer approves. No worker calls
-`kanban_complete` on a code card it did not review, and there is no "this team has no
+`kanban_request_review(task_id, summary=..., metadata={...}, reviewer="pigeon-rev")`.
+Pass the reviewer explicitly every time: a re-review with no recorded reviewer
+provenance is refused. The card moves to `review` and the dispatcher spawns
+`pigeon-rev`. A review that finds defects calls `kanban_request_changes(task_id,
+reason=...)`, which requeues the card to `pigeon-dev` with a `changes_requested` event
+and re-spawns the implementer. That repeats until the reviewer approves. Only
+`pigeon-rev` calls `kanban_complete` on a code card, and there is no "this team has no
 reviewer" shortcut.
 
-**What the reviewer verifies before approving** - all three, against the current head
-SHA:
+**What the reviewer does, in this order.** Every step is against one head SHA, and that
+SHA is named in the artifact from step 5:
 
-1. **CI is green on that exact SHA.** The latest `ci` run for the PR head reports
-   `completed / success` (`$GH run list --repo m7jay/pigeon --branch <branch>`). A
-   green run from an earlier commit is not the gate. If CI is red, it goes back to the
-   implementer: never merge around a red check, never disable one.
-2. **A defect pass over auth, tenant isolation, SQL and tests**, reported as
+1. Read the head the implementer named: `$GH pr view <n> --json headRefOid,mergeable,
+   mergeStateStatus,isDraft,title,body`. Review that SHA, not whatever is in a
+   worktree.
+2. A defect pass over auth, tenant isolation, SQL and tests, reported as
    `file:line - problem - fix`. Restating the diff is not a review.
-3. **GitHub reports the PR mergeable.** `mergeable: MERGEABLE`,
+3. CI is green on that exact SHA: the latest `ci` run for the PR head reports
+   `completed / success` (`$GH run list --repo m7jay/pigeon --branch <branch>`). A
+   green run from an earlier commit is not the gate. A red check goes back to the
+   implementer - never merge around it, never disable one.
+4. GitHub reports the PR mergeable: `mergeable: MERGEABLE`,
    `mergeStateStatus: CLEAN`, and the PR is not a draft.
-
-**Who merges: the reviewer, at approval - not the implementer.**
+5. **Record the verdict before merging.** `kanban_comment` with the reviewed
+   `headRefOid`, the `ci` run id, and either `no findings` or the finding list. A
+   completion without that comment is not a review and does not count.
+6. Re-read `headRefOid`. If it moved since step 1, the implementer pushed: go back to
+   step 1 with the new SHA. Never merge a SHA you did not review.
+7. Merge - rebase, never squash and never a merge bubble:
 
 ```bash
-$GH pr merge <n> --rebase --delete-branch
-$GH pr view <n> --json state,mergedAt     # mergedAt must be set
-git worktree remove "$HERMES_KANBAN_WORKSPACE/wt"
+GH=/opt/data/toolchain/gh
+$GH pr merge <n> --repo m7jay/pigeon --rebase
+$GH pr view <n> --repo m7jay/pigeon --json state,mergedAt,mergeCommit,headRefOid
 ```
 
-Then `kanban_complete(summary=..., metadata={"pr": <n>, "merge_commit": <sha>})`. That
-completion is the only thing that moves the card to `done`. `--rebase` and not
-`--merge`: the branch lands as individual commits, not one squashed blob and not a
-merge bubble. If the PR goes `BEHIND` or `DIRTY`, rebase onto the default branch, push,
-and let CI run again before merging.
+`mergeCommit.oid` is the value for `metadata["merge_commit"]`; it is `null` until the
+merge lands, so read it after the merge returns, not before. Do not pass
+`--delete-branch`: the branch is checked out in the implementer's worktree and git
+refuses to delete a branch in use. Remove the remote ref yourself, then complete:
+
+```bash
+git push origin --delete wt/<card-id>-<slug>
+```
+
+```python
+kanban_complete(summary="...", metadata={
+    "pr": <n>, "merge_commit": "<mergeCommit.oid>",
+    "head_sha": "<reviewed headRefOid>", "ci_run_id": <run id>,
+})
+```
+
+That completion is the only thing that moves the card to `done`. The implementer's
+scratch workspace, including its `wt/`, is discarded with its run - the reviewer has no
+worktree of its own and does not need one.
+
+**If the PR is `BEHIND` or `DIRTY`** it needs a rebase, and the reviewer does not do
+it: §3 and §4 forbid rewriting a branch that has been reviewed, and the command guard
+refuses the `--force` push that a rebase of an open branch would need. Send it back
+with `kanban_request_changes`. The implementer either adds commits, or replaces the
+branch with the delete-then-push dance in §3 and opens a replacement PR - which the
+reviewer then reviews from scratch, because the head SHA changed.
 
 **Where the verdict lives: the card.** `gh pr review` is not usable here - the token
 belongs to the PR's own author and GitHub refuses it (`Review Can not request changes
 on your own pull request`), so `reviewDecision` on these PRs stays empty forever and
-must never be used as the gate. The reviewer records its verdict as a card comment and
-may mirror it to the PR for humans; the card event is what the loop and the next
-worker act on.
+must never be used as the gate. The card comment from step 5 is the review artifact; it
+may be mirrored to the PR for humans, but the card is what the loop acts on.
 
 **Corollary: a PR comment is not a review.** Nothing polls the GitHub thread. A finding
 left on a PR by a human is invisible to the loop until it is copied into the card with
