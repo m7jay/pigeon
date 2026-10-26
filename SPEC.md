@@ -453,11 +453,26 @@ minimising - and that is what a Redis `SETNX` would have done to Redis, plus it 
 have been lost on the wipe AC-10 exercises, breaking P3 for the one question FR-903
 exists to answer.
 
-The honest cost is disk: the archive only ever holds the 16 days between the two
-retentions, about 64 B per pair, roughly 48 M rows and 3 GB at the reference box's
-sustained 35 deliveries/s. That is real on a 40 GB disk, which is why its retention
-is a knob, why its partitions go first under pressure, and why FR-905 states the
-per-row cost so an operator can size it instead of guessing.
+The honest cost is disk, and the first draft of this amendment understated it by
+roughly three times by counting payload only. Every identifier in `0001_init.sql` is
+`text` holding a 26-character ULID, so an archive row is a 24 B tuple header plus
+three 27 B text values plus an 8 B `timestamptz`, aligned and line-pointed: about
+124 B in the heap. The `(endpoint_id, event_id)` primary key adds a 62 B btree entry,
+about 76 B once the default `fillfactor = 0.9` is counted, so a pair costs roughly
+200 B all in. At the reference box's sustained 35 deliveries/s the archive holds
+48.4 M pairs - the 16 days between the two retentions - which is **about 10 GB**, a
+quarter of SB-8's 40 GB disk rather than the 3 GB the payload count suggested.
+
+Storing the ids as `uuid` would cut that by about a third (16 B keys instead of 26 B
+text plus a varlena header) and is not available: the ids are ULID text at every layer,
+so the archive cannot change their encoding without introducing a second representation
+of the same key at the exact seam where a support answer is already hard to get. The
+number is therefore managed rather than optimised away - retention is a knob, the
+archive's partitions are dropped first under pressure (SB-3), and FR-905 requires the
+size to be published from `pg_total_relation_size`, so an operator reads the real
+figure instead of trusting this estimate. Every figure in this paragraph is an
+assumption an operator can check with one query, which is the only kind of disk number
+worth writing down.
 
 **Adjacent, found here and decided with it: I-3's uniqueness is partial.** I-3 says
 `(event_id, endpoint_id)` is unique "so fan-out and replay are idempotent", but
