@@ -78,6 +78,16 @@ func SetProducerScope(ctx context.Context, tx pgx.Tx, producerID string) error {
 	return err
 }
 
+// SetEnvScope sets the second half of the tenant predicate: FR-103 separates
+// test and live data, and since 0004 the policies on the environment-bearing
+// tables require `env = current_setting('pigeon.env')` as well as the producer
+// id. A transaction that sets only the producer sees no rows at all, which is
+// the failure mode we want (fail closed) rather than a cross-plane read.
+func SetEnvScope(ctx context.Context, tx pgx.Tx, env string) error {
+	_, err := tx.Exec(ctx, "select set_config('pigeon.env', $1, true)", env)
+	return err
+}
+
 // SetInstanceAdmin marks the transaction as the instance-admin path. It is what
 // the producers_admin policy in 0003 reads: without it, producers stay invisible
 // even to the application role (fail closed).
