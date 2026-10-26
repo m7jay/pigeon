@@ -134,7 +134,7 @@ Install is one `docker compose up` that brings up all five. No cloud account, no
                  relay (SKIP LOCKED, LISTEN/NOTIFY + 1 s poll)      │
                                  ▼               └────────────────┘
                           ┌──────────────┐              ▲
-                          │ Redis Streams│              │ scoped tokens
+                          │ Redis Streams│              │ session token
                           │ events       │              │ (same API)
                           │ deliveries:* │──────────────┘
                           │ dlq · limits │
@@ -696,8 +696,8 @@ Three independent ladders. Adding capacity to one does nothing for the others, a
 | Relay | yes | N | `SKIP LOCKED` prevents double-claim (FR-702) |
 | Fan-out consumer | yes | N | Redis Streams consumer group |
 | Delivery workers | yes | N | `(event_id, consumer_id)` unique makes duplicate consumption harmless |
-| Producer portal | yes | N | thin API client, signed cookie session |
-| Consumer portal | yes | N | thin API client, scoped token |
+| Producer portal | yes | N | thin API client, opaque session token (FR-112) |
+| Consumer portal | yes | N | thin API client, opaque session token (FR-112) |
 | Flusher | yes, but | few | batching amortises better with fewer writers |
 | **Sweeper** | **no** | **1, leased** | partition drops are destructive (D-7) |
 | **Migrations** | **no** | **1, advisory lock** | §2.2 stack |
@@ -876,7 +876,7 @@ Logs are for **debugging the process**; the database is for **answering question
 
 ## 14. Portals
 
-Three deployables: the **core** (API and workers, no UI), the **producer portal** (producer-facing), and the **consumer portal** (consumer-facing). Both portals are server-rendered web apps sharing a component library, shipped as separate containers, independently hostable and independently themeable. Neither embeds business logic: each is a thin API client over the same public API using scoped tokens, so anything the portal can do is also scriptable.
+Three deployables: the **core** (API and workers, no UI), the **producer portal** (producer-facing), and the **consumer portal** (consumer-facing). Both portals are server-rendered web apps sharing a component library, shipped as separate containers, independently hostable and independently themeable. Neither embeds business logic: each is a thin API client over the same public API using the session bearer in FR-112, so anything the portal can do is also scriptable.
 
 Splitting them is the whole point. They have different audiences (a producer's engineers versus its customers' engineers), different authentication (producer SSO versus emailed invitations), different release cadences, and different branding - the consumer portal carries the producer's brand, not Pigeon's. A single fused dashboard is how the production system ended up with a portal only its own team could use.
 
@@ -909,7 +909,7 @@ Splitting them is the whole point. They have different audiences (a producer's e
 | UI-18 | A Standard Webhooks verification snippet tailored to their own endpoint and `whsec_` secret. | P1 |
 | UI-19 | The consumer portal MUST be deployable on its own host and DNS name, and MAY be omitted entirely for API-only producers. | P0 |
 
-**Authorization is server-side.** Every consumer-portal request is scoped by `consumer_id` on a scoped token; the UI hiding a control is not the control. A consumer user calling the API directly MUST receive exactly the same filtered result set as through the portal (AC-20, AC-39).
+**Authorization is server-side.** Every consumer-portal request is scoped by the `consumer_id` binding on its own session record (FR-110, FR-112); the UI hiding a control is not the control. A consumer user calling the API directly MUST receive exactly the same filtered result set as through the portal (AC-20, AC-39).
 
 **Session security is a portal contract, not a dashboard preference (FR-1009).**
 Every cookie a portal sets carries `HttpOnly`, `Secure` and `SameSite=Lax` - a flash
