@@ -286,7 +286,7 @@ func (s *Store) VerifyEndpoint(ctx context.Context, sc Scope, endpointID, token 
 		res, err := tx.Exec(ctx, `
 			update endpoints set verified_at = now()
 			where producer_id = $1 and env = $2 and id = $3 and status <> 'deleted'
-			  and (verified_at is null or verified_at <> verified_at)`,
+			  and verified_at is null`,
 			sc.ProducerID, sc.Env, endpointID)
 		if err != nil {
 			return err
