@@ -95,7 +95,15 @@ jobs:
             TestAPIKeyLifecycleAndRevocation \
             TestRateLimitsArePerKeyAndPerProducer \
             TestTestAndLivePlanesAreSeparate \
-            TestAuditLogIsAppendOnly
+            TestAuditLogIsAppendOnly \
+            TestInvitationAcceptanceRequiresTheInviteesOwnSession \
+            TestInviteAcceptanceCannotRewriteAnExistingAccount \
+            TestInviteAcceptLooksUpTheInviteBeforeHashing \
+            TestReplayScopedKeyCanBeIssued \
+            TestSuspendIsIdempotentAndReportsTheStoredTimestamp \
+            TestTenantTablesCannotBeBypassedByTheRuntimeRole \
+            TestMigratorRoleMustDifferFromTheRuntimeRole \
+            TestComposeSplitsTheMigratorFromTheRuntimeRole
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
