@@ -8,13 +8,15 @@ decisions rather than accidents.
 
 ```
 cmd/pigeon/          the single core binary: API, workers, migrator
-internal/config/     environment-only configuration + OPS-7 refusals
-internal/db/         pool, migrations (embedded), ControlTx/EvidenceTx
+internal/config/     environment-only configuration + OPS-7 refusals + OPS-8 budget
+internal/db/         pool, migrations (embedded), ControlTx/EvidenceTx, scope setters
 internal/db/migrations/   NN_name.sql, applied in order under an advisory lock
 internal/apikey/     key minting, hashing, env parsing
+internal/id/         prefixed identifiers (prd_, usr_, key_, ses_, inv_, aud_)
 internal/identity/   users, passwords, instance-admin bootstrap
-internal/store/      tenant-scoped data access (every method names a producer)
-internal/httpapi/    router, middleware, handlers
+internal/ratelimit/  in-process token buckets behind FR-207
+internal/store/      tenant-scoped data access (every method names a producer+env)
+internal/httpapi/    route table, credential kinds, handlers
 ```
 
 **Module path.** `github.com/m7jay/pigeon`. `REQUIREMENTS.md` §19 chose
@@ -68,6 +70,84 @@ them.
 **Deliveries and attempts are not in `0001`.** Their partitioning (SB-1) is a
 design decision with a retention consequence, and adding them later is a
 migration, not a rewrite. They arrive in S3/S8.
+
+## S1 decisions — identity, environments, admin surface
+
+These are the places S1 had to choose, recorded so the next slice inherits
+decisions rather than accidents.
+
+**`env` is part of the RLS predicate, not just a column.** FR-103 wants `test` and
+`live` fully separated. A column that a handler must remember to filter separates
+nothing, so 0004 adds `pigeon.env` and rewrites the policies on `consumers`,
+`consumer_users`, `api_keys` and `invites` to require
+`env = current_setting('pigeon.env', true)`. A transaction that sets the producer
+but not the environment sees **zero** rows on every environment-bearing table
+(fail closed). The store also filters explicitly, so the property is enforced twice
+(MT-1). Consequence: `store.scoped` accepts an empty `Env`, which means
+"producer-wide" and can only reach `producers`, `producer_members` and
+environment-less (member) invitations.
+
+**A producer-wide row exists only where the concept is producer-wide.** A producer
+membership (FR-104) is producer-wide, so its invitation carries `env = null` rather
+than a misleading environment; a consumer invitation (FR-109) always carries the
+consumer's environment. The RLS policy encodes both cases in one predicate.
+
+**Sessions carry claims that are re-read per request.** FR-110 needs a
+`consumer_id` claim on a consumer user's session; the instance admin and producer
+members need a credential too. One `sessions` table holds an optional producer /
+consumer claim, and the token is opaque (256-bit, SHA-256 at rest, like an API
+key). Claims are resolved by `pigeon_session_lookup` on **every** request instead of
+being trusted from the token: removing a membership, revoking a consumer binding,
+or revoking a session all take effect on the next request, which is what FR-109's
+"independently" and FR-205's 60 s budget actually require. A session token is
+`pgns_…` and an API key is `pgn_…`; each is rejected where the other belongs.
+
+**`sessions` has RLS enabled and no policy.** It is not tenant data a request may
+query — it is read only through definer functions, before the tenant is known. The
+same shape as 0002's key lookup, and for the same reason.
+
+**`producers` has no ownerless state.** `POST /v1/admin/producers` requires
+`owner_email` and returns the owner's invitation token once. Without that, an
+admin-created tenant has nobody who can invite, so it would be unmanageable until
+someone added a second admin endpoint. Creating tenant + first-owner invitation in
+one transaction is what keeps the invariant true from the first second. (FR-102's
+optional self-registration does the same thing by creating the owner user
+directly.)
+
+**FR-108 is a routing property, not a handler property.** `routes()` declares each
+route with the credential kind it needs; `authorize()` is the only place that
+decides. A caller who is authenticated but out of scope gets **404**: an admin
+session has no producer route, a producer owner has no admin route, a consumer user
+has neither. Two failures are honest 403s, and both concern a caller who already
+is who they say they are: FR-101's pending forced password change, and FR-107's
+suspended producer (whose key still authenticates, and must be told why it is
+refused rather than sent to re-issue a valid key). Refusals are logged as
+`cross-producer attempt` with the caller's tenant, which is AC-15's "logged" half.
+
+**Rate limiting is in-process for S1.** FR-207 asks for per-key and per-producer
+limits with `429` + `Retry-After`; the token buckets live in the core process, so N
+replicas allow N times the configured rate. That is honest for S1 (there is one
+publishing route and no ingest path yet) and wrong for production multi-replica
+deployments; the distributed limiter belongs with the per-endpoint throttles in S5,
+where Redis is already required for the queue. Recorded in PLAN.md as a limit, not
+as a finished requirement.
+
+**Revocation is a read, not a cache invalidation.** `pigeon_auth_lookup` filters
+`revoked_at is null`, so a revoked key or session is refused on the very next
+request from any replica. FR-205's 60 s budget is met by construction; there is no
+cache that could go stale.
+
+**A consumer user is bound to exactly one consumer by the schema, not by code.**
+`consumer_users_one_consumer_key` (0001) makes the cardinality a constraint, so the
+second acceptance for one email fails as a conflict (409) instead of silently
+rebinding. Revoking the binding deletes only `consumer_users`; the consumer row,
+its endpoints and its history stay, and the session stops resolving.
+
+**The audit log is append-only by policy.** `admin_audit_log` has insert and select
+policies gated on `pigeon.instance_admin = 'on'` and no update or delete policy, so
+the application role can record and read admin actions but not rewrite them. Rows
+reference the actor with `NO ACTION`, so a record of who suspended what outlives the
+account.
 
 ## Durability mapping
 
