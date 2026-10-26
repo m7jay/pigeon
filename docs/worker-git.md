@@ -146,7 +146,7 @@ $GH run list --repo m7jay/pigeon --branch wt/<card-id>-<slug> -L 5 \
     --json databaseId,headSha,status,conclusion
 $GH run view <run-id> --repo m7jay/pigeon --log \
   | sed -E 's/^[^\t]+\t[^\t]+\t[^ ]+ //' \
-  | grep -E '^(ok|FAIL|---)'    # e.g. "ok  github.com/m7jay/pigeon/internal/store"
+  | grep -E '^(ok|FAIL|---)'    # "--- PASS: TestX" per test, "ok  <pkg>" per package
 ```
 
 `gh run view --log` prefixes every line with `<job>\t<step>\t<timestamp>Z `, so the
@@ -219,13 +219,27 @@ SHA is named in the artifact from step 5. Each block sets `GH` itself so it also
 in a fresh shell: `gh` is not on `PATH` (§8), and an inherited variable is not worth
 relying on.
 
-1. Read the head the implementer named. Review that SHA, not whatever is in a worktree.
+1. Read the head the implementer named, then read the code **at that SHA**. The reviewer
+   has no checkout (§2 keeps the shared one off limits), so every read is pinned.
 
    ```bash
    GH=/opt/data/toolchain/gh
    $GH pr view <n> --repo m7jay/pigeon \
        --json headRefOid,headRefName,mergeable,mergeStateStatus,isDraft,title,body
    ```
+
+   Then read the code itself - every read pinned to `headRefOid`:
+
+   ```bash
+   GH=/opt/data/toolchain/gh
+   $GH pr diff <n> --repo m7jay/pigeon                          # the whole change
+   $GH api "repos/m7jay/pigeon/git/trees/<headRefOid>?recursive=1" --jq '.tree[].path'
+   $GH api "repos/m7jay/pigeon/contents/<path>?ref=<headRefOid>" --jq .content | base64 -d
+   ```
+
+   `pr diff` follows the live PR head, so re-read `headRefOid` after it; a `contents`
+   read with `?ref=<headRefOid>` cannot drift. Reviewing from the PR title and body is
+   not a review.
 
 2. A defect pass over auth, tenant isolation, SQL and tests, reported as
    `file:line - problem - fix`. Restating the diff is not a review.
@@ -237,14 +251,17 @@ relying on.
        --json databaseId,headSha,status,conclusion
    ```
 
-   The run must report `status: completed`, `conclusion: success`, and a `headSha`
-   equal to the `headRefOid` from step 1. A run whose `headSha` differs is not the
-   gate, however green it is. A red check goes back to the implementer - never merge
-   around it, never disable one.
-4. GitHub reports the PR mergeable: `mergeable: MERGEABLE`,
-   `mergeStateStatus: CLEAN` (a head that is behind the base still reports `CLEAN` on
-   this repo, because protection cannot exist here - if GitHub ever reports `BEHIND`,
-   treat it as mergeable, see below), and the PR is not a draft.
+   `<branch>` is the `headRefName` from step 1. The run must report `status: completed`,
+   `conclusion: success`, and a `headSha` equal to the `headRefOid` from step 1. A run
+   whose `headSha` differs is not the gate, however green it is. While that run is
+   `queued` or `in_progress`, wait and re-run this step - never merge on the strength of
+   a previous commit's run. A completed run with any conclusion other than `success` goes
+   back to the implementer: never merge around a red check, never disable one.
+4. GitHub reports the PR mergeable: `mergeable: MERGEABLE`, and the PR is not a draft.
+   `mergeStateStatus` is `CLEAN` once the checks settle; `UNSTABLE` while a check is
+   still running is not a blocker as long as step 3 gives you a `completed / success` run
+   for the reviewed SHA - only a completed non-success run is. `BEHIND` is mergeable on
+   this repo too, because protection cannot exist here (see below).
 5. **Record the verdict before merging - once, and only for a SHA you have reviewed.**
    `kanban_comment` with the reviewed
    `headRefOid`, the `ci` run id and its `headSha`, and either `no findings` or the
