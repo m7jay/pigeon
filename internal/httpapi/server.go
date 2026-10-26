@@ -44,7 +44,7 @@ type Data interface {
 	CreateSession(ctx context.Context, in store.LoginInput, ttl time.Duration) (store.Session, string, error)
 	RevokeSession(ctx context.Context, token string) error
 	ChangePassword(ctx context.Context, userID, oldPassword, newPassword string) error
-	AcceptInvite(ctx context.Context, token, password string) (store.AcceptedInvite, error)
+	AcceptInvite(ctx context.Context, token, password, callerUserID string) (store.AcceptedInvite, error)
 
 	ListMembers(ctx context.Context, sc store.Scope) ([]store.Member, error)
 	InviteMember(ctx context.Context, sc store.Scope, actor store.Actor, email, role string) (store.Invite, error)
@@ -58,7 +58,7 @@ type Data interface {
 	ListConsumerUsers(ctx context.Context, sc store.Scope, consumerID string) ([]store.ConsumerUser, error)
 	RevokeConsumerUser(ctx context.Context, sc store.Scope, consumerID, userID string) error
 
-	IssueKey(ctx context.Context, sc store.Scope, actor store.Actor) (store.IssuedKey, error)
+	IssueKey(ctx context.Context, sc store.Scope, actor store.Actor, replayScope bool) (store.IssuedKey, error)
 	ListKeys(ctx context.Context, sc store.Scope) ([]store.KeyMeta, error)
 	GetKey(ctx context.Context, sc store.Scope, keyID string) (store.KeyMeta, error)
 	RevokeKey(ctx context.Context, sc store.Scope, keyID string) error

@@ -158,6 +158,31 @@ func (s *Server) withSession(kind routeKind, next http.Handler) http.Handler {
 	})
 }
 
+// optionalSession resolves a session when the caller presented one, and is a
+// no-op when they did not.
+//
+// Only POST /v1/invites/accept uses it, and it is the one route where both shapes
+// are legitimate: a new invitee has no session yet (the invitation plus a chosen
+// password creates the account), while an invitee who already has an account has
+// to prove it, because the token is handed to the inviter and therefore proves
+// nothing about the account it names.
+func (s *Server) optionalSession(w http.ResponseWriter, r *http.Request) (store.Session, bool) {
+	if strings.TrimSpace(r.Header.Get("Authorization")) == "" {
+		return store.Session{}, true
+	}
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok || !strings.HasPrefix(token, store.SessionPrefix) || s.deps.Sessions == nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "invalid session")
+		return store.Session{}, false
+	}
+	sess, err := s.deps.Sessions(r.Context(), token)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "invalid session")
+		return store.Session{}, false
+	}
+	return sess, true
+}
+
 // writeNotFound logs and answers a scope violation: the resource exists
 // somewhere the caller may not see, or does not exist at all, and both answers
 // must be identical (FR-108).

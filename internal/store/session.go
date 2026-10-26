@@ -245,16 +245,89 @@ type AcceptedInvite struct {
 	Env        string
 }
 
-// AcceptInvite consumes an invitation token and sets the user's password. It is
-// the only path that can add a user to a producer (FR-111: no self-registration)
-// and the only path that can bind a consumer user (FR-109).
-func (s *Store) AcceptInvite(ctx context.Context, token, password string) (AcceptedInvite, error) {
+// InviteTicket is an invitation resolved but not consumed. It exists so the
+// acceptance path can decide what to do *before* paying for bcrypt: the token is
+// the only input an anonymous caller controls, and hashing first made
+// POST /v1/invites/accept a cheap way to burn a CPU (~250 ms per request at cost
+// 12) with a token that need not exist.
+type InviteTicket struct {
+	ID         string
+	Email      string
+	Role       string
+	ProducerID string
+	ConsumerID string
+	Env        string
+	// ExistingUserID is non-empty when the invited address already has an
+	// account. Such an invitation is not a credential on its own: the inviter
+	// holds the token, so acceptance must also prove the account holder.
+	ExistingUserID string
+}
+
+// LookupInvite resolves an invitation token without consuming it. Unknown,
+// expired, revoked and already-accepted tokens are one answer (ErrNotFound), as
+// are malformed ones: the caller must not be able to tell them apart.
+func (s *Store) LookupInvite(ctx context.Context, token string) (InviteTicket, error) {
+	if !wellFormedToken(token, InvitePrefix) {
+		return InviteTicket{}, ErrNotFound
+	}
+	var t InviteTicket
+	err := s.pool.QueryRow(ctx, `
+		select invite_id, email, role, producer_id, consumer_id, env, existing_user_id
+		  from pigeon_invite_lookup($1)`, hashToken(token),
+	).Scan(&t.ID, &t.Email, &t.Role, &t.ProducerID, &t.ConsumerID, &t.Env, &t.ExistingUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return InviteTicket{}, ErrNotFound
+	}
+	if err != nil {
+		return InviteTicket{}, fmt.Errorf("lookup invite: %w", err)
+	}
+	return t, nil
+}
+
+// AcceptInvite consumes an invitation token. It is the only path that can add a
+// user to a producer (FR-111: no self-registration) and the only path that can
+// bind a consumer user (FR-109).
+//
+// Three properties, each of which is a fixed defect rather than a preference:
+//
+//   - The invitation is resolved first, so an unknown token never reaches bcrypt.
+//   - For a new address, password is hashed and the user is created.
+//   - For an address that already has an account, callerUserID must be that
+//     account and the password is ignored: acceptance binds the membership and
+//     never rewrites an existing account's credentials. The invitation token is
+//     returned to the inviter (there is no mailer yet), so possession of it is not
+//     proof of anything; a session is.
+func (s *Store) AcceptInvite(ctx context.Context, token, password, callerUserID string) (AcceptedInvite, error) {
 	if !wellFormedToken(token, InvitePrefix) {
 		return AcceptedInvite{}, ErrNotFound
 	}
-	hash, err := identity.HashPassword(password)
+
+	ticket, err := s.LookupInvite(ctx, token)
 	if err != nil {
-		return AcceptedInvite{}, fmt.Errorf("%w: %s", ErrInvalid, err.Error())
+		return AcceptedInvite{}, err
+	}
+
+	var hash string
+	if ticket.ExistingUserID != "" {
+		if callerUserID == "" {
+			return AcceptedInvite{}, ErrSessionRequired
+		}
+		if callerUserID != ticket.ExistingUserID {
+			// Somebody else's session: indistinguishable from an unknown token,
+			// because the caller has no business knowing which it is.
+			return AcceptedInvite{}, ErrNotFound
+		}
+		password = "" // never used for an existing account
+	} else if password == "" {
+		// A new human needs a password: the invitation alone would create an
+		// account nobody can log into.
+		return AcceptedInvite{}, fmt.Errorf("%w: password is required to accept this invitation", ErrInvalid)
+	}
+	if password != "" {
+		hash, err = identity.HashPassword(password)
+		if err != nil {
+			return AcceptedInvite{}, fmt.Errorf("%w: %s", ErrInvalid, err.Error())
+		}
 	}
 
 	var out AcceptedInvite
@@ -263,8 +336,8 @@ func (s *Store) AcceptInvite(ctx context.Context, token, password string) (Accep
 	// list here would mean a rename in SQL breaks the Go scan with a runtime error
 	// instead of a compile error - and `select *` is checked at plan time anyway.
 	err = s.pool.QueryRow(ctx, `
-		select * from pigeon_invite_accept($1, $2, $3)`,
-		hashToken(token), id.New("usr"), hash,
+		select * from pigeon_invite_accept($1, $2, $3, $4)`,
+		hashToken(token), id.New("usr"), hash, callerUserID,
 	).Scan(&out.InviteID, &out.UserID, &out.Email, &out.Role, &out.ProducerID, &out.ConsumerID, &out.Env)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Unknown, expired, already accepted or revoked: one answer, because

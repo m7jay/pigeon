@@ -280,13 +280,19 @@ func TestMembershipSpansProducersAndRolesAreEnforced(t *testing.T) {
 	code, raw = e.do(http.MethodGet, "/v1/producer/keys?env=live", one.DeveloperToken, nil)
 	mustStatus(t, code, raw, http.StatusOK)
 
-	// FR-105: the same human in two producers. Invite the developer of tenant one
-	// into tenant two, accept, and log in.
+	// FR-105: the same human in two producers. The developer already has an
+	// account, and an invitation for an existing account is not a credential on
+	// its own (the inviter holds the token), so it is redeemed with the invitee's
+	// own session. That is the shape every second membership has until there is a
+	// mailer.
 	code, raw = e.do(http.MethodPost, "/v1/producer/invites", two.OwnerToken, map[string]string{
 		"email": one.DeveloperEmail, "role": "developer",
 	})
 	mustStatus(t, code, raw, http.StatusCreated)
-	e.acceptInvite(t, decode[inviteJSON](t, raw).TokenValue())
+	code, raw = e.do(http.MethodPost, "/v1/invites/accept", one.DeveloperToken, map[string]string{
+		"token": decode[inviteJSON](t, raw).TokenValue(),
+	})
+	mustStatus(t, code, raw, http.StatusOK)
 
 	// A login that names no producer is now ambiguous, and the server refuses to
 	// guess which tenant the session is for (FR-105).
@@ -360,8 +366,11 @@ func TestConsumerUserIsBoundToOneConsumerAndRevocable(t *testing.T) {
 	code, raw = e.do(http.MethodPost, "/v1/producer/consumers/"+second+"/invites?env=live",
 		tn.OwnerToken, map[string]string{"email": tn.ConsumerEmail})
 	mustStatus(t, code, raw, http.StatusCreated)
-	code, raw = e.do(http.MethodPost, "/v1/invites/accept", "", map[string]string{
-		"token": decode[inviteJSON](t, raw).TokenValue(), "password": memberPassword,
+	// The consumer user already has an account, so the redemption carries their
+	// session; the conflict is then about the binding (one consumer per user), not
+	// about proving who they are.
+	code, raw = e.do(http.MethodPost, "/v1/invites/accept", tn.ConsumerToken, map[string]string{
+		"token": decode[inviteJSON](t, raw).TokenValue(),
 	})
 	mustStatus(t, code, raw, http.StatusConflict)
 

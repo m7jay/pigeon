@@ -54,6 +54,12 @@ var ErrAmbiguousProducer = errors.New("user belongs to several producers; name o
 // no owner has no one who can invite the replacement.
 var ErrLastOwner = errors.New("producer must keep at least one owner")
 
+// ErrSessionRequired marks an invitation addressed to an address that already has
+// an account. The invitation token is handed to the inviter (no mailer yet), so it
+// cannot prove control of the account it names: the invitee has to accept it with
+// their own session, and acceptance never touches their credentials.
+var ErrSessionRequired = errors.New("this invitation belongs to an existing account; accept it with that account's session")
+
 // Envs are the two data planes FR-103 requires to stay separate.
 const (
 	EnvTest = "test"

@@ -174,6 +174,10 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 // inviteAcceptRequest consumes an invitation (FR-104, FR-109, FR-111). It is the
 // only route that can create a membership from an email address: there is no
 // registration form that takes a producer id.
+//
+// password is required only when the invitation creates a new account. An
+// invitation addressed to an address that already has an account must be redeemed
+// with that account's session, and never sets its password (see store.AcceptInvite).
 type inviteAcceptRequest struct {
 	Token    string `json:"token"`
 	Password string `json:"password"`
@@ -184,19 +188,37 @@ func (s *Server) handleAcceptInvite(w http.ResponseWriter, r *http.Request) {
 	if !s.decodeJSON(w, r, &req) {
 		return
 	}
-	if strings.TrimSpace(req.Token) == "" || len(req.Password) < 8 {
-		writeError(w, http.StatusBadRequest, "invalid_request",
-			"token and a password of at least 8 characters are required")
+	if strings.TrimSpace(req.Token) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "token is required")
 		return
 	}
-	acc, err := s.deps.Data.AcceptInvite(r.Context(), req.Token, req.Password)
+	if req.Password != "" && len(req.Password) < 8 {
+		writeError(w, http.StatusBadRequest, "invalid_request",
+			"password must be at least 8 characters")
+		return
+	}
+
+	// This is the one route that is anonymous *and* can be authenticated: a new
+	// invitee has no session yet, while an invitee who already has an account has
+	// to prove it. The session is optional here and mandatory in the store when
+	// the invitation names an existing account.
+	caller, ok := s.optionalSession(w, r)
+	if !ok {
+		return
+	}
+
+	acc, err := s.deps.Data.AcceptInvite(r.Context(), req.Token, req.Password, caller.UserID)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		switch {
+		case errors.Is(err, store.ErrSessionRequired):
+			writeError(w, http.StatusForbidden, "session_required",
+				"this invitation is for an existing account; sign in as that account and accept it again")
+		case errors.Is(err, store.ErrNotFound):
 			writeError(w, http.StatusNotFound, "invalid_invite",
 				"this invitation is unknown, expired, revoked or already used")
-			return
+		default:
+			s.storeError(w, r, err)
 		}
-		s.storeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
