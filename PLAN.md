@@ -20,7 +20,7 @@ disagree, the requirements win and this file is wrong.
 | S0 | Repo, module, config, migrations, RLS, API-key auth, `/health` + `/health/ready`, bootstrap admin, cross-producer harness | AC-15 ✅ (SQL layer), AC-20 ✅ (harness runs in CI) | — | **done** — CI run 40307423507 |
 | S1 | Producers, users, environments, instance-admin API, key issue/revoke, rate limits | AC-15 ✅ (HTTP layer), AC-20 ✅ (every route classified) | S0 | **done** — CI run 40317878772 (after review round 1) |
 | S2 | Event types (JSON Schema, name regex, payload version), `POST /events` + outbox in one transaction, relay with `SKIP LOCKED` + `LISTEN/NOTIFY` + 1 s poll | AC-08, AC-09 | S1 | — |
-| S3 | Consumers, routing (`consumer_id` / `consumer_ref`), fan-out, delivery rows with `(event_id, endpoint_id)` uniqueness | AC-02, AC-03, AC-23, AC-24, AC-25, AC-27 | S2 | — |
+| S3 | Consumers, routing (`consumer_id` / `consumer_ref`), fan-out, delivery rows with the partial `(event_id, endpoint_id)` unique index over first fan-out (I-3) | AC-02, AC-03, AC-23, AC-24, AC-25, AC-27 | S2 | — |
 | S4 | Delivery worker: signing, 5 s timeout, status classification, lease at fan-out, sweeper | AC-04, AC-05, AC-06, AC-07, AC-21, AC-28 | S3 | — |
 | S5 | Retry policy, `Retry-After`, pause thresholds, per-endpoint leased concurrency + token bucket in Redis | AC-14, AC-16, AC-17, AC-35…AC-37, AC-41 | S4 | — |
 | S6 | Attempt buffer + flusher, `synchronous_commit` split, evidence retention | AC-29, AC-33 | S4 | — |
