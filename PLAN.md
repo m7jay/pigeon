@@ -17,7 +17,7 @@ disagree, the requirements win and this file is wrong.
 
 | # | Slice | Turns green | Depends on | State |
 |---|---|---|---|---|
-| S0 | Repo, module, config, migrations, RLS, API-key auth, `/health` + `/health/ready`, bootstrap admin, cross-producer harness | AC-15 (SQL layer), AC-20 (harness exists) | — | **in progress** |
+| S0 | Repo, module, config, migrations, RLS, API-key auth, `/health` + `/health/ready`, bootstrap admin, cross-producer harness | AC-15 ✅ (SQL layer), AC-20 ✅ (harness runs in CI) | — | **done** — CI run 40307423507 |
 | S1 | Producers, users, environments, instance-admin API, key issue/revoke, `pigeon doctor` skeleton | AC-15, AC-20 | S0 | next |
 | S2 | Event types (JSON Schema, name regex, payload version), `POST /events` + outbox in one transaction, relay with `SKIP LOCKED` + `LISTEN/NOTIFY` + 1 s poll | AC-08, AC-09 | S1 | — |
 | S3 | Consumers, routing (`consumer_id` / `consumer_ref`), fan-out, delivery rows with `(event_id, endpoint_id)` uniqueness | AC-02, AC-03, AC-23, AC-24, AC-25, AC-27 | S2 | — |
@@ -33,7 +33,49 @@ Two items are in S2/S3 rather than later, for the reason §17 gives: the outbox
 changes the ingest transaction, and per-endpoint throttling changes the queue
 topology. Retrofitting either is a rewrite of the paths around it.
 
-## Current state (S0)
+## Current state (S0) — closed
+
+Evidence: CI run **40307423507** on head `8b9a74c0adf23c27b8d7fe09ecc4892556fa772e`
+(`ci`, success). The test step ran `go test -count=1 -race -v ./...` against the
+`postgres:16` service container and logged:
+
+    --- PASS: TestCrossProducerReadsAreEmpty (0.05s)
+    --- PASS: TestProducersAreAdminOnly (0.05s)
+    ok      github.com/m7jay/pigeon/internal/store  2.315s
+    AC-15/AC-20 harness executed and passed
+
+No `--- SKIP` line appeared. Since this commit the CI step fails if one does, or
+if either named test did not pass, so "the harness exists" cannot quietly become
+"the harness skipped" again. The same suite also ran green locally on Postgres
+16.2 on the build host against a scratch cluster, which is how the harness was
+debugged before CI.
+
+What that proves:
+
+- **AC-20** — the cross-producer harness executes in CI against real Postgres.
+  It skips only when `PIGEON_TEST_DATABASE_URL` is unset, and CI now treats a
+  skip as a failure.
+- **AC-15 at the SQL layer** — as `pigeon_app` (`login nosuperuser nobypassrls`),
+  with the tenant scope set to producer A, counting producer B's consumer by id
+  returns 0 and counting A's own returns 1. The positive assertion is what rules
+  out a policy that just returns no rows.
+- **The instance-admin path for `producers` now exists.**
+  `0003_producers_admin.sql` adds a permissive policy gated on
+  `pigeon.instance_admin = 'on'`, and `db.SetInstanceAdmin` is the sanctioned way
+  to set it. `TestProducersAreAdminOnly` proves both halves: tenant scope and an
+  unset marker see 0 producers, the admin marker sees both seeded rows, an insert
+  without the marker is refused and one with it succeeds.
+
+Honest limits — S1 owns these:
+
+- The admin gate is a session GUC the application role can set. It defends
+  against a forgotten tenant scope in a request path, not against a compromised
+  app role. A separate database role for admin operations is the real privilege
+  boundary and belongs with the instance-admin API in S1.
+- There is no admin HTTP API yet: producers/users/environments CRUD and key
+  issue/revoke are S1. S0 ships the bootstrap credential and the DB path only.
+- `internal/identity` has no test file; bootstrap idempotency is exercised by the
+  binary's start-up path but not asserted in a test. S1 adds it with the API.
 
 Done:
 
@@ -47,6 +89,9 @@ Done:
   api_keys; RLS on every tenant table (MT-1); `env` on every tenant row (FR-103).
 - `0002_auth_lookup.sql` — the single sanctioned RLS bypass, a `SECURITY DEFINER`
   function that reads one key row by hash.
+- `0003_producers_admin.sql` — the instance-admin policy for `producers`
+  (`producers_admin`, gated on `pigeon.instance_admin = 'on'`), so the admin path
+  S1 builds against exists instead of only being named in a comment.
 - `internal/apikey` — `pgn_<env>_<43 chars>`, SHA-256 at rest, hint for the UI.
 - `internal/httpapi` — liveness/readiness split, bearer auth, structured errors,
   `X-Request-Id`, panic recovery.
@@ -56,11 +101,10 @@ Done:
 - Tests: config, api-key, migration loader, HTTP middleware; cross-producer
   harness gated on `PIGEON_TEST_DATABASE_URL`.
 
-Not done, and deliberately: no Postgres or Redis is reachable in the current
-build environment (no daemon, no server binary), so every DB-backed test skips.
-S0's AC-15/AC-20 claims are therefore **unverified at runtime** — the code path
-exists and the harness is written, but nothing has proven it against a live
-database yet. The first CI run with a Postgres service is what closes S0.
+Status: **S0 closed.** AC-15 (SQL layer) and AC-20 (harness) are proven against a
+live database, in CI and on the build host. The admin policy hole is filled; the
+remaining admin surface (HTTP API, separate admin role) is S1's, as listed above.
+Nothing in this section is a claim that was not run.
 
 ## Definition of done for M0
 
