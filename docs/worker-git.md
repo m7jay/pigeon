@@ -74,7 +74,15 @@ Examples: `wt/t_8b5d4ad0-worker-git-docs`, `wt/t_f78a96c3-s0-postgres-evidence`.
 Rules: one branch per card, branched from the repo's current default branch
 (`$GH repo view m7jay/pigeon --json defaultBranchRef` — today `feat/m0-skeleton`).
 Never push to `master` or the default branch directly. Never force-push a branch
-that has an open PR.
+under review, and never rewrite one that another person has looked at.
+
+One exception: a worker's **own, unreviewed** branch may be rewritten to purge a
+credential — or the bare token prefix, which is enough to trip the leak scan —
+from its history. Do it by deleting and re-pushing the branch (the command guard
+refuses `git push --force`), then open the replacement PR and say in it why the
+old history was dropped; the new PR gets a new number, because a closed PR cannot
+be reopened against a rewritten head. Scan before pushing:
+`git log -p origin/<default>..HEAD | grep -c <token-prefix>` must print `0`.
 
 ## 4. Commits
 
@@ -184,6 +192,10 @@ To discard a throwaway branch locally, use `git update-ref -d refs/heads/<branch
   multiplexer, which keeps the environment it started with. This is exactly why
   auth lives in `hosts.yml` rather than in the environment: `git push` and
   `gh pr create` work in such a shell, `$GH_TOKEN` does not.
+- **The worker command guard blocks the obvious destructive git verbs.** `git push
+  --force` and `git branch -D` are refused in unattended mode; use
+  `git update-ref -d refs/heads/<branch>` to drop a local branch and the
+  delete-then-push dance in §3 to replace a remote one.
 - **Profile `.env` changes reach the *next* worker process, not a running one.**
   A worker process snapshots `.env` at startup; to give a long-lived surface new
   environment values, restart the gateway it runs under
