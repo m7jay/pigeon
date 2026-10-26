@@ -18,7 +18,7 @@ disagree, the requirements win and this file is wrong.
 | # | Slice | Turns green | Depends on | State |
 |---|---|---|---|---|
 | S0 | Repo, module, config, migrations, RLS, API-key auth, `/health` + `/health/ready`, bootstrap admin, cross-producer harness | AC-15 ✅ (SQL layer), AC-20 ✅ (harness runs in CI) | — | **done** — CI run 40307423507 |
-| S1 | Producers, users, environments, instance-admin API, key issue/revoke, `pigeon doctor` skeleton | AC-15, AC-20 | S0 | next |
+| S1 | Producers, users, environments, instance-admin API, key issue/revoke, rate limits | AC-15 ✅ (HTTP layer), AC-20 ✅ (suite covers every route) | S0 | **done** — CI run 40311482804 |
 | S2 | Event types (JSON Schema, name regex, payload version), `POST /events` + outbox in one transaction, relay with `SKIP LOCKED` + `LISTEN/NOTIFY` + 1 s poll | AC-08, AC-09 | S1 | — |
 | S3 | Consumers, routing (`consumer_id` / `consumer_ref`), fan-out, delivery rows with `(event_id, endpoint_id)` uniqueness | AC-02, AC-03, AC-23, AC-24, AC-25, AC-27 | S2 | — |
 | S4 | Delivery worker: signing, 5 s timeout, status classification, lease at fan-out, sweeper | AC-04, AC-05, AC-06, AC-07, AC-21, AC-28 | S3 | — |
@@ -105,6 +105,64 @@ Status: **S0 closed.** AC-15 (SQL layer) and AC-20 (harness) are proven against 
 live database, in CI and on the build host. The admin policy hole is filled; the
 remaining admin surface (HTTP API, separate admin role) is S1's, as listed above.
 Nothing in this section is a claim that was not run.
+
+## Current state (S1) — closed
+
+Evidence: CI run **40311482804** on head `bbc5ad29f1bd34ee6a44a5c8574d8b7878c3454f`
+(`ci`, success, PR #4). The test step ran `go test -count=1 -race -p 1 -v ./...`
+against the `postgres:16` service container and logged:
+
+    --- PASS: TestCrossProducerRequestsAreNotFound (30.67s)     # AC-15 at the HTTP layer
+    --- PASS: TestCrossProducerSuiteCoversEveryRoute (0.00s)    # AC-20 coverage
+    --- PASS: TestInstanceAdminCreatesProducersAndIsAudited ...  (FR-102, MT-5)
+    --- PASS: TestSuspensionStopsIngestionAndIsReversible ...    (FR-107)
+    --- PASS: TestTestAndLivePlanesAreSeparate ...               (FR-103)
+    --- PASS: TestAPIKeyLifecycleAndRevocation ...               (FR-201..FR-206)
+    --- PASS: TestRateLimitsArePerKeyAndPerProducer ...          (FR-207)
+    --- PASS: TestAuditLogIsAppendOnly ...                       (MT-5)
+    ok      github.com/m7jay/pigeon/internal/httpapi  198.588s
+    AC-15/AC-20: SQL-layer and HTTP-layer cross-producer suites executed and passed
+
+No `--- SKIP` line appeared. CI now requires thirteen named tests (S0's two plus
+eleven S1 acceptance tests) and fails if any is missing, so a rename cannot quietly
+drop an assertion.
+
+What that proves:
+
+- **AC-15 at the HTTP layer.** Every producer-scoped route, aimed at another
+  tenant's identifiers, answers `404` with `code=not_found` (never `403`), and the
+  refusal is logged as a `cross-producer attempt` naming the requested identifier
+  and the caller's tenant.
+- **AC-20 over every resource.** The suite is generated from the route table
+  (`routes()`), and `TestCrossProducerSuiteCoversEveryRoute` fails when a
+  producer-scoped route exists without a case — so "covers every resource" is a
+  property of the build, not a claim in a document.
+- **No route is reachable without a credential.** Every non-anonymous route answers
+  `401` without a bearer token, and the anonymous allow-list is asserted to be
+  exactly health, login and invitation acceptance (plus self-registration only when
+  the flag is on).
+- **FR-103 is enforced in the database, not only in Go.** The policies on
+  `consumers`, `consumer_users`, `api_keys` and `invites` require
+  `env = current_setting('pigeon.env')`; a transaction with a producer scope and no
+  environment scope sees zero rows, asserted in `TestCrossProducerReadsAreEmpty`.
+
+Honest limits — the next slices own these:
+
+- **Rate limits are per process.** FR-207 is satisfied for one replica; N replicas
+  allow N × the configured rate. The Redis-backed limiter belongs with the
+  per-endpoint throttles in S5 (recorded in `SPEC.md`).
+- **The instance-admin DB gate is still a GUC**, not a separate database role. It
+  defends against a forgotten scope in a request path, not against a compromised
+  application role. Splitting the admin path onto its own role remains open.
+- **No mailer.** Invitation tokens are returned once in the API response, like API
+  keys. An operator delivers them; the product path (FR-111's emailed invitation) is
+  a notification concern for the portals.
+- **`/v1/producer/*` is not versioned per environment in the URL**, it takes `?env=`
+  for member sessions. If the portals prefer a path segment, that is a routing
+  change with no data-model consequence.
+- **`internal/httpapi` takes ~3.5 min under `-race`** because the acceptance suite
+  performs ~50 real bcrypt operations at cost 12. A test-only cost knob is the lever
+  if CI gets tight, not dropping `-race`.
 
 ## Definition of done for M0
 
