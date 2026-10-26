@@ -158,20 +158,41 @@ git -c user.name='pigeon-dev (agent)' \
 
 Do not impersonate a human, and do not set a different identity per commit.
 
-## 7. Never merge
+## 7. Merge through the gate, then delete the branch
 
-The worker opens the PR and stops. Merging, squashing, rebasing and closing PRs
-belong to Jay. If CI is red, fix it on the same branch — do not merge around it,
-and do not disable a check.
+A worker merges its own PR. Merging is automatic, not discretionary: nobody waits
+for Jay. What is not automatic is the gate - all three conditions below are checked
+against the current head SHA, in this order, and the evidence goes in the PR.
 
-After a PR is merged, the branch is deleted by Jay (or the next worker); a worker
-may delete its own branch only after it has confirmed the merge:
+1. **CI is green on that exact SHA.** The latest `ci` run for the PR head reports
+   `completed / success` (`$GH run list --repo m7jay/pigeon --branch <branch>`). A
+   green run from an earlier commit is not the gate. If CI is red, fix it on the
+   same branch: never merge around a red check and never disable one.
+2. **An independent review approved the diff.** A different agent or profile from
+   the author reviews it (`pigeon-rev` reviews `pigeon-dev` cards). A worker never
+   approves its own card, and a review means a defect pass over auth, tenant
+   isolation, SQL and tests - not a restatement of the diff. The verdict is posted
+   on the PR.
+3. **GitHub reports the PR mergeable.** `mergeable: MERGEABLE`,
+   `mergeStateStatus: CLEAN`, and the PR is not a draft.
+
+Then merge with the history style the repo uses - rebase, linear, worker authorship
+kept - and delete the branch in the same step:
 
 ```bash
-$GH pr view <n> --json state,mergedAt
-git push origin --delete wt/<card-id>-<slug>
+$GH pr merge <n> --rebase --delete-branch
+$GH pr view <n> --json state,mergedAt     # mergedAt must be set
 git worktree remove "$HERMES_KANBAN_WORKSPACE/wt"
 ```
+
+`--rebase` and not `--merge`: the branch has to land as individual commits, not one
+squashed blob and not a merge bubble. If the PR goes `BEHIND` or `DIRTY` while it
+waits, rebase onto the default branch, push, and let CI run again before merging.
+
+This replaces the earlier "never merge" rule (changed 26 Oct 2026). Nothing changes
+about **where** work lands: a worker still never pushes to `master` or the default
+branch directly, and it still does not merge a PR whose review or CI it has not
+seen.
 
 To discard a throwaway branch locally, use `git update-ref -d refs/heads/<branch>`
 — `git branch -D` is refused by the worker's command guard.
