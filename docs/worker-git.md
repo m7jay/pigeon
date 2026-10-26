@@ -117,7 +117,7 @@ $GH pr create --base <default-branch> \
   --body-file /tmp/pr-body.md
 ```
 
-One PR per card. The PR body states what changed and any item that needs a human
+One open PR per card at a time. The PR body states what changed and any item that needs a human
 decision, plus how the change was verified.
 
 CI: check the run for your head commit, and read the log — a skipped test is not a
@@ -183,24 +183,44 @@ and re-spawns the implementer. That repeats until the reviewer approves. Only
 reviewer" shortcut.
 
 **What the reviewer does, in this order.** Every step is against one head SHA, and that
-SHA is named in the artifact from step 5:
+SHA is named in the artifact from step 5. Each block sets `GH` itself: a shell variable
+does not survive to the next tool call, and `gh` is not on `PATH` (§8).
 
-1. Read the head the implementer named: `$GH pr view <n> --json headRefOid,mergeable,
-   mergeStateStatus,isDraft,title,body`. Review that SHA, not whatever is in a
-   worktree.
+1. Read the head the implementer named. Review that SHA, not whatever is in a worktree.
+
+   ```bash
+   GH=/opt/data/toolchain/gh
+   $GH pr view <n> --repo m7jay/pigeon \
+       --json headRefOid,mergeable,mergeStateStatus,isDraft,title,body
+   ```
+
 2. A defect pass over auth, tenant isolation, SQL and tests, reported as
    `file:line - problem - fix`. Restating the diff is not a review.
-3. CI is green on that exact SHA: the latest `ci` run for the PR head reports
-   `completed / success` (`$GH run list --repo m7jay/pigeon --branch <branch>`). A
-   green run from an earlier commit is not the gate. A red check goes back to the
-   implementer - never merge around it, never disable one.
+3. CI is green on that exact SHA - not "the branch has a green run somewhere":
+
+   ```bash
+   GH=/opt/data/toolchain/gh
+   $GH run list --repo m7jay/pigeon --branch <branch> -L 5 \
+       --json databaseId,headSha,status,conclusion
+   ```
+
+   The run must report `status: completed`, `conclusion: success`, and a `headSha`
+   equal to the `headRefOid` from step 1. A run whose `headSha` differs is not the
+   gate, however green it is. A red check goes back to the implementer - never merge
+   around it, never disable one.
 4. GitHub reports the PR mergeable: `mergeable: MERGEABLE`,
    `mergeStateStatus: CLEAN`, and the PR is not a draft.
 5. **Record the verdict before merging.** `kanban_comment` with the reviewed
-   `headRefOid`, the `ci` run id, and either `no findings` or the finding list. A
-   completion without that comment is not a review and does not count.
+   `headRefOid`, the `ci` run id and its `headSha`, and either `no findings` or the
+   finding list. Be plain about what this is: kanban does not enforce it - a
+   completion out of the review column needs no evidence at all
+   (`hermes_cli/kanban_db.py`, "Completions from non-review statuses need evidence",
+   review exempt), and completion metadata is free-form. The comment and the metadata
+   are the record a human reads when they ask whether a card was ever really reviewed.
+   A completion without them is a protocol violation even though nothing rejects it.
 6. Re-read `headRefOid`. If it moved since step 1, the implementer pushed: go back to
-   step 1 with the new SHA. Never merge a SHA you did not review.
+   step 1 with the new SHA and redo step 5, so the only verdict comment on the card
+   names the SHA that actually merges. Never merge a SHA you did not review.
 7. Merge - rebase, never squash and never a merge bubble:
 
 ```bash
@@ -210,31 +230,41 @@ $GH pr view <n> --repo m7jay/pigeon --json state,mergedAt,mergeCommit,headRefOid
 ```
 
 `mergeCommit.oid` is the value for `metadata["merge_commit"]`; it is `null` until the
-merge lands, so read it after the merge returns, not before. Do not pass
-`--delete-branch`: the branch is checked out in the implementer's worktree and git
-refuses to delete a branch in use. Remove the remote ref yourself, then complete:
+merge lands, so read it after the merge returns, not before. Skip `--delete-branch`:
+it operates on a local branch in the current repository, and the reviewer has no
+repository (§2 keeps the shared checkout off limits, and the implementer's worktree
+dies with its run). Delete the remote ref by API instead, which needs no checkout:
 
 ```bash
-git push origin --delete wt/<card-id>-<slug>
+GH=/opt/data/toolchain/gh
+$GH api -X DELETE repos/m7jay/pigeon/git/refs/heads/wt/<card-id>-<slug>
 ```
+
+Then complete, using the same key names section 5 uses for the PR:
 
 ```python
 kanban_complete(summary="...", metadata={
+    "published_pr": "https://github.com/m7jay/pigeon/pull/<n>",
     "pr": <n>, "merge_commit": "<mergeCommit.oid>",
     "head_sha": "<reviewed headRefOid>", "ci_run_id": <run id>,
 })
 ```
 
-That completion is the only thing that moves the card to `done`. The implementer's
-scratch workspace, including its `wt/`, is discarded with its run - the reviewer has no
-worktree of its own and does not need one.
+That completion is the only thing that moves the card to `done`.
 
-**If the PR is `BEHIND` or `DIRTY`** it needs a rebase, and the reviewer does not do
-it: §3 and §4 forbid rewriting a branch that has been reviewed, and the command guard
-refuses the `--force` push that a rebase of an open branch would need. Send it back
-with `kanban_request_changes`. The implementer either adds commits, or replaces the
-branch with the delete-then-push dance in §3 and opens a replacement PR - which the
-reviewer then reviews from scratch, because the head SHA changed.
+**If the PR is `BEHIND`,** merge anyway. There is no branch protection on this repo
+and rebase merges are allowed, so a branch whose base moved is still mergeable; only
+re-check `mergeable`/`mergeStateStatus` right before the merge and redo step 3 if the
+merge rewrites the head.
+
+**If the PR is `DIRTY`,** the branch really conflicts, and neither worker rewrites it:
+§3 and §4 forbid rebasing a branch that has been reviewed, and the force-push that
+would need is refused by the guard. Send it back with `kanban_request_changes`: the
+implementer merges the default branch **into** its own branch
+(`git merge origin/<default-branch>`), resolves, and pushes forward. That is a new head
+SHA, so the reviewer starts again at step 1. A replacement PR is only for the
+credential case in §3, and then the card must name both PRs so the completion points at
+the one that merged.
 
 **Where the verdict lives: the card.** `gh pr review` is not usable here - the token
 belongs to the PR's own author and GitHub refuses it (`Review Can not request changes
