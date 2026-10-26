@@ -255,7 +255,7 @@ nowhere - it sits between the subscription depth (10) and the endpoint depth the
 draft of this amendment had (100) - which is the only reading that explains AC-14 as
 written: it is the residue of a single-level draft.
 
-A depth trigger of 100 failed attempts cannot reach an endpoint at all. A subscription
+A depth trigger of 100 failed attempts cannot do the job it was written for. A subscription
 stops producing failures the moment it pauses (§7.12), so an endpoint accumulates at
 most 10 failures per subscription: 100 is unreachable below ten subscriptions, and at
 ten it fires only after every one has already tripped and sent its own notification,
@@ -266,7 +266,7 @@ The 100-attempt depth trigger is deleted rather than kept beside it, and the rea
 not that breadth always fires first. Breadth trips at `3 × ceil(active/4)` attempts -
 99 at 132 live subscriptions, 102 at 133, 150 at 200 - so above 132 subscriptions a
 depth trigger would fire earlier. The reason is what each one measures at that size.
-At 133 subscriptions, 100 failures is at most 0.75 attempts per subscription: depth
+At 133 subscriptions, 100 failures is under 0.76 attempts per subscription: depth
 would pause the endpoint on 10 failing subscriptions, a breadth of 7.5%, which is
 exactly the small-endpoint over-reach the 3-attempt floor exists to prevent, while
 breadth pauses at 34 of 133 (26%). Below 133 subscriptions breadth also fires first,
