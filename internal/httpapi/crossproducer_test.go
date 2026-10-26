@@ -59,6 +59,11 @@ type cpCase struct {
 	// build returns the request path for tenant B's identifiers, plus an optional
 	// body.
 	build func(a, b *tenant) (path string, body any)
+	// credential is the bearer token the case is aimed with. Nil means "A's owner
+	// session", which is the shape every id-addressed route needs. Routes that
+	// take no identifier in the path (a key, a consumer session) are aimed with
+	// the *other* tenant's credential and must answer with its own scope only.
+	credential func(a, b *tenant) string
 	// want is the status the route must answer for a cross-tenant request.
 	want int
 	// leaks are substrings that must not appear in the response body (collection
@@ -186,6 +191,65 @@ var crossProducerCases = map[string]cpCase{
 		},
 		want: http.StatusNotFound,
 	},
+	// The two routes that name their tenant only through the credential. There is
+	// no identifier to aim at another tenant, so the case is the other way round:
+	// present the other tenant's credential and prove the answer is scoped to it.
+	"GET /v1/whoami": {
+		build:      func(a, b *tenant) (string, any) { return "/v1/whoami", nil },
+		credential: func(a, b *tenant) string { return b.KeyPlain },
+		want:       http.StatusOK,
+		leaks: func(a, b *tenant) []string {
+			return []string{a.ID, a.KeyID, a.ConsumerID, a.ConsumerRef}
+		},
+		after: func(t *testing.T, e *env, created []byte) {
+			b := e.tenantFor(t, "cp-beta")
+			who := decode[struct {
+				ProducerID string `json:"producer_id"`
+				KeyID      string `json:"key_id"`
+			}](t, created)
+			if who.ProducerID != b.ID || who.KeyID != b.KeyID {
+				t.Fatalf("producer B's key resolved as producer_id=%q key_id=%q; want %q/%q",
+					who.ProducerID, who.KeyID, b.ID, b.KeyID)
+			}
+		},
+	},
+	"GET /v1/consumer/me": {
+		build:      func(a, b *tenant) (string, any) { return "/v1/consumer/me", nil },
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusOK,
+		leaks: func(a, b *tenant) []string {
+			return []string{a.ConsumerID, a.ConsumerRef, a.ID}
+		},
+		after: func(t *testing.T, e *env, created []byte) {
+			b := e.tenantFor(t, "cp-beta")
+			if me := decode[consumerJSON](t, created); me.ID != b.ConsumerID {
+				t.Fatalf("producer B's consumer session resolved consumer %q; want %q", me.ID, b.ConsumerID)
+			}
+		},
+	},
+}
+
+// notProducerScoped classifies every route that is not part of the producer-scoped
+// surface, with the reason. The coverage test below requires each registered route
+// to appear in exactly one of the two tables, so "every resource has a case" is a
+// property of the build rather than a claim in a document — and a route that is
+// added without a classification fails instead of being skipped silently (which is
+// how /v1/whoami and /v1/consumer/me escaped the first version of this suite).
+var notProducerScoped = map[string]string{
+	"GET /health":                                   "liveness: no credential and no tenant",
+	"GET /health/ready":                             "readiness: no credential and no tenant",
+	"POST /v1/session":                              "login: obtains the credential, so it cannot require one",
+	"GET /v1/session":                               "self-description: scoped to the caller's own claims, no tenant id in the request",
+	"DELETE /v1/session":                            "logout: acts on the presented token only",
+	"POST /v1/session/password":                     "FR-101 forced change: acts on the caller's own account only",
+	"POST /v1/invites/accept":                       "accepts an invitation: the token identifies the tenant, and an existing account must present its own session",
+	"POST /v1/admin/producers":                      "instance-admin surface: no producer scope by design (FR-102)",
+	"GET /v1/admin/producers":                       "instance-admin surface: lists tenants, so it cannot be tenant-scoped",
+	"GET /v1/admin/producers/{producerID}":          "instance-admin surface: the admin may address any tenant (FR-102)",
+	"POST /v1/admin/producers/{producerID}/suspend": "instance-admin surface: suspends any tenant (FR-107)",
+	"POST /v1/admin/producers/{producerID}/resume":  "instance-admin surface: resumes any tenant (FR-107)",
+	"GET /v1/admin/producers/{producerID}/audit":    "instance-admin surface: the audit log is not tenant data (MT-5)",
+	"POST /v1/producers":                            "FR-102 self-registration: exists only when enabled, and by definition has no tenant yet",
 }
 
 // TestCrossProducerRequestsAreNotFound is AC-15 and AC-20: every producer-scoped
@@ -205,9 +269,11 @@ func TestCrossProducerRequestsAreNotFound(t *testing.T) {
 	b.PendingInviteID = decode[inviteJSON](t, raw).ID
 	e.remember(t, b)
 
-	// A's owner session, aimed at every one of B's identifiers.
+	// A's owner session, aimed at every one of B's identifiers — except on the two
+	// routes that take no identifier, where the case presents B's own credential
+	// and proves the answer is scoped to it.
 	for _, rt := range e.routes() {
-		if rt.Kind != kindMember && rt.Kind != kindOwner {
+		if !producerScoped(rt.Kind) {
 			continue
 		}
 		key := rt.Method + " " + rt.Path
@@ -217,7 +283,11 @@ func TestCrossProducerRequestsAreNotFound(t *testing.T) {
 		}
 		t.Run(strings.ReplaceAll(key, " ", "_"), func(t *testing.T) {
 			path, body := tc.build(a, b)
-			code, raw := e.do(rt.Method, path, a.OwnerToken, body)
+			token := a.OwnerToken
+			if tc.credential != nil {
+				token = tc.credential(a, b)
+			}
+			code, raw := e.do(rt.Method, path, token, body)
 			mustStatus(t, code, raw, tc.want)
 			if tc.want == http.StatusNotFound {
 				if got := errorCode(t, raw); got != "not_found" {
@@ -248,30 +318,68 @@ func TestCrossProducerRequestsAreNotFound(t *testing.T) {
 	}
 }
 
-// TestCrossProducerSuiteCoversEveryRoute is the anti-rot half of AC-20: it fails
-// when a producer-scoped route exists without a cross-producer case, which is the
-// only way "the suite covers every resource" stays true as routes are added.
+// producerScoped reports whether a route's credential names a tenant. These are
+// exactly the routes AC-20 has to cover: a credential that resolves to one
+// producer must never reach another's rows.
+func producerScoped(k routeKind) bool {
+	switch k {
+	case kindProducerKey, kindMember, kindOwner, kindConsumer:
+		return true
+	}
+	return false
+}
+
+// TestCrossProducerSuiteCoversEveryRoute is the anti-rot half of AC-20: every
+// route in the table is classified, either as producer-scoped (and then it must
+// have a cross-producer case) or as not producer-scoped (and then the exclusion
+// has to be written down with a reason in notProducerScoped).
+//
+// The first version of this test skipped every route that was neither kindMember
+// nor kindOwner, so /v1/whoami and /v1/consumer/me were never exercised while the
+// documentation claimed a route without a case fails the build. The classification
+// is asserted over the *superset* of routes (self-registration enabled), so a
+// conditional route cannot escape it either.
 func TestCrossProducerSuiteCoversEveryRoute(t *testing.T) {
-	e := setup(t)
+	s := newAuthServer(t, nil, nil, true)
 	seen := map[string]bool{}
-	for _, rt := range e.routes() {
-		if rt.Kind != kindMember && rt.Kind != kindOwner {
-			continue
-		}
+	scoped := 0
+
+	for _, rt := range s.routes() {
 		key := rt.Method + " " + rt.Path
-		if _, ok := crossProducerCases[key]; !ok {
-			t.Errorf("producer-scoped route %s has no cross-producer case (AC-20)", key)
+		if seen[key] {
+			t.Errorf("route %s is classified twice", key)
 		}
 		seen[key] = true
+
+		if producerScoped(rt.Kind) {
+			scoped++
+			if _, ok := crossProducerCases[key]; !ok {
+				t.Errorf("producer-scoped route %s has no cross-producer case (AC-20)", key)
+			}
+			continue
+		}
+		if reason, ok := notProducerScoped[key]; !ok || strings.TrimSpace(reason) == "" {
+			t.Errorf("route %s is not producer-scoped and has no recorded reason in notProducerScoped (AC-20 classifies every route)", key)
+		}
 	}
+	if scoped == 0 {
+		t.Fatal("no producer-scoped routes found; the route table is empty or the kinds changed")
+	}
+
 	for key := range crossProducerCases {
 		if !seen[key] {
 			t.Errorf("cross-producer case %s names no registered producer route", key)
 		}
 	}
-	if len(seen) == 0 {
-		t.Fatal("no producer-scoped routes found; the route table is empty or the kinds changed")
+	for key := range notProducerScoped {
+		if !seen[key] {
+			t.Errorf("notProducerScoped %s names no registered route", key)
+		}
 	}
+	if len(seen) != len(s.routes()) {
+		t.Fatalf("classified %d routes, table has %d: a route is unclassified", len(seen), len(s.routes()))
+	}
+	t.Logf("AC-20: %d routes classified, %d producer-scoped with a cross-producer case", len(seen), scoped)
 }
 
 // --- small helpers the table needs -----------------------------------------
