@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/pigeon-hq/pigeon/internal/apikey"
+	"github.com/m7jay/pigeon/internal/apikey"
 )
 
 // ErrNotFound is the only "no such thing" answer the API may give for a

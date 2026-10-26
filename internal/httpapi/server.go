@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pigeon-hq/pigeon/internal/store"
+	"github.com/m7jay/pigeon/internal/store"
 )
 
 // Lookup authenticates a plaintext bearer key. Declared as a function type so the

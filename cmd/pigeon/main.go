@@ -17,11 +17,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pigeon-hq/pigeon/internal/config"
-	"github.com/pigeon-hq/pigeon/internal/db"
-	"github.com/pigeon-hq/pigeon/internal/httpapi"
-	"github.com/pigeon-hq/pigeon/internal/identity"
-	"github.com/pigeon-hq/pigeon/internal/store"
+	"github.com/m7jay/pigeon/internal/config"
+	"github.com/m7jay/pigeon/internal/db"
+	"github.com/m7jay/pigeon/internal/httpapi"
+	"github.com/m7jay/pigeon/internal/identity"
+	"github.com/m7jay/pigeon/internal/store"
 )
 
 // version is stamped by the build: -ldflags "-X main.version=$(git describe)".

@@ -17,6 +17,14 @@ internal/store/      tenant-scoped data access (every method names a producer)
 internal/httpapi/    router, middleware, handlers
 ```
 
+**Module path.** `github.com/m7jay/pigeon`. `REQUIREMENTS.md` §19 chose
+`github.com/pigeon-hq/pigeon` on the assumption of an organisation; no such org
+exists and a fine-grained PAT cannot create one, so the module follows the actual
+repository. `ghcr.io/pigeon-hq/pigeon` in §19 stays as the intended image path
+until an org exists — being wrong about an unpublished image prefix costs nothing,
+being wrong about the import path costs every consumer a module rename. Amend §19
+when the org is created.
+
 Rules that hold across the tree:
 
 - No package outside `internal/store` writes SQL against tenant tables. RLS makes

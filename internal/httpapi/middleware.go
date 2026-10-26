@@ -9,7 +9,7 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/pigeon-hq/pigeon/internal/store"
+	"github.com/m7jay/pigeon/internal/store"
 )
 
 type ctxKey int

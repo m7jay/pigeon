@@ -1,4 +1,4 @@
-module github.com/pigeon-hq/pigeon
+module github.com/m7jay/pigeon
 
 go 1.26.0
 

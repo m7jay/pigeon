@@ -9,7 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/pigeon-hq/pigeon/internal/store"
+	"github.com/m7jay/pigeon/internal/store"
 )
 
 func newTestServer(lookup Lookup, ready func(context.Context) error) http.Handler {
