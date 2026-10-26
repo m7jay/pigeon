@@ -67,11 +67,12 @@ or a push from somewhere else) cannot leave you reviewing a stale base:
 
 ```bash
 cd /opt/data/workspace/projects/pigeon
-: "${HERMES_KANBAN_WORKSPACE:?}"          # never let the rm -rf below run on an empty var
 git worktree unlock "$HERMES_KANBAN_WORKSPACE/wt" 2>/dev/null || true
 git worktree remove --force "$HERMES_KANBAN_WORKSPACE/wt" 2>/dev/null || true
 git fetch origin wt/<card-id>-<slug>
-rm -rf "$HERMES_KANBAN_WORKSPACE/wt"      # a leftover directory is not a registered worktree
+rm -rf "${HERMES_KANBAN_WORKSPACE:?}/wt"  # a leftover directory is not a registered worktree;
+                                          # the :? aborts this command (not just a script) if the
+                                          # variable is unset, so it can never become `rm -rf /wt`
 git worktree prune                        # after the delete: prune only clears registrations
                                           # whose directory is already gone
 git worktree add -B wt/<card-id>-<slug> "$HERMES_KANBAN_WORKSPACE/wt" origin/wt/<card-id>-<slug>
@@ -277,12 +278,18 @@ relying on.
    implementer: never merge around a red check, never disable one. If runners are
    unavailable, that is still a send-back - the card waits for a human, it does not
    merge.
-4. GitHub reports the PR mergeable: `mergeable: MERGEABLE` - if it is `UNKNOWN`, GitHub is
-   still computing, so re-read every ~15 s for up to ~2 minutes and then send the card
-   back with `kanban_request_changes` - and the PR is not a draft. The block
-   is step 3, not the summary badge: `mergeStateStatus` reads `UNSTABLE` whenever any check
-   on the head has not concluded `success`, including one still running, so it is never
-   on its own a reason to refuse - and a `completed` non-success run for the reviewed
+4. GitHub reports the PR mergeable: `mergeable: MERGEABLE`, and the PR is not a draft. If
+   `mergeable` is `UNKNOWN`, GitHub is still computing - re-read every ~15 s and look at
+   `mergeStateStatus` before concluding anything:
+
+   - it settles to `BEHIND` (the base moved): keep waiting and follow the `BEHIND`
+     paragraph below. Do not bounce.
+   - it stays `UNKNOWN` with `mergeable` still `UNKNOWN` after ~10 minutes: stop and send
+     the card back with `kanban_request_changes`.
+
+   `mergeStateStatus` is not the gate; step 3 is. It reads `UNSTABLE` whenever any check
+   on the head has not concluded `success`, including one still running, so it is never on
+   its own a reason to refuse - and a `completed` non-success run for the reviewed
    `headRefOid` is a blocker per step 3, not something this line excuses. `BEHIND` is
    mergeable on this repo too, because protection cannot exist here (see below).
 5. **Record the verdict before merging - once, and only for a SHA you have reviewed.**
@@ -342,8 +349,9 @@ That completion is the only thing that moves the card to `done`.
 **If the PR is `BEHIND`,** merge anyway. There is no branch protection on this repo and
 rebase merges are allowed, so a branch whose base moved is still mergeable; re-check
 `mergeable` before merging - step 6's head re-read and step 7's `--match-head-commit`
-still apply, and do not re-run step 3. A `mergeable: UNKNOWN` here is a wait, not a
-bounce: it is what a just-moved base looks like while GitHub recomputes. Do not try to
+still apply, and do not re-run step 3. `mergeable: UNKNOWN` right after a base move is a
+wait, not a bounce - that is the `BEHIND` branch of step 4, and its ~10 minute bound is
+the one that applies. Do not try to
 re-run step 3 after the merge: a rebase merge rewrites the commits and creates new SHAs
 by design, and the branch ref is gone, so there is no run to match. The gate is the CI
 run for the reviewed `headRefOid`, and that is the value `metadata["head_sha"]` keeps -
