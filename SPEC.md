@@ -248,40 +248,39 @@ Decisions taken in place of gaps, each with the mechanism that makes it
 implementable and the trade-off it accepts, because a decision without its mechanism
 gets relitigated the moment somebody implements the other one.
 
-### A-2 — NFR-4 was two claims wearing one number
+### A-3 — The envelope carries the resolved `consumer_ref` and never `consumer_id`
 
-**Decision.** Restate NFR-4 as three claims, each naming its machine and its
-workload, and measure each where it is claimed:
+**Decision.** Routing input and envelope output are decoupled. A producer may publish
+with `consumer_id` or `consumer_ref` (FR-505), and every `consumer`-routed event
+leaves the platform carrying the **resolved `consumer_ref`**. `consumer_id` does not
+appear in the envelope at all.
 
-| Claim | Machine | Workload | Pass |
-|---|---|---|---|
-| ingest write path | 2 vCPU / 4 GB (reference) | 1,000 events/s with the relay stopped, so nothing fans out | all `202`, p99 ≤ 100 ms, zero `429`/`5xx`, RSS ≤ 1.5 GB per service, commit rate ≤ 100/s |
-| end-to-end rated load | 2 vCPU / 4 GB (reference) | 250 events/s × 10 subscriptions = 2,500 deliveries/s | NFR-1/NFR-2 hold, queue drains per NFR-6 |
-| end-to-end rated load | 8 vCPU / 16 GB | 1,000 events/s × 10 subscriptions = 10,000 deliveries/s | NFR-1/NFR-2 hold (AC-16) |
+**Mechanism.** `consumers.ref` is `not null` and unique per `(producer, env)`
+(FR-506, `0001_init.sql`), so the case the gap feared - a producer publishes by
+opaque id and the receiver is handed nothing - cannot arise: id to consumer row to
+ref always resolves at fan-out, and the resolved ref is written into the envelope
+once, from the same lookup FR-511 already caches. For `broadcast` events neither
+field is present, as §10 already said. S3's struct is therefore
+`ConsumerRef *string`, nil only for broadcast, with no `ConsumerID` field: a field
+that is always absent, or always ignored, is worse than no field.
 
-The original sentence asserted the third row's workload on the first row's machine.
-That is not an unmeasured claim, it is an impossible one: 10,000 delivery inserts
-plus 10,000 completion updates per second is four times what §8.1 rates the
-reference box for, and §8.1's own table says so a page later.
+The resolution rule for the id form is FR-514, and it is deliberately the same rule
+as the ref form: an unknown, deleted, or other-producer's `consumer_id` is
+`unroutable:consumer_not_registered` in live (`202`) and `422` in test, exactly as
+FR-508 treats an unknown ref. Two different outcomes for "the reference did not
+resolve" would be a silent data-loss asymmetry, and answering a cross-tenant id probe
+with a distinct response would hand out an id-enumeration oracle.
 
-**Mechanism.** AC-45 is the new test of claim 1, and the load protocol now written
-into §12 is what makes any of the three numbers mean something: 5 minutes of warm-up
-excluded, 30 minutes measured, pass criteria evaluated over the last 10 minutes,
-`attempt_log.mode=buffered`, accepted events reconciled against `events` and `outbox`
-rows rather than against the generator's own counter, and `pg_stat_database`
-sampled to prove FR-815's batching. Claim 1 stops the relay on purpose, because
-delivery amplification is the only thing that separates it from claim 2; the
-end-to-end claims follow in AC-31 and AC-16.
+**Trade-off.** The receiver sees only an identifier it already understands: the
+producer's own name for it, which a shared endpoint can route on without a lookup -
+which is why §10 carries it. The cost is that `consumer_id` is the one identifier
+that survives FR-506's re-key, so a consumer that must survive a re-key cannot key on
+the ref; it keys on `id` per event, or on a field in `data` its producer controls -
+the same guidance §10 already gives for replays. Emitting both would have handed
+receivers an internal identifier whose stability we would then owe them, and a spec
+gap is a poor reason to take on a compatibility promise.
 
-**Trade-off.** Claim 1 is a stronger statement about ingest than this tree has ever
-demonstrated, and if S10 measures below 1,000 events/s the answer is either a defect
-to fix or an amendment to §8.1 recorded as one - never a tolerance quietly added to
-the test. Claim 2 is a smaller headline number than the old NFR-4 advertised (250
-events/s, not 1,000), and it is the number an operator can actually size capacity
-against, which the inflated one was not: §8.1.1 already says so, and an operator who
-plans against 1,000 events/s on a 2 vCPU box discovers the truth at 3 a.m., which is
-the failure mode §8 exists to prevent. Neither claim addresses *sustained* weeks-long
-throughput, which §8.1.1 shows is a disk and retention question, not a CPU one.
+**Encoded by.** FR-513, FR-514, §10's field table, AC-23 (extended to id mode).
 
 ## Gap list — where `REQUIREMENTS.md` is silent or inconsistent
 
