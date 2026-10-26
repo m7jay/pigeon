@@ -128,8 +128,9 @@ $GH run list --branch wt/<card-id>-<slug> -L 5
 $GH run view <run-id> --log | grep -E '^(ok|FAIL|---)'   # e.g. "ok  github.com/m7jay/pigeon/internal/store"
 ```
 
-Put the run id and its conclusion in `kanban_complete(summary=..., metadata=...)`,
-together with `metadata["published_pr"] = "<PR URL>"`.
+Put the run id and its conclusion in `kanban_request_review(summary=..., metadata=...)`
+with `reviewer="pigeon-rev"`, together with `metadata["published_pr"] = "<PR URL>"`. The
+implementer does not call `kanban_complete` on a code card - section 7.
 
 ## 6. Identity: commits are authored by the worker, not by Jay
 
@@ -158,26 +159,34 @@ git -c user.name='pigeon-dev (agent)' \
 
 Do not impersonate a human, and do not set a different identity per commit.
 
-## 7. Merge through the gate, then delete the branch
+## 7. The review loop decides done, and the reviewer merges
 
-A worker merges its own PR. Merging is automatic, not discretionary: nobody waits
-for Jay. What is not automatic is the gate - all three conditions below are checked
-against the current head SHA, in this order, and the evidence goes in the PR.
+Card state is the gate, not the GitHub review pane. A code card reaches `done` only
+when `pigeon-rev` completes it, and the merge happens at that moment.
+
+**The loop is mandatory.** `pigeon-dev` implements, opens the PR, and submits with
+`kanban_request_review(task_id, summary=..., reviewer="pigeon-rev")`. Pass the
+reviewer explicitly every time: a re-review with no recorded reviewer provenance is
+refused. The card moves to `review` and the dispatcher spawns `pigeon-rev`. A review
+that finds defects calls `kanban_request_changes(task_id, reason=...)`, which requeues
+the card to `pigeon-dev` with a `changes_requested` event and re-spawns the
+implementer. That repeats until the reviewer approves. No worker calls
+`kanban_complete` on a code card it did not review, and there is no "this team has no
+reviewer" shortcut.
+
+**What the reviewer verifies before approving** - all three, against the current head
+SHA:
 
 1. **CI is green on that exact SHA.** The latest `ci` run for the PR head reports
    `completed / success` (`$GH run list --repo m7jay/pigeon --branch <branch>`). A
-   green run from an earlier commit is not the gate. If CI is red, fix it on the
-   same branch: never merge around a red check and never disable one.
-2. **An independent review approved the diff.** A different agent or profile from
-   the author reviews it (`pigeon-rev` reviews `pigeon-dev` cards). A worker never
-   approves its own card, and a review means a defect pass over auth, tenant
-   isolation, SQL and tests - not a restatement of the diff. The verdict is posted
-   on the PR.
+   green run from an earlier commit is not the gate. If CI is red, it goes back to the
+   implementer: never merge around a red check, never disable one.
+2. **A defect pass over auth, tenant isolation, SQL and tests**, reported as
+   `file:line - problem - fix`. Restating the diff is not a review.
 3. **GitHub reports the PR mergeable.** `mergeable: MERGEABLE`,
    `mergeStateStatus: CLEAN`, and the PR is not a draft.
 
-Then merge with the history style the repo uses - rebase, linear, worker authorship
-kept - and delete the branch in the same step:
+**Who merges: the reviewer, at approval - not the implementer.**
 
 ```bash
 $GH pr merge <n> --rebase --delete-branch
@@ -185,17 +194,26 @@ $GH pr view <n> --json state,mergedAt     # mergedAt must be set
 git worktree remove "$HERMES_KANBAN_WORKSPACE/wt"
 ```
 
-`--rebase` and not `--merge`: the branch has to land as individual commits, not one
-squashed blob and not a merge bubble. If the PR goes `BEHIND` or `DIRTY` while it
-waits, rebase onto the default branch, push, and let CI run again before merging.
+Then `kanban_complete(summary=..., metadata={"pr": <n>, "merge_commit": <sha>})`. That
+completion is the only thing that moves the card to `done`. `--rebase` and not
+`--merge`: the branch lands as individual commits, not one squashed blob and not a
+merge bubble. If the PR goes `BEHIND` or `DIRTY`, rebase onto the default branch, push,
+and let CI run again before merging.
+
+**Where the verdict lives: the card.** `gh pr review` is not usable here - the token
+belongs to the PR's own author and GitHub refuses it (`Review Can not request changes
+on your own pull request`), so `reviewDecision` on these PRs stays empty forever and
+must never be used as the gate. The reviewer records its verdict as a card comment and
+may mirror it to the PR for humans; the card event is what the loop and the next
+worker act on.
+
+**Corollary: a PR comment is not a review.** Nothing polls the GitHub thread. A finding
+left on a PR by a human is invisible to the loop until it is copied into the card with
+`kanban_comment` - which is also how a human redirects an in-flight card.
 
 This replaces the earlier "never merge" rule (changed 26 Oct 2026). Nothing changes
 about **where** work lands: a worker still never pushes to `master` or the default
-branch directly, and it still does not merge a PR whose review or CI it has not
-seen.
-
-To discard a throwaway branch locally, use `git update-ref -d refs/heads/<branch>`
-— `git branch -D` is refused by the worker's command guard.
+branch directly, and it still does not merge a PR whose review or CI it has not seen.
 
 ## 8. What does not work here (measured, not guessed)
 
