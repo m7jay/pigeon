@@ -225,11 +225,17 @@ func insertSkippedDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, 
 		endpoints[i] = s.EndpointID
 		reasons[i] = s.Reason
 	}
+	// The endpoint id and its reason are two columns of ONE set-returning
+	// source: unnest($5, $6) zips the arrays row-by-row, so each endpoint is
+	// paired with its own reason. Two comma-separated unnest() would be a CROSS
+	// JOIN — every endpoint paired with every reason — and ON CONFLICT would
+	// then keep an arbitrary reason per endpoint, corrupting both the row and
+	// the FR-508 metric label derived from it.
 	res, err := tx.Exec(ctx, `
 		insert into deliveries
 			(event_id, endpoint_id, producer_id, env, consumer_id, status, non_delivery_reason, lease_expires_at)
-		select $1, x, $2, $3, $4, 'skipped', y, null
-		from unnest($5::text[]) as x, unnest($6::text[]) as y
+		select $1, x.endpoint_id, $2, $3, $4, 'skipped', x.reason, null
+		from unnest($5::text[], $6::text[]) as x(endpoint_id, reason)
 		on conflict (event_id, endpoint_id) do nothing`,
 		eventID, sc.ProducerID, sc.Env, consumerID, endpoints, reasons)
 	if err != nil {
