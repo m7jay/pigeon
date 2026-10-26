@@ -61,16 +61,18 @@ cd "$HERMES_KANBAN_WORKSPACE/wt"
 the worktree - `git worktree remove` deletes the directory, not the ref - so `-b` fails
 with `fatal: a branch named 'wt/<card-id>-<slug>' already exists`, and re-cutting it from
 `origin/<default-branch>` would leave you without the commits under review and make your
-push non-fast-forward. Check out the branch that has the PR on it:
+push non-fast-forward. Re-create the worktree on the branch as the remote has it - `-B`
+resets the local ref to `origin/`, so a local ref that lagged (a failed push last round,
+or a push from somewhere else) cannot leave you reviewing a stale base:
 
 ```bash
 cd /opt/data/workspace/projects/pigeon
 git worktree remove --force "$HERMES_KANBAN_WORKSPACE/wt" 2>/dev/null || true
 git fetch origin wt/<card-id>-<slug>
 git worktree prune
-git worktree add "$HERMES_KANBAN_WORKSPACE/wt" wt/<card-id>-<slug>
+git worktree add -B wt/<card-id>-<slug> "$HERMES_KANBAN_WORKSPACE/wt" origin/wt/<card-id>-<slug>
 cd "$HERMES_KANBAN_WORKSPACE/wt"
-git status -sb        # must show ...origin/wt/<card-id>-<slug>, not a fresh branch
+git status -sb        # must show wt/<card-id>-<slug> in sync with origin, not a stale local ref
 ```
 
 `HERMES_KANBAN_WORKSPACE/wt` is the worktree to use; the scratch workspace root is
@@ -253,19 +255,24 @@ relying on.
 
    `<branch>` is the `headRefName` from step 1. The run must report `status: completed`,
    `conclusion: success`, and a `headSha` equal to the `headRefOid` from step 1. A run
-   whose `headSha` differs is not the gate, however green it is. While that run is
-   `queued` or `in_progress`, wait and re-run this step - never merge on the strength of
-   a previous commit's run. A completed run with any conclusion other than `success` goes
-   back to the implementer: never merge around a red check, never disable one.
-4. GitHub reports the PR mergeable: `mergeable: MERGEABLE`, and the PR is not a draft.
-   `mergeStateStatus` is `CLEAN` once the checks settle; `UNSTABLE` while a check is
-   still running is not a blocker as long as step 3 gives you a `completed / success` run
-   for the reviewed SHA - only a completed non-success run is. `BEHIND` is mergeable on
-   this repo too, because protection cannot exist here (see below).
+   whose `headSha` differs is not the gate, however green it is. While the run for
+   `headRefOid` reports any status other than `completed` - `queued`, `pending`,
+   `requested`, `waiting`, `in_progress` all occur - wait and re-run this step; never
+   merge on the strength of a previous commit's run. A `completed` run whose conclusion is
+   anything but `success` goes back to the implementer: never merge around a red check,
+   never disable one.
+4. GitHub reports the PR mergeable: `mergeable: MERGEABLE` - if it is `UNKNOWN`, GitHub is
+   still computing, so re-read until it settles - and the PR is not a draft. The block
+   is step 3, not the summary badge: `mergeStateStatus` reads `UNSTABLE` whenever any check
+   on the head has not concluded `success`, including one still running, so it is never
+   on its own a reason to refuse - and a `completed` non-success run for the reviewed
+   `headRefOid` is a blocker per step 3, not something this line excuses. `BEHIND` is
+   mergeable on this repo too, because protection cannot exist here (see below).
 5. **Record the verdict before merging - once, and only for a SHA you have reviewed.**
    `kanban_comment` with the reviewed
    `headRefOid`, the `ci` run id and its `headSha`, and either `no findings` or the
-   finding list. Be plain about what this is: kanban does not enforce it - a
+   finding list. A `no findings` verdict names at least one path you actually read at
+   that SHA, so the comment shows the pass happened rather than asserting it. Be plain about what this is: kanban does not enforce it - a
    completion out of the review column needs no evidence at all
    (`hermes_cli/kanban_db.py`, "Completions from non-review statuses need evidence",
    review exempt), and completion metadata is free-form. The comment and the metadata
