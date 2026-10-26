@@ -695,7 +695,7 @@ Three independent ladders. Adding capacity to one does nothing for the others, a
 | Ingest API | yes | N | one transaction per publish |
 | Relay | yes | N | `SKIP LOCKED` prevents double-claim (FR-702) |
 | Fan-out consumer | yes | N | Redis Streams consumer group |
-| Delivery workers | yes | N | `(event_id, consumer_id)` unique makes duplicate consumption harmless |
+| Delivery workers | yes | N | the partial `(event_id, endpoint_id)` unique index makes duplicate fan-out harmless (I-3) |
 | Producer portal | yes | N | thin API client, opaque session token (FR-112) |
 | Consumer portal | yes | N | thin API client, opaque session token (FR-112) |
 | Flusher | yes, but | few | batching amortises better with fewer writers |
