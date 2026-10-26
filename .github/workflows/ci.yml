@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+    branches: [master, "feat/**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pigeon_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      # The cross-producer harness (AC-20) skips unless this is set, and the
+      # whole point of CI is that it must not skip.
+      PIGEON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/pigeon_test?sslmode=disable
+      PIGEON_TEST_REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "unformatted files:"; echo "$out"; exit 1; fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test -count=1 -race ./...
+
+      - name: redis AOF is mandatory (D-5)
+        run: |
+          redis-cli -h localhost config get appendonly
+
+      # OPS-7 is a startup guarantee, not a documentation claim: the binary must
+      # refuse to boot on an unsafe configuration. Prove it on every push.
+      - name: binary refuses an unsafe configuration (OPS-7)
+        run: |
+          go build -o /tmp/pigeon ./cmd/pigeon
+          if /tmp/pigeon 2>/dev/null; then
+            echo "binary started with no configuration"; exit 1
+          fi
+          if PIGEON_DATABASE_URL="$PIGEON_TEST_DATABASE_URL" \
+             PIGEON_INSTANCE_ADMIN_PASSWORD=password /tmp/pigeon 2>/dev/null; then
+            echo "binary started with a weak admin password"; exit 1
+          fi
+          echo "refusals ok"
