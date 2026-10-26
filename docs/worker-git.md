@@ -180,7 +180,9 @@ provenance is refused. The card moves to `review` and the dispatcher spawns
 reason=...)`, which requeues the card to `pigeon-dev` with a `changes_requested` event
 and re-spawns the implementer. That repeats until the reviewer approves. Only
 `pigeon-rev` calls `kanban_complete` on a code card, and there is no "this team has no
-reviewer" shortcut.
+reviewer" shortcut. None of that is enforced by the tool - nothing refuses an
+implementer that calls `kanban_complete` straight from `running` - so it is a protocol
+the profiles and this file agree on, auditable after the fact from the card's events.
 
 **What the reviewer does, in this order.** Every step is against one head SHA, and that
 SHA is named in the artifact from step 5. Each block sets `GH` itself: a shell variable
@@ -209,7 +211,9 @@ does not survive to the next tool call, and `gh` is not on `PATH` (§8).
    gate, however green it is. A red check goes back to the implementer - never merge
    around it, never disable one.
 4. GitHub reports the PR mergeable: `mergeable: MERGEABLE`,
-   `mergeStateStatus: CLEAN`, and the PR is not a draft.
+   `mergeStateStatus: CLEAN` (a head that is behind the base still reports `CLEAN` on
+   this repo, because protection cannot exist here - if GitHub ever reports `BEHIND`,
+   treat it as mergeable, see below), and the PR is not a draft.
 5. **Record the verdict before merging.** `kanban_comment` with the reviewed
    `headRefOid`, the `ci` run id and its `headSha`, and either `no findings` or the
    finding list. Be plain about what this is: kanban does not enforce it - a
@@ -219,21 +223,29 @@ does not survive to the next tool call, and `gh` is not on `PATH` (§8).
    are the record a human reads when they ask whether a card was ever really reviewed.
    A completion without them is a protocol violation even though nothing rejects it.
 6. Re-read `headRefOid`. If it moved since step 1, the implementer pushed: go back to
-   step 1 with the new SHA and redo step 5, so the only verdict comment on the card
-   names the SHA that actually merges. Never merge a SHA you did not review.
+   step 1 with the new SHA and post a fresh verdict comment naming the new SHA and
+   saying it supersedes the earlier verdict. `kanban_comment` is append-only - there is
+   no edit or delete - so earlier verdicts stay on the card; the newest one is the
+   record and every earlier one is stale by definition. Never merge a SHA you did not
+   review.
 7. Merge - rebase, never squash and never a merge bubble:
 
 ```bash
 GH=/opt/data/toolchain/gh
-$GH pr merge <n> --repo m7jay/pigeon --rebase
+$GH pr merge <n> --repo m7jay/pigeon --rebase --match-head-commit <reviewed headRefOid>
 $GH pr view <n> --repo m7jay/pigeon --json state,mergedAt,mergeCommit,headRefOid
 ```
 
+`--match-head-commit` closes the window between step 6's re-read and the merge: if the
+head moved after the re-read, GitHub refuses the merge instead of landing a SHA nobody
+reviewed.
+
 `mergeCommit.oid` is the value for `metadata["merge_commit"]`; it is `null` until the
-merge lands, so read it after the merge returns, not before. Skip `--delete-branch`:
-it operates on a local branch in the current repository, and the reviewer has no
-repository (§2 keeps the shared checkout off limits, and the implementer's worktree
-dies with its run). Delete the remote ref by API instead, which needs no checkout:
+merge lands, so read it after the merge returns, not before. Skip `--delete-branch`: it deletes
+the remote ref correctly, but its local-branch cleanup needs a checkout the reviewer
+does not have (§2 keeps the shared checkout off limits, and the implementer's worktree
+dies with its run), so it can fail after the merge has already landed. Delete the
+remote ref directly instead, which needs no checkout:
 
 ```bash
 GH=/opt/data/toolchain/gh
