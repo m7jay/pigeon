@@ -304,6 +304,7 @@ erDiagram
 - **D-5** Redis MUST run `appendonly yes` with `appendfsync everysec`; RDB-only persistence is unsupported because it loses the queue. The startup gate is OPS-7.
 - **D-6** The sweeper MUST re-queue any delivery whose `lease_expires_at < now` within 10 s, so a crashed worker costs one lease interval, not a lost delivery.
 - **D-7** Exactly one sweeper MUST be active per deployment. Leadership is taken with a Postgres advisory lock and MUST be released within 30 s of the holder dying, because partition drops (SB-3) are destructive and MUST NOT run concurrently. Every other core replica runs as a standby that competes for the lock.
+- **D-8** Pause state for an endpoint or a subscription MUST be a durable Postgres column written as control state, never a Redis key. Losing a failure-counter window MAY delay a pause, but MUST NOT pause or unpause anything.
 
 ---
 
@@ -518,6 +519,11 @@ The class is declared on the event type, not chosen per event, so a payload cann
 | FR-1206 | The dead-letter view MUST be per endpoint, sortable by failure reason. | P1 |
 | FR-1207 | The retry deadline MUST be extended by any period during which the delivery was paused, so a pause cannot consume a delivery's remaining window. | P0 |
 | FR-1208 | Each delivery MUST expose `next_attempt_at` and `retry_deadline`, so a consumer can see how long the platform intends to keep trying. | P1 |
+| FR-1209 | A failure for FR-1202/FR-1203 MUST mean one attempt that did not return `2xx`, counted in a sliding one-hour window per `(endpoint, event_type)` and per endpoint; a success MUST NOT count toward either. | P0 |
+| FR-1210 | The endpoint threshold MUST be evaluated before the subscription threshold, and per-subscription notifications for an endpoint that has tripped its own threshold MUST be suppressed, so one dead endpoint sends one email rather than one per subscription. | P0 |
+| FR-1211 | Resume MUST clear the pause and that key's counter window in one action, so the failures that caused the pause cannot immediately cause it again (FR-1205). | P0 |
+
+**Why the unit is an attempt, not a delivery.** A pause exists to stop hammering a receiver that is failing, and a delivery counts as one failure whether it failed once or fifteen times. Counting attempts is therefore the honest unit: at the default backoff a single dead delivery contributes 7 failing attempts inside its first hour, so a subscription carrying steady traffic pauses within minutes of an outage, while a quiet subscription pauses only once it has genuinely accumulated 10 failures and not on one bad event. Because a paused subscription stops producing failures, an endpoint accumulates at most 10 failures per subscription: FR-1203's 100 is reachable only on an endpoint with 10 or more subscriptions where every one of them is failing, and below that it is deliberately unreachable.
 
 ### 7.13 Quotas and fairness (FR-13)
 
@@ -973,7 +979,7 @@ paragraph - S10 MUST NOT implement a second token beside this one.
 | AC-11 | Valid / tampered / stale-timestamp signatures | Only the valid one passes |
 | AC-12 | Replay twice with one idempotency key | One set of new deliveries |
 | AC-13 | Replay 5,000 events | Rejected, naming the 1,000 bound |
-| AC-14 | 50 failures for one endpoint in an hour | Subscription paused, one email, resume works |
+| AC-14 | 10 failed attempts for one `(endpoint, event_type)` within an hour | That subscription paused; one email naming endpoint, event type and the first and last failing response; the endpoint's other subscriptions unaffected; resume clears the window and the next matching event delivers |
 | AC-15 | Producer A requests producer B's delivery | `404`, logged |
 | AC-16 | Load: 1,000 events/s, 10 subs, one hanging endpoint, on 8 vCPU / 16 GB | NFR-1/2 hold; hanging endpoint capped; commit rate stays under 100/s |
 | AC-17 | Load: one producer at 50% | Other producer p99 degrades ≤ 20% |
@@ -1003,6 +1009,7 @@ paragraph - S10 MUST NOT implement a second token beside this one.
 | AC-41 | Two core replicas, one endpoint capped at 10 concurrent, 100 deliveries enqueued at once | The endpoint never observes more than 10 in-flight requests; observed count is identical with 1 and 2 replicas |
 | AC-42 | Start two sweepers; kill the lock holder | The standby takes leadership within 30 s; exactly one partition is dropped; no delivery is re-queued twice |
 | AC-43 | Scale 1 → 2 → 4 replicas at fixed load below the DB ceiling | Throughput scales ≥ 80% per doubling; above the ceiling, throughput does not improve and p99 worsens, matching §8.4 |
+| AC-44 | 10 subscriptions on one endpoint all failing, 100 failed attempts within an hour | Endpoint paused once, by the endpoint threshold evaluated first; one email naming the endpoint; per-subscription emails suppressed; every subscription stops receiving; one resume restores each one that had not tripped its own threshold |
 | AC-49 | Every `Set-Cookie` a portal emits (session, flash, CSRF) | Carries `HttpOnly`, `Secure` and `SameSite=Lax`; no portal cookie lacks any of the three |
 | AC-50 | A state-changing `POST` to a portal route - the anonymous `/login` and `/invite` included - with the CSRF token absent or not matching the session cookie: a cross-origin form, or a same-origin request with the hidden field stripped | `403` and no state change; the same `POST` carrying the token the page rendered succeeds |
 | AC-51 | Core `PIGEON_SESSION_TTL=24h`, then log in to a portal; repeat at `15m` | The session cookie's `Max-Age` is the 24 h / 15 m the core issued (from the login response's `expires_at`), not the 12 h constant the portal used to hardcode |
