@@ -415,6 +415,8 @@ Each is a different email to a different person, which is why one generic `not_d
 | FR-510 | One event MUST represent one business occurrence for one consumer. A batch affecting N consumers MUST be published as N events, so payload size stays bounded, dedupe stays per-consumer, and one consumer's failing endpoint cannot delay the other N-1. | P0 |
 | FR-511 | `consumer_ref` resolution MUST be cached in Redis with invalidation on consumer change, so publish latency excludes the lookup. | P1 |
 | FR-512 | An API key MAY be scoped to a single `consumer_ref`, for producer backends that emit from a per-consumer context. | P2 |
+| FR-513 | The envelope of a `consumer`-routed event MUST carry the resolved `consumer_ref` whether the producer supplied `consumer_id` or `consumer_ref`; `consumer_id` MUST NOT appear in the envelope, and a `broadcast` event carries neither. | P0 |
+| FR-514 | A `consumer_id` that is unknown, deleted, or belongs to another producer MUST be treated exactly as an unresolvable `consumer_ref` (FR-508), so the two reference forms cannot diverge and no id-enumeration oracle exists. | P0 |
 
 ### 7.6 Ingestion (FR-6)
 
@@ -759,7 +761,7 @@ The shape matters as much as the length. Retries start at 30 seconds, so a recei
 | `type` | per event type | Producer-defined. |
 | `version` | per event type | Payload schema version. |
 | `producer_id` | per event | Lets a shared endpoint route without a lookup. |
-| `consumer_ref` | per event | The producer's own identifier for the consumer: which consumer this event is about. Present when the event type routes to a consumer. |
+| `consumer_ref` | per event | The producer's own identifier for the consumer: which consumer this event is about. Always present when the event type routes to a consumer, whether the producer published by `consumer_ref` or by `consumer_id` (FR-513); absent for `broadcast`. `consumer_id` is deliberately not in the envelope: the receiver is handed only an identifier its own integration already understands. |
 | `created_at` | per event | ISO-8601 UTC, milliseconds. |
 | `delivery_id` | per delivery | Distinguishes a retry from a new event. |
 | `attempt` | per attempt | 1-based. |
@@ -990,7 +992,7 @@ paragraph - S10 MUST NOT implement a second token beside this one.
 | AC-20 | Cross-producer suite over every resource | All `404`; suite runs in CI |
 | AC-21 | Graceful restart during in-flight attempts | `SIGTERM` drains; zero lost attempts |
 | AC-22 | `pigeon doctor` on a misconfigured box | Fails with a specific, actionable message |
-| AC-23 | Publish a consumer-routed event with an unknown `consumer_ref` | Live: `202`, recorded `unroutable:consumer_not_registered`, visible in UI and a metric, zero deliveries. Test: `422` |
+| AC-23 | Publish a consumer-routed event with an unknown `consumer_ref`, and separately with an unknown, deleted, or another producer's `consumer_id` | Live: `202`, recorded `unroutable:consumer_not_registered`, visible in UI and a metric, zero deliveries. Test: `422`. The id form behaves identically (FR-514) |
 | AC-24 | Consumer exists but nothing subscribed to that event type | `not_delivered:no_matching_subscription`, distinguishable from AC-23 in the UI and in the metric label |
 | AC-25 | Publish with both `consumer_id` and `consumer_ref`, or with neither | `422` naming the conflict |
 | AC-26 | Batch settlement for 400 consumers published as 400 events | Deliveries independent per consumer; one consumer's hanging endpoint does not delay the other 399 |
