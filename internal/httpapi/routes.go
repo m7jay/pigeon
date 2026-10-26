@@ -90,6 +90,13 @@ func (s *Server) routes() []route {
 		// The ingest credential (FR-201..FR-207).
 		{http.MethodGet, "/v1/whoami", kindProducerKey, s.handleWhoami},
 
+		// Event types and ingest (§11). A producer registers the contracts it may
+		// publish (FR-301..FR-306), then publishes events against them; each accept
+		// writes the event and its outbox row in one transaction (FR-604).
+		{http.MethodPost, "/v1/event-types", kindProducerKey, s.handleCreateEventType},
+		{http.MethodGet, "/v1/event-types", kindProducerKey, s.handleListEventTypes},
+		{http.MethodPost, "/v1/events", kindProducerKey, s.handlePublish},
+
 		// Instance administration (FR-102, FR-107, MT-5).
 		{http.MethodPost, "/v1/admin/producers", kindAdmin, s.handleCreateProducer},
 		{http.MethodGet, "/v1/admin/producers", kindAdmin, s.handleListProducers},

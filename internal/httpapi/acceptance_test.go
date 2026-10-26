@@ -37,6 +37,11 @@ type tenant struct {
 	// give the invitation routes a real id to aim at.
 	PendingInviteID    string
 	PendingInviteEmail string
+
+	// EventTypeName is a live event type this producer registered, so the ingest
+	// and event-type routes have a real, scoped contract to publish against and a
+	// name the other tenant must not see.
+	EventTypeName string
 }
 
 type createdProducer struct {

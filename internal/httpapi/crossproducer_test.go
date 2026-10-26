@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -227,6 +228,64 @@ var crossProducerCases = map[string]cpCase{
 			}
 		},
 	},
+	// Ingest and event types (FR-301..FR-306, FR-601..FR-607). None of the three
+	// takes a cross-tenant identifier in the path - publish and event-type writes
+	// are scoped by the credential - so the cross-producer proof is that the row
+	// lands in the caller's tenant and never crosses.
+	"POST /v1/event-types": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/event-types", map[string]any{
+				"name":           "cp.event",
+				"payload_schema": map[string]any{"type": "object"},
+			}
+		},
+		credential: func(a, b *tenant) string { return a.KeyPlain },
+		want:       http.StatusCreated,
+		after: func(t *testing.T, e *env, created []byte) {
+			// The type landed in A; B's list must not contain it.
+			b := e.tenantFor(t, "cp-beta")
+			code, raw := e.do(http.MethodGet, "/v1/event-types", b.KeyPlain, nil)
+			mustStatus(t, code, raw, http.StatusOK)
+			if strings.Contains(string(raw), "cp.event") {
+				t.Fatalf("an event type created in producer A is visible in producer B: %s", raw)
+			}
+		},
+	},
+	"GET /v1/event-types": {
+		build:      func(a, b *tenant) (string, any) { return "/v1/event-types", nil },
+		credential: func(a, b *tenant) string { return a.KeyPlain },
+		want:       http.StatusOK,
+		leaks:      func(a, b *tenant) []string { return []string{b.EventTypeName} },
+	},
+	"POST /v1/events": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/events", map[string]any{
+				"event_type": a.EventTypeName,
+				"payload":    map[string]any{"note": "cross-producer-probe"},
+			}
+		},
+		credential: func(a, b *tenant) string { return a.KeyPlain },
+		want:       http.StatusAccepted,
+		after: func(t *testing.T, e *env, created []byte) {
+			// The accept is scoped to A: the event row carries A's producer_id, and
+			// its outbox row is pending in the same transaction (FR-604).
+			a := e.tenantFor(t, "cp-alpha")
+			pub := decode[publishResponse](t, created)
+			var producerID, status string
+			err := e.admin.QueryRow(context.Background(),
+				`select e.producer_id, o.status from events e join outbox o on o.event_id = e.id
+				 where e.id = $1`, pub.ID).Scan(&producerID, &status)
+			if err != nil {
+				t.Fatalf("read accepted event: %v", err)
+			}
+			if producerID != a.ID {
+				t.Fatalf("event accepted under producer_id %q; want %q (publish is credential-scoped)", producerID, a.ID)
+			}
+			if status != "pending" {
+				t.Fatalf("accepted event's outbox row is %q, want pending (FR-604)", status)
+			}
+		},
+	},
 }
 
 // notProducerScoped classifies every route that is not part of the producer-scoped
@@ -268,6 +327,13 @@ func TestCrossProducerRequestsAreNotFound(t *testing.T) {
 	mustStatus(t, code, raw, http.StatusCreated)
 	b.PendingInviteID = decode[inviteJSON](t, raw).ID
 	e.remember(t, b)
+
+	// Each producer registers one live event type, so the ingest and event-type
+	// routes have a real scoped contract to act on. The name is derived from the
+	// slug so the two tenants' types are distinct and the leak check has a name to
+	// prove is absent from the other tenant.
+	seedCrossProducerEventType(t, e, a)
+	seedCrossProducerEventType(t, e, b)
 
 	// A's owner session, aimed at every one of B's identifiers — except on the two
 	// routes that take no identifier, where the case presents B's own credential
@@ -408,4 +474,21 @@ func (e *env) tenantFor(t *testing.T, slug string) *tenant {
 	}
 	t.Fatalf("no fixture recorded for %s", slug)
 	return nil
+}
+
+// seedCrossProducerEventType registers one live event type for a producer so the
+// ingest and event-type routes have a scoped contract to act on. The name is the
+// slug with hyphens dropped plus ".order" - the only form the name regex accepts
+// from a slug - so the two tenants' types never collide and each is absent from
+// the other (they are what the leak checks prove).
+func seedCrossProducerEventType(t *testing.T, e *env, tn *tenant) {
+	t.Helper()
+	tn.EventTypeName = strings.ReplaceAll(tn.Slug, "-", "") + ".order"
+	// Event types and events are ingest-credential routes (FR-201): they take the
+	// producer API key, not an owner session.
+	code, raw := e.do(http.MethodPost, "/v1/event-types", tn.KeyPlain, map[string]any{
+		"name":           tn.EventTypeName,
+		"payload_schema": map[string]any{"type": "object"},
+	})
+	mustStatus(t, code, raw, http.StatusCreated)
 }

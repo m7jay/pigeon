@@ -62,6 +62,13 @@ type Data interface {
 	ListKeys(ctx context.Context, sc store.Scope) ([]store.KeyMeta, error)
 	GetKey(ctx context.Context, sc store.Scope, keyID string) (store.KeyMeta, error)
 	RevokeKey(ctx context.Context, sc store.Scope, keyID string) error
+
+	// Ingest (§11, FR-301..FR-306, FR-601..FR-607). Event types are the producer's
+	// published contracts; publishing writes the event and its outbox row in one
+	// transaction so an accept can never outrun a publish intent.
+	CreateEventType(ctx context.Context, sc store.Scope, in store.NewEventType) (store.EventType, error)
+	ListEventTypes(ctx context.Context, sc store.Scope) ([]store.EventType, error)
+	PublishEvent(ctx context.Context, sc store.Scope, in store.PublishInput) (store.PublishedEvent, error)
 }
 
 // Deps are the collaborators the handlers need. Nil Ready means "nothing to
