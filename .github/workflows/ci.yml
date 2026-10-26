@@ -65,9 +65,14 @@ jobs:
       - name: test
         run: go test -count=1 -race ./...
 
-      - name: redis AOF is mandatory (D-5)
+      # D-5 is a property of the deployment, not of CI's throwaway Redis, and
+      # redis-cli is not installed on the runner. Assert the artifact we ship
+      # rather than the service container's defaults.
+      - name: compose declares AOF (D-5)
         run: |
-          redis-cli -h localhost config get appendonly
+          grep -q -- '--appendonly' compose.yaml
+          grep -q -- 'everysec' compose.yaml
+          echo "appendonly + everysec present in compose.yaml"
 
       # OPS-7 is a startup guarantee, not a documentation claim: the binary must
       # refuse to boot on an unsafe configuration. Prove it on every push.
