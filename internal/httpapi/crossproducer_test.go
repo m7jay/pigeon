@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/m7jay/pigeon/internal/ratelimit"
+	"github.com/stretchr/testify/require"
 )
 
 // logBuffer is a slog sink the tests can read. FR-108's AC-15 says the refusal is
@@ -256,6 +258,25 @@ var crossProducerCases = map[string]cpCase{
 		credential: func(a, b *tenant) string { return a.KeyPlain },
 		want:       http.StatusOK,
 		leaks:      func(a, b *tenant) []string { return []string{b.EventTypeName} },
+	},
+	"PATCH /v1/event-types/{name}": {
+		// FR-304/FR-305: version bump and disable are PATCH operations. It targets a
+		// SEEDED example (order.shipped), not a.EventTypeName - the POST /v1/events
+		// case still publishes to a.EventTypeName, and a disabled type is rejected
+		// there (TestPublishDisabledTypeIsInvalid), so the two cases must not share
+		// a type or the suite's ordering would make publish flaky.
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/event-types/order.shipped", map[string]any{"enabled": false}
+		},
+		credential: func(a, b *tenant) string { return a.KeyPlain },
+		want:       http.StatusOK,
+		after: func(t *testing.T, e *env, raw []byte) {
+			var got map[string]any
+			require.NoError(t, json.Unmarshal(raw, &got))
+			if v, _ := got["enabled"].(bool); v {
+				t.Errorf("event type should be disabled after PATCH: %s", raw)
+			}
+		},
 	},
 	"POST /v1/events": {
 		build: func(a, b *tenant) (string, any) {

@@ -253,8 +253,8 @@ func TestEventTypeCreateAndList(t *testing.T) {
 	if err := json.Unmarshal(raw, &list); err != nil {
 		t.Fatalf("decode list: %v", err)
 	}
-	if len(list) != 1 || list[0].Name != "invoice.created" {
-		t.Fatalf("event type list = %+v, want one invoice.created", list)
+	if len(list) != 4 || list[0].Name != "invoice.created" {
+		t.Fatalf("event type list = %+v, want four (three seeded examples + invoice.created)", list)
 	}
 }
 
@@ -271,4 +271,46 @@ func TestEventTypeNameRejected(t *testing.T) {
 	if got := errorCode(t, raw); got != "invalid" {
 		t.Fatalf("bad name code = %q, want invalid", got)
 	}
+}
+
+// TestPatchEventTypeLifecycle is FR-304/FR-305: PATCH disables a type (and a
+// disabled type is then refused at publish, not accepted), bumps its version, a
+// field left out of a patch is preserved, and a PATCH to a name the caller's
+// environment does not own is a 404, never a 403 (FR-108 + FR-103).
+func TestPatchEventTypeLifecycle(t *testing.T) {
+	e := setup(t)
+	tn := e.seedTenant(t, "evt-patch")
+	createType(t, e, tn, "billing.invoice")
+
+	// Disable it. The response is the updated type with enabled flipped.
+	code, raw := e.do(http.MethodPatch, "/v1/event-types/billing.invoice", tn.KeyPlain, map[string]any{"enabled": false})
+	mustStatus(t, code, raw, http.StatusOK)
+	if d := decode[eventTypeJSON](t, raw); d.Enabled {
+		t.Fatalf("patched type %+v still enabled after {enabled:false}", d)
+	}
+
+	// A disabled type is refused at publish - the accept never happens.
+	code, raw = publish(t, e, tn.KeyPlain, map[string]any{"event_type": "billing.invoice", "payload": map[string]any{"amount": 1}})
+	mustStatus(t, code, raw, http.StatusUnprocessableEntity)
+	if got := errorCode(t, raw); got != "invalid" {
+		t.Fatalf("publish to a disabled type code = %q, want invalid", got)
+	}
+
+	// Re-enable and bump the version in one patch.
+	code, raw = e.do(http.MethodPatch, "/v1/event-types/billing.invoice", tn.KeyPlain, map[string]any{"enabled": true, "payload_version": 2})
+	mustStatus(t, code, raw, http.StatusOK)
+	if p := decode[eventTypeJSON](t, raw); !p.Enabled || p.PayloadVersion != 2 {
+		t.Fatalf("patched type %+v, want enabled v2", p)
+	}
+
+	// A field left out of the patch is preserved (partial patch).
+	code, raw = e.do(http.MethodPatch, "/v1/event-types/billing.invoice", tn.KeyPlain, map[string]any{"payload_version": 3})
+	mustStatus(t, code, raw, http.StatusOK)
+	if o := decode[eventTypeJSON](t, raw); !o.Enabled || o.PayloadVersion != 3 {
+		t.Fatalf("partial patch %+v, want enabled v3 (enabled preserved)", o)
+	}
+
+	// A name the caller owns no environment's copy of is a 404, not a 403.
+	code, raw = e.do(http.MethodPatch, "/v1/event-types/ghost.happened", tn.KeyPlain, map[string]any{"enabled": false})
+	mustStatus(t, code, raw, http.StatusNotFound)
 }
