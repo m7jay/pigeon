@@ -805,10 +805,10 @@ Written against the 2 vCPU / 4 GB reference machine (§2.1).
 
 | ID | Requirement |
 |---|---|
-| NFR-1 | Ingest p99 ≤ 100 ms at 1,000 req/s. |
+| NFR-1 | Ingest p99 ≤ 100 ms at every load up to the machine class's ingest rating (§8.1): 1,000 events/s ingest-only on the reference machine, 250 events/s end-to-end on the reference machine, 1,000 events/s end-to-end on 8 vCPU / 16 GB. |
 | NFR-2 | Priority delivery p99 publish→first attempt ≤ 2 s; normal ≤ 60 s. |
 | NFR-3 | Outbox lag p99 ≤ 2 s; alarm at 30 s. |
-| NFR-4 | Ingest MUST sustain 1,000 events/s at 2 vCPU / 4 GB. Delivery capacity per machine class is defined once in §8.1 and is not restated here; at 10 subscriptions, 1,000 events/s implies 10,000 deliveries/s. |
+| NFR-4 | The rated load MUST be a property of the machine class, not one number asserted on every machine: **1,000 events/s ingest-only** and **250 events/s × 10 subscriptions end-to-end** on 2 vCPU / 4 GB, and **1,000 events/s × 10 subscriptions** on 8 vCPU / 16 GB. Delivery amplification is why the two differ, and §8.1 carries the row-level model for each. |
 | NFR-5 | Steady-state RSS ≤ 1.5 GB per service at target load. |
 | NFR-6 | Queue depth MUST return to baseline within 10 minutes of a burst ending (observed by OBS-9); a queue that does not drain is a defect, not a backlog. |
 | NFR-7 | Idempotent restart: killing any worker mid-attempt yields a retried or completed attempt, never a lost delivery. |
@@ -819,7 +819,9 @@ Written against the 2 vCPU / 4 GB reference machine (§2.1).
 | NFR-12 | Upgrade: `docker compose pull && up`, migrations automatic, no loss of accepted events. |
 | NFR-13 | Delivery throughput MUST scale at ≥80% efficiency per doubling of core replicas while the Postgres write path is below its measured ceiling, and MUST NOT claim to scale past it. Verified by AC-43. |
 
-**Capacity basis for NFR-4** — ingest and delivery are not the same workload, and conflating them was the defect this section fixed. Ingest is 2 rows per event and stays cheap; delivery is `subscriptions × events/s` rows plus one update each, which is what binds. §8.1 carries the row-level model and the levers that make it fit.
+**Capacity basis for NFR-4** — ingest and delivery are not the same workload, and conflating them was the defect this section fixed. Ingest is 2 rows per event and stays cheap; delivery is `subscriptions × events/s` rows plus one update each, which is what binds. §8.1 carries the row-level model and the levers that make it fit. 1,000 events/s × 10 subscriptions is 10,000 deliveries/s plus 10,000 completion updates, which §8.1 rates at 8 vCPU / 16 GB: the earlier wording asserted that workload on the 2 vCPU / 4 GB reference machine, where it is not a target but an impossibility.
+
+**Load protocol, which is what makes these numbers mean anything.** Every load claim in this section and in §16 is measured the same way: 5 minutes of warm-up excluded from the measurement, 30 minutes measured, pass criteria evaluated over the last 10 minutes; `attempt_log.mode=buffered`; the generator outside the machine under test or in its own container so it does not compete for the 2 vCPU; accepted events reconciled against `events` and `outbox` rows rather than taken from the generator's own counter; `pg_stat_database.xact_commit` sampled to prove FR-815's batching. An ingest-only claim stops the relay deliberately, because delivery amplification is the only thing that separates the two figures. A miss is a defect to fix, or an amendment to §8.1 recorded as one, never a tolerance added to the test.
 
 ---
 
@@ -1010,6 +1012,7 @@ paragraph - S10 MUST NOT implement a second token beside this one.
 | AC-42 | Start two sweepers; kill the lock holder | The standby takes leadership within 30 s; exactly one partition is dropped; no delivery is re-queued twice |
 | AC-43 | Scale 1 → 2 → 4 replicas at fixed load below the DB ceiling | Throughput scales ≥ 80% per doubling; above the ceiling, throughput does not improve and p99 worsens, matching §8.4 |
 | AC-44 | 10 subscriptions on one endpoint all failing, 100 failed attempts within an hour | Endpoint paused once, by the endpoint threshold evaluated first; one email naming the endpoint; per-subscription emails suppressed; every subscription stops receiving; one resume restores each one that had not tripped its own threshold |
+| AC-45 | Ingest-only load on 2 vCPU / 4 GB: 1,000 events/s for 30 minutes with the relay stopped, warm-up excluded | Every request `202`; p99 ≤ 100 ms over the last 10 minutes; zero `429` and zero `5xx`; `events` + `outbox` rows equal the accepted count; commit rate ≤ 100/s; RSS ≤ 1.5 GB per service (NFR-4, §12 load protocol) |
 | AC-49 | Every `Set-Cookie` a portal emits (session, flash, CSRF) | Carries `HttpOnly`, `Secure` and `SameSite=Lax`; no portal cookie lacks any of the three |
 | AC-50 | A state-changing `POST` to a portal route - the anonymous `/login` and `/invite` included - with the CSRF token absent or not matching the session cookie: a cross-origin form, or a same-origin request with the hidden field stripped | `403` and no state change; the same `POST` carrying the token the page rendered succeeds |
 | AC-51 | Core `PIGEON_SESSION_TTL=24h`, then log in to a portal; repeat at `15m` | The session cookie's `Max-Age` is the 24 h / 15 m the core issued (from the login response's `expires_at`), not the 12 h constant the portal used to hardcode |
