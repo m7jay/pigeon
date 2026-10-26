@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -24,11 +25,18 @@ type Config struct {
 	ReadHeaderLimit time.Duration
 
 	// Storage
-	DatabaseURL   string // PIGEON_DATABASE_URL
-	DBMaxConns    int32  // PIGEON_DB_MAX_CONNS
-	RedisURL      string // PIGEON_REDIS_URL
-	MigrationsOn  bool   // PIGEON_MIGRATIONS_ON_BOOT (OPS-9: exactly one migrator)
-	MigrateWaitDL time.Duration
+	//
+	// DatabaseURL is the runtime role: the one that serves requests, which must
+	// not own the tables or PostgreSQL would exempt it from row-level security.
+	// MigrateDatabaseURL is the owning role, used only for migrations; it defaults
+	// to DatabaseURL for single-role development, and Validate refuses an explicit
+	// configuration where the two are the same role.
+	DatabaseURL        string // PIGEON_DATABASE_URL
+	MigrateDatabaseURL string // PIGEON_MIGRATE_DATABASE_URL
+	DBMaxConns         int32  // PIGEON_DB_MAX_CONNS
+	RedisURL           string // PIGEON_REDIS_URL
+	MigrationsOn       bool   // PIGEON_MIGRATIONS_ON_BOOT (OPS-9: exactly one migrator)
+	MigrateWaitDL      time.Duration
 
 	// Identity
 	InstanceAdminPassword string // PIGEON_INSTANCE_ADMIN_PASSWORD
@@ -79,6 +87,7 @@ func Load() (Config, error) {
 	c := defaults()
 	c.HTTPAddr = env("PIGEON_HTTP_ADDR", c.HTTPAddr)
 	c.DatabaseURL = env("PIGEON_DATABASE_URL", "")
+	c.MigrateDatabaseURL = env("PIGEON_MIGRATE_DATABASE_URL", "")
 	c.RedisURL = env("PIGEON_REDIS_URL", "")
 	c.InstanceAdminPassword = env("PIGEON_INSTANCE_ADMIN_PASSWORD", "")
 
@@ -139,6 +148,18 @@ func (c Config) Validate() error {
 	if c.DatabaseURL == "" {
 		problems = append(problems, "PIGEON_DATABASE_URL is required")
 	}
+	// The migrator owns the tables and PostgreSQL exempts a table owner from
+	// row-level security, so "migrate and serve as the same role" is a deployment
+	// with no tenant isolation at all. Refusing it is the same class of check as
+	// the connection budget: cheap at boot, unfindable in production.
+	if c.MigrateDatabaseURL != "" && c.DatabaseURL != "" {
+		runtimeRole, migratorRole := roleOf(c.DatabaseURL), roleOf(c.MigrateDatabaseURL)
+		if runtimeRole != "" && runtimeRole == migratorRole {
+			problems = append(problems, fmt.Sprintf(
+				"PIGEON_MIGRATE_DATABASE_URL uses the same role as PIGEON_DATABASE_URL (%q): the migrator owns the tenant tables, "+
+					"and a table owner bypasses row-level security, so the migrator role and the runtime role must differ", runtimeRole))
+		}
+	}
 	if c.InstanceAdminPassword == "" {
 		problems = append(problems, "PIGEON_INSTANCE_ADMIN_PASSWORD is required: first run has no other credential (FR-101)")
 	} else if isWeakPassword(c.InstanceAdminPassword) {
@@ -188,6 +209,16 @@ func (c Config) ValidateBudget(serverMaxConnections int32) error {
 			ErrUnsafeConfig, c.CoreReplicas, c.DBMaxConns, c.DBReservedConns, budget, serverMaxConnections)
 	}
 	return nil
+}
+
+// roleOf returns the username part of a Postgres URL, or "" when the URL does not
+// name one (a malformed URL is Connect's problem to report, not Validate's).
+func roleOf(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil || u.User == nil {
+		return ""
+	}
+	return u.User.Username()
 }
 
 func isWeakPassword(p string) bool {

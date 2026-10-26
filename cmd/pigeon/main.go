@@ -79,7 +79,19 @@ func run() error {
 	st := store.New(pool)
 
 	if cfg.MigrationsOn {
-		if err := db.Migrate(ctx, pool, cfg.MigrateWaitDL); err != nil {
+		// Migrations run as the role that owns the schema, because CREATE TABLE
+		// needs it. The API then serves as the unprivileged runtime role:
+		// PostgreSQL exempts a table owner from row-level security, so serving on
+		// the migrator's connection would make every tenant policy inert.
+		migratePool := pool
+		if cfg.MigrateDatabaseURL != "" && cfg.MigrateDatabaseURL != cfg.DatabaseURL {
+			migratePool, err = db.Connect(ctx, cfg.MigrateDatabaseURL, 5)
+			if err != nil {
+				return fmt.Errorf("connect migrator: %w", err)
+			}
+			defer migratePool.Close()
+		}
+		if err := db.Migrate(ctx, migratePool, cfg.MigrateWaitDL); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
 		log.Info("migrations up to date")
