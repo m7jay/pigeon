@@ -194,8 +194,8 @@ func queryFanOutMatches(ctx context.Context, tx pgx.Tx, sc Scope, eventType, con
 // insertDeliveries batch-inserts one pending delivery per endpoint (FR-706: a
 // single round trip, never one per row), setting the lease at creation
 // (FR-813). ON CONFLICT (event_id, endpoint_id) DO NOTHING makes a re-fan-out a
-// no-op (FR-704). Returns how many rows the platform attempted to add, which the
-// caller reports as the delivery count.
+// no-op (FR-704). Returns how many rows were actually inserted (0 on a replay,
+// when every row already exists), which the caller reports as the delivery count.
 func insertDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, consumerID string, endpoints []string) (int, error) {
 	if len(endpoints) == 0 {
 		return 0, nil
