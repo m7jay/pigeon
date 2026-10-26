@@ -418,3 +418,89 @@ func TestFanOutSkipsPausedEndpointWithReason(t *testing.T) {
 		t.Fatalf("paused fan-out = %+v, want 0 deliveries and one endpoint_paused skip", res)
 	}
 }
+
+// FR-703/FR-704/FR-706 + FR-508/FR-509: one event can skip two of a consumer's
+// subscribed endpoints for DIFFERENT reasons — one paused, one active-but-
+// unverified in live. Each skipped delivery row must carry ITS OWN endpoint's
+// reason, not an arbitrary one drawn from the batch. This is the regression
+// guard for the skip-path batch insert: the endpoint id and its reason must be
+// paired by position (a single unnest($5,$6) zip), not by cartesian product. A
+// CROSS JOIN of two separate unnest() calls pairs each endpoint with every
+// reason, and ON CONFLICT (event_id, endpoint_id) DO NOTHING then keeps an
+// arbitrary reason per endpoint — corrupting both the stored row and the metric
+// label the relay derives from it. The Go-side result.Skipped was always correct;
+// only the written rows were wrong, so this test asserts the durable rows.
+func TestFanOutSkipsTwoEndpointsEachWithItsOwnReason(t *testing.T) {
+	admin := testPool(t)
+	resetRoutingTables(t, admin)
+	st := New(appPool(t, admin))
+	ctx := context.Background()
+	pid := seedRoutingProducer(t, admin, "skip2")
+	sc := Scope{ProducerID: pid, Env: "live"}
+
+	et := mustConsumerEvent(t, st, sc, "signup.completed")
+	con := mustConsumer(t, st, sc, "school_1", "School 1")
+
+	// epPaused: verified (so it is otherwise deliverable) then paused -> paused.
+	epPaused := mustVerifiedEndpoint(t, st, sc, con.ID, "paused", "https://8.8.8.8/hook")
+	mustSubscribe(t, st, sc, epPaused.ID, et.Name)
+	if _, err := st.SetEndpointPaused(ctx, sc, epPaused.ID, true); err != nil {
+		t.Fatalf("SetEndpointPaused: %v", err)
+	}
+
+	// epUnverified: created but never verified, still active -> unverified in live.
+	created, err := st.CreateEndpoint(ctx, sc, NewEndpoint{ConsumerID: con.ID, Name: "unverified", URL: "https://9.9.9.9/hook"})
+	if err != nil {
+		t.Fatalf("CreateEndpoint(unverified): %v", err)
+	}
+	epUnverified := created.Endpoint
+	mustSubscribe(t, st, sc, epUnverified.ID, et.Name)
+
+	pub, err := st.PublishEvent(ctx, sc, PublishInput{
+		EventType: et.Name, Payload: json.RawMessage(`{}`), ConsumerRef: ptr(con.Ref),
+	})
+	if err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+
+	res, err := st.FanOutEvent(ctx, sc, pub.ID)
+	if err != nil {
+		t.Fatalf("FanOutEvent: %v", err)
+	}
+	if res.Deliveries != 0 {
+		t.Fatalf("deliveries = %d, want 0 (both endpoints skipped)", res.Deliveries)
+	}
+	// The in-memory result already lists each endpoint with its own reason.
+	got := map[string]string{}
+	for _, s := range res.Skipped {
+		got[s.EndpointID] = s.Reason
+	}
+	if len(got) != 2 || got[epPaused.ID] != ReasonEndpointPaused || got[epUnverified.ID] != ReasonEndpointUnverified {
+		t.Fatalf("res.Skipped = %v, want paused->%q and unverified->%q", res.Skipped, ReasonEndpointPaused, ReasonEndpointUnverified)
+	}
+
+	// The durable proof: each skipped row carries its own endpoint's reason.
+	// A cross-join skip insert gives both rows the same (arbitrary) reason; this
+	// fails exactly there.
+	want := map[string]string{epPaused.ID: ReasonEndpointPaused, epUnverified.ID: ReasonEndpointUnverified}
+	for epID, wantReason := range want {
+		var reason, status string
+		if err := admin.QueryRow(ctx,
+			`select non_delivery_reason, status from deliveries where event_id=$1 and endpoint_id=$2`,
+			pub.ID, epID).Scan(&reason, &status); err != nil {
+			t.Fatalf("read skipped delivery for %s: %v", epID, err)
+		}
+		if reason != wantReason {
+			t.Fatalf("skipped delivery for %s has reason %q, want %q (each skipped endpoint must keep its own reason)", epID, reason, wantReason)
+		}
+	}
+	// Exactly two skipped rows, one per endpoint — no cartesian duplication.
+	var n int
+	if err := admin.QueryRow(ctx,
+		`select count(*) from deliveries where event_id=$1 and status='skipped'`, pub.ID).Scan(&n); err != nil {
+		t.Fatalf("count skipped: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("skipped rows = %d, want 2 (one per endpoint)", n)
+	}
+}
