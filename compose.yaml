@@ -18,10 +18,12 @@ services:
       # would have no tenant isolation at all. The runtime role (pigeon_app) is
       # created unprivileged by deploy/postgres/01-roles.sql before the core starts.
       POSTGRES_USER: pigeon_migrator
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pigeon}
+      # No default: a deployment supplies its own database credentials, and compose
+      # refuses to start without them.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       POSTGRES_DB: pigeon
       # Password for the runtime role. Rotate it like any other credential.
-      PIGEON_APP_PASSWORD: ${PIGEON_APP_PASSWORD:-pigeon_app}
+      PIGEON_APP_PASSWORD: ${PIGEON_APP_PASSWORD:?PIGEON_APP_PASSWORD must be set}
     command:
       # OPS-8: the pool budget is documented arithmetic, so the server must
       # accept it. 100 leaves room for 4 replicas × 10 + reserved.
@@ -66,8 +68,8 @@ services:
       #   PIGEON_DATABASE_URL         — serves requests; unprivileged, so RLS applies
       #   PIGEON_MIGRATE_DATABASE_URL — owns the schema; used only by the migration
       #                                 path at boot
-      PIGEON_DATABASE_URL: postgres://pigeon_app:${PIGEON_APP_PASSWORD:-pigeon_app}@postgres:5432/pigeon?sslmode=disable
-      PIGEON_MIGRATE_DATABASE_URL: postgres://pigeon_migrator:${POSTGRES_PASSWORD:-pigeon}@postgres:5432/pigeon?sslmode=disable
+      PIGEON_DATABASE_URL: postgres://pigeon_app:${PIGEON_APP_PASSWORD:?PIGEON_APP_PASSWORD must be set}@postgres:5432/pigeon?sslmode=disable
+      PIGEON_MIGRATE_DATABASE_URL: postgres://pigeon_migrator:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/pigeon?sslmode=disable
       PIGEON_REDIS_URL: redis://redis:6379/0
     ports:
       - "8080:8080"
