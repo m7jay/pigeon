@@ -262,11 +262,17 @@ ten it fires only after every one has already tripped and sent its own notificat
 which is the opposite of the mail storm it was supposed to prevent. The endpoint level
 therefore accuses **breadth** instead: it trips when enough *distinct* subscriptions
 are failing, each having accumulated 3 failed attempts inside the same sliding hour.
-The 100-attempt depth trigger is deleted rather than kept beside it: breadth with a
-3-attempt floor fires earlier than 100 attempts in every case the depth trigger could
-have covered (13 distinct subscriptions at 3 attempts is 39 attempts, not 100), so a
-second trigger that can never fire first is a second thing to implement and test for
-no outcome.
+The 100-attempt depth trigger is deleted rather than kept beside it, and the reason is
+not that breadth always fires first. Breadth trips at `3 × ceil(active/4)` attempts -
+99 at 132 live subscriptions, 102 at 133, 150 at 200 - so above 132 subscriptions a
+depth trigger would fire earlier. The reason is what each one measures at that size.
+At 133 subscriptions, 100 failures is at most 0.75 attempts per subscription: depth
+would pause the endpoint on 10 failing subscriptions, a breadth of 7.5%, which is
+exactly the small-endpoint over-reach the 3-attempt floor exists to prevent, while
+breadth pauses at 34 of 133 (26%). Below 133 subscriptions breadth also fires first,
+so depth only ever wins where it is the wrong rule; keeping it beside breadth would
+mean implementing, testing and documenting a trigger whose sole distinct outcome is a
+worse one.
 
 **Mechanism.**
 
@@ -328,12 +334,16 @@ Breadth is a heuristic, and its cost is over-reach: on a two-subscription endpoi
 subscriptions failing three times pauses the whole endpoint, including a subscription
 whose receiver was healthy but whose event type the producer broke. That is the price
 of the endpoint level existing at all on a small endpoint, and it is bounded - above
-eight live subscriptions `N` is a quarter of them, below that it is 3 - and resume is
-one action.
+twelve live subscriptions `N` is a quarter of them, up to twelve it is 3 or every
+subscription if there are fewer than three - and resume is one action.
 
 The alternative, a depth threshold, was not a stricter version of the same rule; it was
-a rule that could not fire, which the previous draft of this amendment demonstrated by
-proving its own trigger unreachable and then keeping it.
+a rule that fires either too late to matter or on the wrong evidence. Up to 132
+subscriptions breadth fires first (99 attempts at 132), so depth could only fire after
+the pause it was supposed to cause; above 132 it can fire first, but then it pauses on
+roughly 10 of 133 subscriptions failing ten times each, which is volume rather than
+breadth. The previous draft of this amendment proved the trigger unreachable at the
+sizes that mattered and kept it anyway.
 
 The email count is what the mechanism yields, not what a marketing sentence would
 prefer: in the ordinary total-outage case the endpoint trips after `N` subscriptions
