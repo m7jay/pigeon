@@ -290,7 +290,7 @@ erDiagram
 |---|---|---|---|
 | Accepted event (`202` returned) | Postgres `events` + `outbox`, one transaction | none | — |
 | Publish intent | Postgres `outbox` | none | — |
-| Delivery record at fan-out | Postgres, batched insert | ≤ 200 ms; rebuildable by re-fan-out | none — unique `(event_id, endpoint_id)` makes re-fan-out idempotent |
+| Delivery record at fan-out | Postgres, batched insert | ≤ 200 ms; rebuildable by re-fan-out | none — the partial `(event_id, endpoint_id)` unique index over first fan-out makes re-fan-out idempotent (I-3) |
 | Attempt record + response body | Redis list → Postgres batches | **0 on worker crash**; ≤ 1 s if Redis itself dies uncleanly | evidence gap only; the delivery is still driven by its lease |
 | Terminal delivery state | same batch | ≤ 200 ms | delivery re-attempted → duplicate, deduped by the consumer on `event_id` |
 | Dedupe key `(endpoint, event_id)`, first 14 d | the `deliveries` row itself | none while the partition exists; under SB-3 disk pressure a partition dropped before its copy ran loses every key it held, logged at warn (FR-903) | a support answer is missing; never a delivery |
