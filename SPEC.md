@@ -248,62 +248,52 @@ Decisions taken in place of gaps, each with the mechanism that makes it
 implementable and the trade-off it accepts, because a decision without its mechanism
 gets relitigated the moment somebody implements the other one.
 
-### A-4 — Dedupe keys are a Postgres archive, not a Redis TTL and not a hot-path row
+### A-5 — Consumer sessions are opaque Postgres-backed tokens in an `HttpOnly` cookie
 
-**Decision.** FR-903's 30-day dedupe answer is served from Postgres twice over: from
-the `deliveries` row while its partition exists (0 to 14 days), and from an archive
-table `delivery_dedupe` copied out of each partition as the sweeper drops it (14 to
-30 days). Nothing about dedupe lives in Redis.
+**Decision.** A consumer user's session is an opaque 256-bit random token, stored
+hashed in a `sessions` row that carries the `consumer_id` binding, delivered to the
+browser as `__Host-pigeon_session` and presented to the API as a bearer. No JWT, no
+client-held claim, no signed cookie.
 
 **Mechanism.**
 
-- `delivery_dedupe(endpoint_id, event_id, first_delivery_id, first_seen_at)`,
-  primary key `(endpoint_id, event_id)` and no surrogate id, so the support question
-  "was this a duplicate for this endpoint?" is an index-only scan on an exact key.
-- The archive is filled by the sweeper (single leaseholder, D-7), which copies the
-  partition's `(endpoint_id, event_id, id, created_at)` into it **before** dropping
-  that partition, `ON CONFLICT DO NOTHING`, in the same loop iteration as the drop.
-  A failed copy aborts that drop. The one exception is SB-3's disk-pressure drop,
-  which is logged at warn and leaves that partition's tail unarchived - a support
-  answer lost, never a delivery.
-- `delivery_dedupe` is itself range-partitioned by day and dropped by partition at
-  `dedupe_retention` (default 30 d), so SB-2 holds here too and there is no `DELETE`
-  and no vacuum pressure. Under disk pressure these partitions are dropped *before*
-  delivery partitions, because they are derived.
-- One view, `delivery_dedupe_all`, unions live `deliveries` with the archive, so the
-  support path - and the API that answers it - reads one name and does not care which
-  side answered.
-- Fan-out idempotency does **not** depend on the archive. It is the `deliveries`
-  unique index, whose coverage is exactly as long as an outbox row can exist, which
-  is the only window in which a re-fan-out is possible.
+- Login mints the token and stores `sha256(token)` with `user_id`, `producer_id`,
+  `env`, `consumer_id`, `csrf_secret`, `expires_at` (absolute TTL, default 12 h) and
+  `last_seen_at` (idle TTL default 30 min, written at most once a minute through the
+  `EvidenceTx` class so it costs no fsync). The cookie is `HttpOnly; Secure;
+  SameSite=Lax; Path=/` per FR-1009 and carries no data beyond the token.
+- The portal is a server-side API client: its handlers call the core over the network
+  with `Authorization: Bearer <that token>`, `X-Request-Id`, and a double-submit CSRF
+  token on mutations. The browser never holds a credential it can replay at another
+  host, and the API performs the filtering, so a compromised or buggy portal cannot
+  widen a result set it was handed.
+- The same token is a plain bearer, so AC-39's "a consumer user calls the API
+  directly" is testable with the value from the cookie and without inventing a second
+  credential type. A copyable long-lived consumer API token is not in v1.0; if it is
+  ever wanted it is another row in the same table with the same binding columns and
+  no schema change.
+- Revocation is `UPDATE sessions SET revoked_at = now()`: immediate, one row,
+  independent of the consumer record (FR-109). Each instance caches a binding for at
+  most 5 s, so revocation takes effect inside 5 s, comfortably inside FR-205's 60 s.
+- Producer-portal sessions reuse the table with `consumer_id` null and a producer
+  role. §8.4's "signed cookie session" is corrected in the same breath: signed means
+  stateless, and stateless means a revocation list, which is this table.
 
-**Trade-off.** Two mechanisms and a union view instead of one insert, and the archive
-lags a partition by at most one sweeper cycle. In exchange the hot path pays nothing:
-an inline row per delivery would add 10,000 control writes per second to the
-reference load, doubling the write amplification §8.1 spends its whole argument
-minimising - and that is what a Redis `SETNX` would have done to Redis, plus it would
-have been lost on the wipe AC-10 exercises, breaking P3 for the one question FR-903
-exists to answer.
+**Trade-off.** One indexed read per authenticated request where a JWT needs none,
+mitigated by the 5 s cache; a session table on the auth path where a JWT needs
+nothing. In exchange: revocation is a row update rather than a deny-list with its own
+expiry, there is no signing key to rotate or leak, no claim that disagrees with the
+database after a role change, no clock-skew window, and no way for a stale token to
+keep a revoked consumer user alive for the life of its `exp`. A JWT earns its place
+when a stateless edge validates tokens at a scale where the lookup hurts; v1.0 has one
+core binary, and its authorization question is a row lookup either way.
 
-The honest cost is disk: the archive only ever holds the 16 days between the two
-retentions, about 64 B per pair, roughly 48 M rows and 3 GB at the reference box's
-sustained 35 deliveries/s. That is real on a 40 GB disk, which is why its retention
-is a knob, why its partitions go first under pressure, and why FR-905 states the
-per-row cost so an operator can size it instead of guessing.
+**Also corrected here:** SPEC previously cited "a scoped token per FR-514", and no
+FR-514 existed - the scoped-token sentence was §14's prose only. The requirement is
+now FR-112 and FR-113; FR-514 is assigned to A-3's id-resolution rule, and this
+amendment no longer refers to it.
 
-**Adjacent, found here and decided with it: I-3's uniqueness is partial.** I-3 says
-`(event_id, endpoint_id)` is unique "so fan-out and replay are idempotent", but
-FR-1106 requires a replay to *create* a second delivery for that same pair. Both
-cannot be a table constraint. The delivery index is therefore
-`UNIQUE (event_id, endpoint_id) WHERE replay_of_delivery_id IS NULL` - first fan-out
-only - and replay idempotency comes from its own request key (FR-1107). The archive
-records the pair's first delivery and a replay does not touch it. Cost: one invariant
-in two places, which is one more thing a reviewer holds in their head; the
-alternatives were an index that makes FR-1106 unimplementable or dropping the index
-and letting a retried fan-out batch create duplicates.
-
-**Encoded by.** FR-903 (rewritten), FR-905, §6's two dedupe rows, I-3 (amended),
-AC-46.
+**Encoded by.** FR-110 (rewritten), FR-112, FR-113, AC-47.
 
 ## Gap list — where `REQUIREMENTS.md` is silent or inconsistent
 
