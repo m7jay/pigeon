@@ -651,8 +651,12 @@ check is OPS-8's formula, not a second one.
 
 One thing this list no longer leaves open: whether the endpoint pause threshold scales
 with subscription count. It does - `N = min(active, max(3, ceil(active/4)))` in FR-1203
-- because the review of this amendment showed that a fixed threshold either cannot fire
-(below the subscription count) or suppresses nothing (above it). One thing it still does
+- because the review of this amendment showed a fixed threshold fails in both
+directions: below ten subscriptions it cannot fire at all, since a paused subscription
+stops producing failures and caps an endpoint at ten failed attempts per subscription;
+and above ten it fires only after ten subscriptions have each exhausted their own 10
+failures, so the ten mails it was meant to replace have already gone out and all it
+still suppresses is the subscriptions that fail afterwards. One thing it still does
 not decide, stated so it is not mistaken for decided: whether consumer users get a
 long-lived API token (A-5 defers it; the schema does not need to change if they do).
 
