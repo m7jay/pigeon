@@ -203,3 +203,77 @@ func TestCrossProducerReadsAreEmpty(t *testing.T) {
 		t.Fatalf("producer %s can see %d of producer %s's rows; RLS is not enforcing isolation", aID, got, bID)
 	}
 }
+
+// TestProducersAreAdminOnly proves both halves of the producers policy from
+// 0003: the tenant role sees nothing by default (fail closed), and the explicit
+// instance-admin path sees the rows it is meant to manage. Without the second
+// assertion, `using (false)` would pass this test while making the admin API
+// impossible to build.
+func TestProducersAreAdminOnly(t *testing.T) {
+	admin := testPool(t)
+	app := appPool(t, admin)
+	ctx := context.Background()
+
+	aID, _ := seedProducer(t, admin, "epsilon")
+	bID, _ := seedProducer(t, admin, "zeta")
+
+	countProducers := func(setScope func(pgx.Tx) error) (int, error) {
+		var n int
+		err := db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+			if err := setScope(tx); err != nil {
+				return err
+			}
+			return tx.QueryRow(ctx,
+				`select count(*) from producers where id in ($1, $2)`, aID, bID).Scan(&n)
+		})
+		return n, err
+	}
+
+	// Tenant scope only: producers stay invisible, because no producer id can
+	// isolate a producer list from itself (0001).
+	if n, err := countProducers(func(tx pgx.Tx) error {
+		return db.SetProducerScope(ctx, tx, aID)
+	}); err != nil {
+		t.Fatalf("tenant-scoped read: %v", err)
+	} else if n != 0 {
+		t.Fatalf("tenant role saw %d producers under tenant scope; producers must fail closed", n)
+	}
+
+	// Unset marker: still invisible. This is the "forgot to opt in" case.
+	if n, err := countProducers(func(pgx.Tx) error { return nil }); err != nil {
+		t.Fatalf("unmarked read: %v", err)
+	} else if n != 0 {
+		t.Fatalf("tenant role saw %d producers without the admin marker; the default must be no rows", n)
+	}
+
+	// Admin path: both rows are visible.
+	if n, err := countProducers(func(tx pgx.Tx) error {
+		return db.SetInstanceAdmin(ctx, tx)
+	}); err != nil {
+		t.Fatalf("admin-scoped read: %v", err)
+	} else if n != 2 {
+		t.Fatalf("instance-admin path saw %d of 2 producers; the admin policy is not working", n)
+	}
+
+	// Writes fail closed too: the tenant role cannot create a producer without
+	// the marker. A write path that only guards reads would be a hole.
+	_, err := admin.Exec(ctx, `delete from producers where id = 'prd_eta'`)
+	if err != nil {
+		t.Fatalf("cleanup prd_eta: %v", err)
+	}
+	if err := db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `insert into producers (id, slug, name) values ('prd_eta','eta','Producer eta')`)
+		return err
+	}); err == nil {
+		t.Fatalf("tenant role inserted a producer without the admin marker; RLS write path is open")
+	}
+	if err := db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+		if err := db.SetInstanceAdmin(ctx, tx); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `insert into producers (id, slug, name) values ('prd_eta','eta','Producer eta') on conflict (id) do nothing`)
+		return err
+	}); err != nil {
+		t.Fatalf("instance-admin insert failed: %v", err)
+	}
+}

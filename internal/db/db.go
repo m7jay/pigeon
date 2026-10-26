@@ -77,3 +77,16 @@ func SetProducerScope(ctx context.Context, tx pgx.Tx, producerID string) error {
 	_, err := tx.Exec(ctx, "select set_config('pigeon.producer_id', $1, true)", producerID)
 	return err
 }
+
+// SetInstanceAdmin marks the transaction as the instance-admin path. It is what
+// the producers_admin policy in 0003 reads: without it, producers stay invisible
+// even to the application role (fail closed).
+//
+// It is transaction-local, like SetProducerScope, so the marker cannot leak to
+// the next borrower of a pooled connection. Callers must be admin routes; this
+// function cannot tell, so the gate is only as good as its call sites (see the
+// scope note in 0003_producers_admin.sql).
+func SetInstanceAdmin(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, "select set_config('pigeon.instance_admin', 'on', true)")
+	return err
+}
