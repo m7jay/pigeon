@@ -248,14 +248,25 @@ Decisions taken in place of gaps, each with the mechanism that makes it
 implementable and the trade-off it accepts, because a decision without its mechanism
 gets relitigated the moment somebody implements the other one.
 
-### A-1 — Pause thresholds: two sliding windows over failed *attempts*
+### A-1 — Pause thresholds: depth per subscription, breadth per endpoint
 
-**Decision.** FR-1202 and FR-1203 are both right; AC-14 is the wrong document. Two
-independent thresholds stay - 10 failed attempts for one `(endpoint, event_type)` in
-a sliding hour pauses that subscription, 100 failed attempts for one endpoint in a
-sliding hour pauses the endpoint - and there is no third level at 50. 50 sits
-between the two thresholds and so triggers neither, which is the only reading that
-explains AC-14 as written: it is the stale number from a single-level draft.
+**Decision.** Two levels stay, and AC-14's 50 is the stale number: 50 is a threshold
+nowhere - it sits between the subscription depth (10) and the endpoint depth the earlier
+draft of this amendment had (100) - which is the only reading that explains AC-14 as
+written: it is the residue of a single-level draft.
+
+A depth trigger of 100 failed attempts cannot reach an endpoint at all. A subscription
+stops producing failures the moment it pauses (§7.12), so an endpoint accumulates at
+most 10 failures per subscription: 100 is unreachable below ten subscriptions, and at
+ten it fires only after every one has already tripped and sent its own notification,
+which is the opposite of the mail storm it was supposed to prevent. The endpoint level
+therefore accuses **breadth** instead: it trips when enough *distinct* subscriptions
+are failing, each having accumulated 3 failed attempts inside the same sliding hour.
+The 100-attempt depth trigger is deleted rather than kept beside it: breadth with a
+3-attempt floor fires earlier than 100 attempts in every case the depth trigger could
+have covered (13 distinct subscriptions at 3 attempts is 39 attempts, not 100), so a
+second trigger that can never fire first is a second thing to implement and test for
+no outcome.
 
 **Mechanism.**
 
@@ -266,47 +277,75 @@ explains AC-14 as written: it is the stale number from a single-level draft.
   produces 7 failing attempts in its first hour, so a subscription with steady
   traffic pauses within minutes while a quiet one pauses only once it has genuinely
   accumulated 10.
-- Each failure updates two Redis sorted sets, `pause:sub:{endpoint_id}:{event_type}`
-  and `pause:ep:{endpoint_id}`, scored by attempt time: `ZADD`, `ZREMRANGEBYSCORE`
-  to trim the window, `ZCARD` to read it, in one pipeline. Each set is trimmed to
-  `threshold+1` members, so an outage that runs for a week still costs 11 entries.
-- The **endpoint threshold is evaluated first**. When it trips, the endpoint pause is
-  written and per-subscription notifications for that endpoint are suppressed for
-  the duration of the pause; otherwise a fully dead endpoint with 10 subscriptions
-  emails once per subscription and then once more, which is the mail storm OBS-10
-  exists to prevent.
+- Two Redis sorted sets per failure, in one pipeline: `pause:sub:{endpoint_id}:{event_type}`,
+  one member per failed attempt scored by attempt time (`ZADD`, `ZREMRANGEBYSCORE` to
+  trim the hour, `ZCARD` to read the subscription depth), and
+  `pause:subs:{endpoint_id}`, one member per *subscription* scored by its latest
+  failure, trimmed to the hour, so `ZCARD` is the breadth count and a subscription
+  that fails fifty times still costs one member.
+- A subscription joins `pause:subs:{endpoint_id}` when its own window first reaches
+  3 failed attempts, and leaves it when the hour trims it out or it is resumed. The
+  3-attempt floor is what keeps a single bad event - one terminal `4xx`, one timeout -
+  from counting a subscription as failing.
+- **Breadth threshold.** The endpoint pauses when `pause:subs:{endpoint_id}` reaches
+  `N = min(active, max(3, ceil(active/4)))`, where `active` is the number of unpaused
+  subscriptions on the endpoint (and `active ≥ 2`). Ten subscriptions give 3, two give
+  2, fifty give 13: a quarter of the endpoint's live subscription surface, floored at
+  3 so that a small endpoint has a reachable trigger at all and one broken event type
+  cannot pause everything it touches. `active` is read from Postgres when the breadth
+  set grows - at most once per newly failing subscription per hour, never per attempt.
+- The **endpoint threshold is evaluated first**, and it is the only threshold whose
+  notification is aggregated. When the endpoint trips, the endpoint pause is written,
+  the endpoint sends exactly one FR-1204 notification naming the endpoint, the number
+  of failing subscriptions and the first and last failing response, and **no further**
+  per-subscription pause notification is emitted for that endpoint for the duration of
+  the pause. A notification already sent before the endpoint tripped is not repeated
+  and not recalled: suppressing mail that has been delivered is not something a pause
+  can do, and this amendment does not claim it.
 - The pause itself is a column, not a Redis key: `endpoints.pause_reason`/`paused_at`
   and `subscriptions.pause_reason`/`paused_at`, written in a `ControlTx`
   (`synchronous_commit=on`). Fan-out requires the endpoint *and* the subscription to
-  be unpaused. There are no cascade rows, so resuming an endpoint is one flag clear
-  and leaves individually paused subscriptions paused - they tripped for their own
-  reason, and the email said which.
-- Resume clears the flag and deletes that key's window. Without the delete the 10
-  failures are still inside the hour and the next one re-pauses immediately, which
-  would make AC-14's "resume works" false.
+  be unpaused. The endpoint pause does **not** write per-subscription pause rows -
+  they tripped for their own reason or they did not - so resuming an endpoint is one
+  flag clear that restores every subscription which had not tripped its own threshold,
+  and leaves those that did paused, with the email that said which.
+- Resume clears the flag and deletes that key's windows: the subscription's own set
+  and its membership in `pause:subs:{endpoint_id}`. Without the delete the failures
+  are still inside the hour and the next one re-pauses immediately, which would make
+  AC-14's "resume works" false.
 - Redis loss is safe in exactly one direction: the counters vanish, so a pause can be
   delayed by up to an hour but can never be invented, and the pause flags survive, so
   AC-10's `FLUSHALL` cannot silently unpause a dead endpoint and resume the hammering
   the pause stopped.
 
-**Trade-off.** A sorted set costs two Redis operations per failure and none per
-success, so the cost tracks the failure rate rather than throughput. A tumbling
-`INCR`+`EXPIRE` window would cost one operation and would also let a window boundary
-deliver twice the threshold inside a few seconds, which is precisely what the
-threshold exists to prevent.
+**Trade-off.** Three sorted-set operations per failure (two windows plus a breadth
+membership upsert) and none per success, so the cost tracks the failure rate rather
+than throughput. A tumbling `INCR`+`EXPIRE` window would cost one operation and would
+also let a window boundary deliver twice the threshold inside a few seconds, which is
+precisely what the threshold exists to prevent.
 
-The endpoint threshold has an arithmetic worth stating before someone waits for its
-email: a subscription stops producing failures the moment it pauses, so an endpoint
-can accumulate at most 10 failures per subscription, and 100 is reachable only on an
-endpoint carrying 10 or more subscriptions where *every* one of them is failing.
-Below 10 subscriptions the endpoint level is unreachable and the subscription level
-is the only latch. That is the level's purpose - the subscription threshold catches
-the ordinary single-broken-type case, the endpoint threshold catches total eclipse -
-but it means FR-1203 is deliberately not a second chance for a producer with three
-subscribers.
+Breadth is a heuristic, and its cost is over-reach: on a two-subscription endpoint both
+subscriptions failing three times pauses the whole endpoint, including a subscription
+whose receiver was healthy but whose event type the producer broke. That is the price
+of the endpoint level existing at all on a small endpoint, and it is bounded - above
+eight live subscriptions `N` is a quarter of them, below that it is 3 - and resume is
+one action.
 
-**Encoded by.** FR-1202, FR-1203 (unchanged), FR-1209, FR-1210, FR-1211, D-8,
-AC-14 (rewritten), AC-44.
+The alternative, a depth threshold, was not a stricter version of the same rule; it was
+a rule that could not fire, which the previous draft of this amendment demonstrated by
+proving its own trigger unreachable and then keeping it.
+
+The email count is what the mechanism yields, not what a marketing sentence would
+prefer: in the ordinary total-outage case the endpoint trips after `N` subscriptions
+have failed 3 times each - 9 attempts on a ten-subscription endpoint - so nobody had
+tripped individually and exactly one email is sent. When traffic is skewed - one
+subscription fails hard to 10 and pauses, then `N` others start failing - two emails
+are sent, and that is right: the first one named a specific event type and was true
+when it was sent. The bound is `N-1` subscription emails plus one endpoint email, and
+only in the case where every one of them is genuinely dying.
+
+**Encoded by.** FR-1202 (unchanged), FR-1203 (rewritten), FR-1209, FR-1210, FR-1211,
+D-8, AC-14 (rewritten), AC-44.
 
 ### A-2 — NFR-4 was two claims wearing one number
 
@@ -540,7 +579,7 @@ amendment and is not one of them; it stays open.
 
 | # | Gap | Decision | Contract changed | Unblocks |
 |---|---|---|---|---|
-| 1 | AC-14 contradicted FR-1202/FR-1203 | A-1 | AC-14 rewritten; FR-1209…FR-1211, D-8 added | S5 |
+| 1 | AC-14 contradicted FR-1202/FR-1203 | A-1 | AC-14 rewritten; FR-1203 rewritten as a breadth trigger; FR-1209…FR-1211, D-8 added | S5 |
 | 2 | NFR-4 untestable on the reference machine | A-2 | NFR-1, NFR-4 restated; load protocol in §12; AC-45 added | S10 |
 | 3 | Envelope had no `consumer_id` | A-3 | FR-513, FR-514 added; §10 field table | S3 |
 | 4 | FR-903's 30-day TTL had no store | A-4 | FR-903 rewritten, FR-905 added; two §6 rows; AC-46 | S7 |
@@ -557,15 +596,15 @@ most of the time, written at most once a minute; A-6 reads the same environment 
 that A-5's session TTL and A-1's thresholds come from, and its `db.connection_budget`
 check is OPS-8's formula, not a second one.
 
-Two things this list does **not** decide, stated so they are not mistaken for decided:
-whether the endpoint pause threshold should scale with subscription count (A-1 argues
-against it, but it is a product question, and 100 with fewer than 10 subscriptions is
-deliberately unreachable), and whether consumer users get a long-lived API token (A-5
-defers it; the schema does not need to change if they do).
+One thing this list no longer leaves open: whether the endpoint pause threshold scales
+with subscription count. It does - `N = min(active, max(3, ceil(active/4)))` in FR-1203
+- because the review of this amendment showed that a fixed threshold either cannot fire
+(below the subscription count) or suppresses nothing (above it). One thing it still does
+not decide, stated so it is not mistaken for decided: whether consumer users get a
+long-lived API token (A-5 defers it; the schema does not need to change if they do).
 
-**Item 7 predates nothing and decides nothing here: it was found after this
-amendment and is not one of the six, so it stays open.** It keeps its number so
-`PLAN.md`'s citation of it still resolves.
+**Item 7 was found after this amendment and is not one of the six, so it stays
+open.** It keeps its number so `PLAN.md`'s citation of it still resolves.
 
 7. **A user with no claims cannot log in, so cannot redeem an invitation.**
    `CreateSession` refuses a user who has no producer membership, no admin flag and
