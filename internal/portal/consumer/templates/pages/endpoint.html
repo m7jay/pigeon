@@ -59,7 +59,12 @@
   <h2>Subscriptions</h2>
   {{if .Data.AvailableTypes}}
   <p class="page-sub">Choose which event types deliver to this endpoint (UI-14). These are the types the producer has made publicly subscribable.</p>
-  <form method="post" action="/endpoints/{{.Data.ID}}/subscriptions" class="inline">
+  {{/* htmx swaps the refreshed panel in place; without htmx the plain post still
+       works, because the handler answers a non-htmx post with a 303 back to this
+       page. A fragment answered to a plain post would navigate the browser to a
+       document with no layout and no htmx, whose own controls are then inert. */}}
+  <form method="post" action="/endpoints/{{.Data.ID}}/subscriptions" class="inline"
+        hx-post="/endpoints/{{.Data.ID}}/subscriptions" hx-target="#subs-list" hx-swap="outerHTML">
     <select name="event_type" required style="width:auto;max-width:24rem">
       {{range .Data.AvailableTypes}}<option value="{{.}}">{{.}}</option>{{end}}
     </select>

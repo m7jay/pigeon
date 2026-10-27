@@ -110,6 +110,20 @@ func (f *fakeCore) calls() []string {
 // handler under test while still proving the login gate is in front of it.
 func signedIn(t *testing.T, h *Handler, method, target string, form url.Values) *httptest.ResponseRecorder {
 	t.Helper()
+	return signedInWith(t, h, method, target, form, false)
+}
+
+// signedInHtmx is signedIn carrying htmx's request header. The portal answers a
+// fragment to htmx and a 303 to every other caller, so a handler's two halves have
+// to be driven separately - and a fragment handed to a plain post is the defect
+// these tests exist for.
+func signedInHtmx(t *testing.T, h *Handler, method, target string, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	return signedInWith(t, h, method, target, form, true)
+}
+
+func signedInWith(t *testing.T, h *Handler, method, target string, form url.Values, htmx bool) *httptest.ResponseRecorder {
+	t.Helper()
 	var body io.Reader
 	if form != nil {
 		body = strings.NewReader(form.Encode())
@@ -117,6 +131,9 @@ func signedIn(t *testing.T, h *Handler, method, target string, form url.Values) 
 	req := httptest.NewRequest(method, target, body)
 	if form != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	if htmx {
+		req.Header.Set("HX-Request", "true")
 	}
 	enc, err := h.cookie.Encode("test-session-token")
 	if err != nil {
@@ -379,5 +396,114 @@ func TestEndpointRotateShowsTheNewSecretOnce(t *testing.T) {
 		if strings.Contains(c.Value, "whsec_ROTATED") {
 			t.Fatalf("the rotated secret was written into cookie %q", c.Name)
 		}
+	}
+}
+
+// TestFragmentSwapTargetsSitOnTheFragmentRoot is the round-2 finding that the swap
+// ids sat on an inner <tbody> while the fragment renders a whole <table>, so every
+// htmx swap put one table inside another: the browser ends up with two tables, a
+// `table table` selector match and the header row rendered twice. The id has to
+// belong to the element the fragment itself renders, and it has to be present on
+// the page before htmx swaps anything.
+func TestFragmentSwapTargetsSitOnTheFragmentRoot(t *testing.T) {
+	core := newFakeCore(t)
+	seedEndpointsPage(t, core, true)
+	core.on(http.MethodGet, "/v1/consumer/endpoints",
+		`{"endpoints":[{"id":"end1","name":"orders-hook","url":"https://1.1.1.1/hook","status":"active","verified":true,"created_at":"2026-01-01T00:00:00Z"}]}`,
+		http.StatusOK)
+	h := testHandlerAt(t, core.srv.URL)
+
+	list := signedInHtmx(t, h, http.MethodGet, "/frag/endpoints", nil).Body.String()
+	if !strings.HasPrefix(strings.TrimSpace(list), `<div id="endpoints-list">`) {
+		t.Fatalf("the endpoints fragment does not carry the swap target on its root:\n%s", list)
+	}
+	if strings.Contains(list, "tbody id=") {
+		t.Fatalf("the endpoints fragment still puts a swap id on a tbody, which nests a table on every swap:\n%s", list)
+	}
+
+	endpointsPage := signedIn(t, h, http.MethodGet, "/endpoints", nil).Body.String()
+	if !strings.Contains(endpointsPage, `<div id="endpoints-list">`) {
+		t.Fatalf("the endpoints page has no #endpoints-list for the first swap:\n%s", endpointsPage)
+	}
+	endpointPage := signedIn(t, h, http.MethodGet, "/endpoints/end1", nil).Body.String()
+	if !strings.Contains(endpointPage, `<div id="subs-list">`) {
+		t.Fatalf("the endpoint page has no #subs-list for the first swap:\n%s", endpointPage)
+	}
+	if strings.Contains(endpointPage, "tbody id=") {
+		t.Fatalf("the endpoint page still puts a swap id on a tbody:\n%s", endpointPage)
+	}
+}
+
+// TestSubscribeUpdatesThePanelOrRedirects is the round-2 finding that the detail
+// page's subscribe control broke the page (UI-14's primary flow). The form posted
+// plainly while the handler answered with the bare `frag:subs/list`, so the browser
+// navigated to a fragment-only document - no layout, no htmx script - where the
+// panel's own "Opt out" control was inert: with htmx absent that form submitted
+// natively, which the portal's GET catch-all answers with a 303 to /endpoints, so
+// the opt-out never happened. Both halves are asserted here: htmx gets the refreshed
+// panel, a plain post gets the page.
+func TestSubscribeUpdatesThePanelOrRedirects(t *testing.T) {
+	core := newFakeCore(t)
+	seedEndpointsPage(t, core, true)
+	core.on(http.MethodPost, "/v1/consumer/endpoints/end1/subscriptions",
+		`{"id":"sub2","endpoint_id":"end1","event_type":"order.refunded","status":"active"}`, http.StatusCreated)
+	h := testHandlerAt(t, core.srv.URL)
+
+	rec := signedInHtmx(t, h, http.MethodPost, "/endpoints/end1/subscriptions",
+		url.Values{"event_type": {"order.refunded"}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("htmx subscribe: status = %d, want 200 carrying the fragment", rec.Code)
+	}
+	frag := rec.Body.String()
+	if strings.Contains(frag, "<html") {
+		t.Fatalf("the htmx answer rendered a document instead of a fragment:\n%s", frag)
+	}
+	if !strings.Contains(frag, `<div id="subs-list">`) {
+		t.Fatalf("the subscribe fragment does not carry the swap target on its root:\n%s", frag)
+	}
+	if got := core.lastBody(http.MethodPost, "/v1/consumer/endpoints/end1/subscriptions"); !strings.Contains(got, `"event_type":"order.refunded"`) {
+		t.Fatalf("the subscribe post did not carry the event type: %s", got)
+	}
+
+	plain := signedIn(t, h, http.MethodPost, "/endpoints/end1/subscriptions",
+		url.Values{"event_type": {"order.refunded"}})
+	if plain.Code != http.StatusSeeOther || plain.Header().Get("Location") != "/endpoints/end1" {
+		t.Fatalf("plain subscribe: status = %d location = %q, want a 303 back to the endpoint page",
+			plain.Code, plain.Header().Get("Location"))
+	}
+}
+
+// TestDetailPageActionsAnswerWithPagesNotFragments covers the other two plain forms
+// on the endpoint page - pause/resume and delete - which carried the same defect as
+// subscribe: the endpoints list drives them with htmx, the detail page does not, so
+// the handler has to answer each caller with something that caller can use.
+func TestDetailPageActionsAnswerWithPagesNotFragments(t *testing.T) {
+	core := newFakeCore(t)
+	core.on(http.MethodPatch, "/v1/consumer/endpoints/end1",
+		`{"id":"end1","status":"paused"}`, http.StatusOK)
+	core.on(http.MethodDelete, "/v1/consumer/endpoints/end1", "", http.StatusNoContent)
+	core.on(http.MethodGet, "/v1/consumer/endpoints",
+		`{"endpoints":[{"id":"end1","name":"orders-hook","url":"https://1.1.1.1/hook","status":"paused","verified":true,"created_at":"2026-01-01T00:00:00Z"}]}`,
+		http.StatusOK)
+	h := testHandlerAt(t, core.srv.URL)
+
+	paused := signedIn(t, h, http.MethodPost, "/endpoints/end1/pause", nil)
+	if paused.Code != http.StatusSeeOther || paused.Header().Get("Location") != "/endpoints/end1" {
+		t.Fatalf("plain pause: status = %d location = %q, want a 303 to the endpoint page",
+			paused.Code, paused.Header().Get("Location"))
+	}
+	deleted := signedIn(t, h, http.MethodPost, "/endpoints/end1/delete", nil)
+	if deleted.Code != http.StatusSeeOther || deleted.Header().Get("Location") != "/endpoints" {
+		t.Fatalf("plain delete: status = %d location = %q, want a 303 to the endpoints list",
+			deleted.Code, deleted.Header().Get("Location"))
+	}
+
+	// The list page's control is an htmx form and must still get the fragment.
+	swapped := signedInHtmx(t, h, http.MethodPost, "/endpoints/end1/pause", nil)
+	if swapped.Code != http.StatusOK {
+		t.Fatalf("htmx pause: status = %d, want the refreshed list fragment", swapped.Code)
+	}
+	if body := swapped.Body.String(); !strings.Contains(body, `<div id="endpoints-list">`) {
+		t.Fatalf("the htmx pause fragment does not carry its swap target on its root:\n%s", body)
 	}
 }

@@ -1,11 +1,20 @@
 {{/* Fragments: rendered without the page layout, swapped in place by htmx. Each
-     reads the same view models the content templates use. */}}
+     reads the same view models the content templates use.
+
+     The swap id sits on the fragment's OUTERMOST element and nowhere else. htmx
+     replaces the element carrying the id with the whole fragment
+     (hx-swap="outerHTML"), so an id on the inner <tbody> made every swap nest a
+     second <table> inside the first - reproduced in a browser: two tables, a
+     `table table` selector match, and the header row rendered twice. Wrapping the
+     fragment in a div that carries the id keeps the swap idempotent: one div
+     out, one div in. */}}
 
 {{define "frag:endpoints/list"}}
+<div id="endpoints-list">
 {{if .Endpoints}}
 <table class="data-table">
   <thead><tr><th>Name</th><th>URL</th><th>Status</th><th>Verified</th><th>Actions</th></tr></thead>
-  <tbody id="endpoints-list">
+  <tbody>
   {{range .Endpoints}}
     <tr>
       <td><a href="/endpoints/{{.ID}}">{{.Name}}</a></td>
@@ -28,14 +37,16 @@
 {{else}}
 <p class="empty">No endpoints yet. Register one above.</p>
 {{end}}
+</div>
 {{end}}
 
 {{define "frag:subs/list"}}
+<div id="subs-list">
 {{if .Error}}<p class="flash flash-error">The subscription was not added: {{.Error}}</p>{{end}}
 {{if .Subscriptions}}
 <table class="data-table">
   <thead><tr><th>Event type</th><th>Status</th><th>Actions</th></tr></thead>
-  <tbody id="subs-list">
+  <tbody>
   {{range .Subscriptions}}
     <tr>
       <td class="mono">{{.EventType}}</td>
@@ -52,4 +63,5 @@
 {{else}}
 <p class="empty">Not subscribed to any event type on this endpoint yet.</p>
 {{end}}
+</div>
 {{end}}

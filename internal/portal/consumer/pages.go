@@ -134,6 +134,21 @@ func coreErrorMessage(resp portal.Response) string {
 	return fmt.Sprintf("the API returned an unexpected error (%d)", resp.Status)
 }
 
+// okStatus reports whether the core accepted a write. The API answers 201 with the
+// created resource, 200 for an edit, and 204 for a delete or an unsubscribe, so a
+// write is accepted if it is any of those.
+func okStatus(status int) bool {
+	return status == http.StatusOK || status == http.StatusCreated || status == http.StatusNoContent
+}
+
+// wantsFragment reports whether the request came from htmx, the only client that
+// can swap a fragment into the page it is on. Every handler that answers with a
+// fragment asks first: a plain form post answered with a fragment navigates the
+// browser to a document that has no layout and no htmx script, so the controls
+// inside that document - the "Opt out" form on the subscriptions panel, for
+// one - become inert and the action the user asked for never happens.
+func wantsFragment(r *http.Request) bool { return r.Header.Get("HX-Request") == "true" }
+
 // --- auth ------------------------------------------------------------------
 
 // loginForm renders the login page; a logged-in visitor is sent straight through.
@@ -483,8 +498,10 @@ func (h *Handler) endpointVerify(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/endpoints/"+id, http.StatusSeeOther)
 }
 
-// endpointSetPaused pauses or resumes an endpoint (UI-13). It returns the
-// refreshed endpoints list fragment for the htmx swap.
+// endpointSetPaused pauses or resumes an endpoint (UI-13). The endpoints list
+// carries this control as an htmx form, so an htmx request gets the refreshed list
+// fragment; the detail page carries it as a plain form, and a plain post gets a 303
+// back to the endpoint page rather than a fragment-only document.
 func (h *Handler) endpointSetPaused(paused bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
@@ -493,25 +510,45 @@ func (h *Handler) endpointSetPaused(paused bool) http.HandlerFunc {
 		if notAuthed(resp, err, w, r, h) {
 			return
 		}
+		if !wantsFragment(r) {
+			if !okStatus(resp.Status) {
+				h.setFlash(w, "error", coreErrorMessage(resp))
+			}
+			http.Redirect(w, r, "/endpoints/"+id, http.StatusSeeOther)
+			return
+		}
 		h.fragEndpoints(w, r) // re-render the list with the new status
 	}
 }
 
-// endpointDelete soft-deletes an endpoint (FR-407), consumer-scoped. Returns the
-// refreshed list fragment.
+// endpointDelete soft-deletes an endpoint (FR-407), consumer-scoped. An htmx
+// request gets the refreshed list fragment; a plain post from the detail page gets
+// a 303 to the list, where the endpoint is gone.
 func (h *Handler) endpointDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	resp, err := h.coreReq(r, http.MethodDelete, "/v1/consumer/endpoints/"+id, nil)
 	if notAuthed(resp, err, w, r, h) {
 		return
 	}
+	if !wantsFragment(r) {
+		if !okStatus(resp.Status) {
+			h.setFlash(w, "error", coreErrorMessage(resp))
+			http.Redirect(w, r, "/endpoints/"+id, http.StatusSeeOther)
+			return
+		}
+		h.setFlash(w, "success", "Endpoint deleted.")
+		http.Redirect(w, r, "/endpoints", http.StatusSeeOther)
+		return
+	}
 	h.fragEndpoints(w, r)
 }
 
-// subscribe opts an endpoint into an event type (UI-14). Returns the refreshed
-// subscriptions fragment; a refusal (the type is not publicly subscribable, or is
-// disabled) is shown in the panel rather than swallowed, so the consumer sees the
-// API's reason where they acted.
+// subscribe opts an endpoint into an event type (UI-14). An htmx request gets the
+// refreshed subscriptions fragment, so the panel updates where the user acted; any
+// other caller gets a 303 back to the endpoint page. A refusal (the type is not
+// publicly subscribable, or is disabled) is shown either way - in the panel, or as
+// the flash on the page it redirects to - so the consumer sees the API's reason
+// wherever they acted.
 func (h *Handler) subscribe(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -524,6 +561,15 @@ func (h *Handler) subscribe(w http.ResponseWriter, r *http.Request) {
 	if notAuthed(resp, err, w, r, h) {
 		return
 	}
+	if !wantsFragment(r) {
+		if resp.Status == http.StatusCreated {
+			h.setFlash(w, "success", "Subscribed to "+eventType+".")
+		} else {
+			h.setFlash(w, "error", coreErrorMessage(resp))
+		}
+		http.Redirect(w, r, "/endpoints/"+id, http.StatusSeeOther)
+		return
+	}
 	// Re-read after the attempt either way, so the panel shows the new state on
 	// success and the unchanged state next to the reason on refusal.
 	view := subsView{Subscriptions: h.endpointSubscriptions(r, id)}
@@ -533,14 +579,22 @@ func (h *Handler) subscribe(w http.ResponseWriter, r *http.Request) {
 	h.r.Fragment(w, http.StatusOK, "frag:subs/list", view)
 }
 
-// unsubscribe opts an endpoint out of an event type (UI-14). Returns the
-// refreshed subscriptions fragment.
+// unsubscribe opts an endpoint out of an event type (UI-14). Same rule as
+// subscribe: htmx gets the refreshed fragment, everyone else a 303 back to the
+// page that owns the control.
 func (h *Handler) unsubscribe(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	eventType := r.PathValue("event")
 	resp, err := h.coreReq(r, http.MethodDelete,
 		"/v1/consumer/endpoints/"+id+"/subscriptions/"+eventType, nil)
 	if notAuthed(resp, err, w, r, h) {
+		return
+	}
+	if !wantsFragment(r) {
+		if !okStatus(resp.Status) {
+			h.setFlash(w, "error", coreErrorMessage(resp))
+		}
+		http.Redirect(w, r, "/endpoints/"+id, http.StatusSeeOther)
 		return
 	}
 	h.renderSubsFragment(w, r, id)
