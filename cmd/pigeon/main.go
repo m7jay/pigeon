@@ -24,7 +24,9 @@ import (
 	"github.com/m7jay/pigeon/internal/delivery"
 	"github.com/m7jay/pigeon/internal/httpapi"
 	"github.com/m7jay/pigeon/internal/identity"
+	"github.com/m7jay/pigeon/internal/limit"
 	"github.com/m7jay/pigeon/internal/metrics"
+	"github.com/m7jay/pigeon/internal/pause"
 	"github.com/m7jay/pigeon/internal/ratelimit"
 	"github.com/m7jay/pigeon/internal/relay"
 	"github.com/m7jay/pigeon/internal/retention"
@@ -265,19 +267,51 @@ func run() error {
 	// FR-811). The sweeper re-queues any lease that has lapsed within the D-6 10 s
 	// ceiling under a single advisory-lock leaseholder (D-7). Both stop on ctx
 	// cancellation and let in-flight work drain (AC-21).
+	//
+	// S5 adds the retry window (§9, FR-1201), the failure thresholds that pause a
+	// subscription or an endpoint (FR-1202/FR-1203), and the two per-endpoint
+	// limits that must hold CLUSTER-WIDE (FR-1302, FR-1306, FR-1307). The limits
+	// live in the same Redis the broker uses, keyed by endpoint id alone, so
+	// adding a replica does not raise an endpoint's effective cap (AC-41). With
+	// no Redis configured the worker falls back to the in-process limiter and
+	// says so: that fallback is per-process, which is exactly what FR-1307
+	// forbids, so it must never be silent.
 	workersWG := &sync.WaitGroup{}
 	if cfg.DeliveryWorkers > 0 {
+		var (
+			limits  limit.Registry
+			tracker *pause.Tracker
+		)
+		if cfg.RedisURL != "" {
+			lim, err := limit.NewRedis(ctx, cfg.RedisURL)
+			if err != nil {
+				return fmt.Errorf("connect delivery limiter: %w", err)
+			}
+			defer lim.Close()
+			limits = lim
+			tracker = pause.NewTracker(lim.Client(), pause.DefaultThresholds())
+		} else {
+			log.Warn("no PIGEON_REDIS_URL: per-endpoint limits and pause thresholds are per-process and thresholds are DISABLED (FR-1302, FR-1307)",
+				"requirement", "FR-1302")
+			limits = limit.NewLocal()
+		}
 		dw := delivery.New(st, delivery.Options{
 			Workers:         cfg.DeliveryWorkers,
+			Concurrency:     cfg.DeliveryConcurrency,
 			Lease:           cfg.DeliveryLease,
 			Timeout:         cfg.DeliveryTimeout,
+			SlotTTL:         cfg.DeliverySlotTTL,
 			MaxBodyBytes:    cfg.DeliveryMaxBodyBytes,
 			BackoffBase:     cfg.DeliveryBackoffBase,
 			BackoffMax:      cfg.DeliveryBackoffMax,
-			MaxAttempts:     cfg.DeliveryMaxAttempts,
+			MaxRetries:      cfg.DeliveryMaxRetries,
+			RetryWindow:     cfg.DeliveryRetryWindow,
+			Jitter:          cfg.DeliveryJitter,
 			MaxConnsPerHost: cfg.DeliveryMaxConnsPerHost,
 			PollInterval:    cfg.DeliveryPollInterval,
 			UserAgent:       "pigeon/" + version,
+			Limits:          limits,
+			Pauses:          tracker,
 			Logger:          log,
 			// S6: evidence goes to the Redis buffer in buffered mode (D-1) or is
 			// written inline in sync mode (D-2). The counters and the log gate

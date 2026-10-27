@@ -218,7 +218,11 @@ where status = 'pending'
 -- column on deliveries: a subscription IS the pair (FR-501), and the partial
 -- unique index on the live pairs makes the join exact.
 -- ---------------------------------------------------------------------------
+-- 0010_attempt_buffer (S6) recreated the claim with the same argument list but a
+-- different OUT row (it added row_attempts); this version keeps that column and
+-- adds S5's, so both argument lists go and one comes back with the union.
 drop function if exists pigeon_claim_delivery(interval);
+drop function if exists pigeon_claim_delivery(interval, interval);
 
 create or replace function pigeon_claim_delivery(
         p_lease                 interval default interval '40 seconds',
@@ -243,6 +247,10 @@ create or replace function pigeon_claim_delivery(
         occurred_at     timestamptz,
         payload         jsonb,
         prior_attempts  int,
+        -- D-2: deliveries.attempts, the control-state attempt counter advanced by
+        -- pigeon_requeue_delivery. Always current, in both attempt-log modes,
+        -- because the attempt number must not depend on the evidence buffer.
+        row_attempts    int,
         first_attempt_at timestamptz,
         -- S5: the retry window state (FR-1201, FR-1207, FR-1208).
         next_attempt_at timestamptz,
@@ -303,7 +311,7 @@ as $$
            ep.url, ep.signing_secret,
            et.name, et.payload_version, coalesce(e.consumer_ref, ''),
            e.occurred_at, e.payload,
-           coalesce(da.n, 0), da.first_attempt_at,
+           coalesce(da.n, 0), d.attempts, da.first_attempt_at,
            coalesce(d.next_attempt_at, d.lease_expires_at),
            coalesce(d.retry_deadline,
                     d.created_at + coalesce(ep.retry_window, p_default_retry_window)),
@@ -336,13 +344,18 @@ $$;
 -- recomputed from a wall-clock constant: a delivery that has been paused and
 -- resumed must still see the window it was promised.
 -- ---------------------------------------------------------------------------
+-- 0008 created pigeon_requeue_delivery(bigint, interval); 0010_attempt_buffer (S6)
+-- recreated it as (bigint, interval, int) to advance deliveries.attempts (D-2).
+-- This version keeps that counter advance and takes the absolute instants S5
+-- schedules with, so all three drops go and one comes back.
 drop function if exists pigeon_requeue_delivery(bigint, interval);
-drop function if exists pigeon_requeue_delivery(bigint, interval, timestamptz, timestamptz);
+drop function if exists pigeon_requeue_delivery(bigint, interval, int);
 
 create or replace function pigeon_requeue_delivery(
         p_delivery_id     bigint,
         p_next_attempt_at timestamptz,
-        p_retry_deadline  timestamptz
+        p_retry_deadline  timestamptz,
+        p_attempt         int
     )
     returns void
     language sql
@@ -352,9 +365,16 @@ as $$
     update deliveries
     set lease_expires_at = p_next_attempt_at,
         next_attempt_at  = p_next_attempt_at,
-        retry_deadline   = p_retry_deadline
+        retry_deadline   = p_retry_deadline,
+        -- D-2: greatest(), never assigned, so a re-delivered requeue (a retried
+        -- control write) cannot walk the attempt number backwards while the
+        -- evidence row may still be sitting in the Redis buffer.
+        attempts         = greatest(attempts, coalesce(p_attempt, 0))
     where id = p_delivery_id and status = 'pending';
 $$;
+
+comment on function pigeon_requeue_delivery(bigint,timestamptz,timestamptz,int) is
+    'FR-805/FR-1208/D-2: moves the lease, next_attempt_at and the retry deadline together and advances deliveries.attempts, so the attempt number never depends on the attempt evidence buffer.';
 
 -- ---------------------------------------------------------------------------
 -- Sweeper (D-6): re-queue EVERY delivery whose lease has lapsed.
@@ -691,7 +711,7 @@ as $$
 $$;
 
 grant execute on function pigeon_claim_delivery(interval, interval) to current_user;
-grant execute on function pigeon_requeue_delivery(bigint, timestamptz, timestamptz) to current_user;
+grant execute on function pigeon_requeue_delivery(bigint, timestamptz, timestamptz, int) to current_user;
 grant execute on function pigeon_finalize_delivery(bigint, int, timestamptz) to current_user;
 grant execute on function pigeon_endpoint_subscription_stats(text) to current_user;
 grant execute on function pigeon_pause_subscription(text, text, text) to current_user;

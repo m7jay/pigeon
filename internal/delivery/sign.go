@@ -30,6 +30,10 @@ type signedRequest struct {
 	webhookTime string // integer Unix seconds of the attempt (FR-1001, FR-1003)
 	webhookSig  string
 	userAgent   string
+	// endpointID keys the per-endpoint transport (FR-817). It is carried on the
+	// request rather than looked up by URL so two endpoints that happen to share
+	// a host still get their own connection pools and their own caps.
+	endpointID string
 }
 
 // buildSignedRequest renders the leased delivery into the §10 envelope, signs it
@@ -72,6 +76,7 @@ func buildSignedRequest(d store.LeasedDelivery, attempt int, userAgent string, n
 	ts := envelope.WebhookTimestamp(now)
 	return signedRequest{
 		url:         d.EndpointURL,
+		endpointID:  d.EndpointID,
 		body:        body,
 		webhookID:   env.ID,
 		webhookTime: ts,

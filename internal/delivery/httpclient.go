@@ -28,24 +28,34 @@ type attemptResult struct {
 // created lazily and cached; the map is only touched while building a client, so
 // the common hot path (an endpoint already seen) is a single read after warm-up.
 type transportCache struct {
-	mu         sync.Mutex
-	byEndpoint map[string]*http.Client
-	maxConns   int
+	mu          sync.Mutex
+	byEndpoint  map[string]*http.Client
+	fallbackCap int
 }
 
-// newTransportCache is the constructor.
-func newTransportCache(maxConns int) *transportCache {
-	return &transportCache{byEndpoint: map[string]*http.Client{}, maxConns: maxConns}
+// newTransportCache is the constructor. fallbackCap is what an endpoint with no
+// concurrency cap of its own gets (config's PIGEON_DELIVERY_MAX_CONNS_PER_HOST).
+func newTransportCache(fallbackCap int) *transportCache {
+	return &transportCache{byEndpoint: map[string]*http.Client{}, fallbackCap: fallbackCap}
 }
 
 // clientFor returns the cached client for an endpoint, creating it on first use.
-// MaxConnsPerHost equals the endpoint's concurrency cap (FR-817); keep-alives are
-// on so a retried delivery to a healthy receiver reuses the connection; and
-// CheckRedirect returns the redirect response unmodified so redirects are never
-// followed (FR-803). The client has no own Timeout: every attempt carries its own
+// maxConns is that endpoint's concurrency cap (FR-817), so the transport's
+// connection budget and the endpoint's leased slot budget agree: a client that
+// allowed fewer connections would make the endpoint's promise unreachable, and one
+// that allowed more would let this process exceed it. keep-alives are on so a
+// retried delivery to a healthy receiver reuses the connection; and CheckRedirect
+// returns the redirect response unmodified so redirects are never followed
+// (FR-803). The client has no own Timeout: every attempt carries its own
 // context.WithTimeout (FR-819), which bounds the attempt in both time and
 // goroutine lifetime and is cancelled on shutdown.
-func (c *transportCache) clientFor(endpointID string) *http.Client {
+func (c *transportCache) clientFor(endpointID string, maxConns int) *http.Client {
+	if maxConns <= 0 {
+		maxConns = c.fallbackCap
+	}
+	if maxConns < 1 {
+		maxConns = 1
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if cl, ok := c.byEndpoint[endpointID]; ok {
@@ -60,9 +70,9 @@ func (c *transportCache) clientFor(endpointID string) *http.Client {
 			return http.ErrUseLastResponse
 		},
 		Transport: &http.Transport{
-			MaxConnsPerHost:     c.maxConns,
-			MaxIdleConns:        c.maxConns,
-			MaxIdleConnsPerHost: c.maxConns,
+			MaxConnsPerHost:     maxConns,
+			MaxIdleConns:        maxConns,
+			MaxIdleConnsPerHost: maxConns,
 			IdleConnTimeout:     90 * time.Second,
 			DisableCompression:  true, // capture the raw body, not a decoded one (FR-804)
 		},
@@ -75,7 +85,7 @@ func (c *transportCache) clientFor(endpointID string) *http.Client {
 // and closes the response body (FR-817), captures the first MaxBodyBytes for the
 // attempt trail (FR-804), and never follows a redirect (FR-803). ctx carries the
 // per-attempt timeout (FR-819).
-func (w *Worker) deliver(ctx context.Context, req signedRequest, maxBody int) attemptResult {
+func (w *Worker) deliver(ctx context.Context, req signedRequest, maxConns, maxBody int) attemptResult {
 	var body bytes.Reader
 	body.Reset(req.body)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.url, &body)
@@ -91,7 +101,7 @@ func (w *Worker) deliver(ctx context.Context, req signedRequest, maxBody int) at
 	httpReq.Header.Set(headerWebhookSig, req.webhookSig)   // FR-1001
 
 	start := time.Now()
-	resp, err := w.clients.clientFor(req.url).Do(httpReq)
+	resp, err := w.clients.clientFor(req.endpointID, maxConns).Do(httpReq)
 	res := attemptResult{duration: time.Since(start), sendErr: err}
 	if err != nil {
 		res.outcome, res.errorClass = classifySendErr(err)

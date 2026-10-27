@@ -83,7 +83,7 @@ func testOptions(timeout, backoffBase, backoffMax time.Duration) Options {
 		MaxBodyBytes:    2048,
 		BackoffBase:     backoffBase,
 		BackoffMax:      backoffMax,
-		MaxAttempts:     15,
+		MaxRetries:      15,
 		MaxConnsPerHost: 1,
 		PollInterval:    time.Millisecond,
 		FailBackoff:     time.Millisecond,
@@ -328,8 +328,11 @@ func TestTerminalFailureOn404(t *testing.T) {
 	}
 
 	status, dbAttempts, attemptRows, deliveredAt, _ := deliveryState(t, admin, deliveryID)
-	if status != "failed" {
-		t.Fatalf("delivery status = %q, want failed (AC-05)", status)
+	if status != "failed_terminal" {
+		// 0009 renames the terminal status to failed_terminal: I-4's vocabulary
+		// ("terminal only in delivered, failed_terminal, cancelled") and AC-36
+		// both name that value, and 0007's `failed` was the only other spelling.
+		t.Fatalf("delivery status = %q, want failed_terminal (AC-05, I-4)", status)
 	}
 	if dbAttempts != 1 {
 		t.Fatalf("delivery.attempts = %d, want 1", dbAttempts)
@@ -497,7 +500,7 @@ func TestLeaseExpiryReclaimsWithoutDuplicateAttempts(t *testing.T) {
 	_, _, deliveryID := seedHarness(t, st, admin, "http://127.0.0.1:1/") // URL never contacted in this test
 
 	// Claim, then simulate a crash: write attempt 1 as a partial, durable record.
-	if _, got, err := st.ClaimDelivery(ctx, 40*time.Second); err != nil {
+	if _, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour); err != nil {
 		t.Fatalf("first claim: %v", err)
 	} else if !got {
 		t.Fatal("first claim found nothing to lease")
@@ -514,7 +517,7 @@ func TestLeaseExpiryReclaimsWithoutDuplicateAttempts(t *testing.T) {
 		`update deliveries set lease_expires_at = now() - interval '1 second' where id=$1`, deliveryID); err != nil {
 		t.Fatalf("expire lease: %v", err)
 	}
-	d2, got, err := st.ClaimDelivery(ctx, 40*time.Second)
+	d2, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour)
 	if err != nil {
 		t.Fatalf("re-claim: %v", err)
 	}
@@ -636,7 +639,7 @@ func TestSweeperRequeuesExpiredLease(t *testing.T) {
 		t.Fatalf("SweeperRequeue reclaimed %d, want 2 (D-6 re-queues any lapsed lease)", n)
 	}
 	// A swept row is immediately claimable, with no waiting for the old lease.
-	if _, got, err := st.ClaimDelivery(ctx, 40*time.Second); err != nil {
+	if _, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour); err != nil {
 		t.Fatalf("claim after sweep: %v", err)
 	} else if !got {
 		t.Fatal("a swept delivery was not claimable")
