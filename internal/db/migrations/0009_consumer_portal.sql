@@ -1,4 +1,4 @@
--- 0008_consumer_portal.sql — S9 (M2b): the two columns UI-13 and UI-14 need.
+-- 0009_consumer_portal.sql — S9 (M2b): the two columns UI-13 and UI-14 need.
 --
 -- Both settings are consumer-owned: UI-13's notification email hangs off the
 -- consumer's own endpoint and UI-14's gate hangs off the producer's event type.
