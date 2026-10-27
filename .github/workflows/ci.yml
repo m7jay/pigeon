@@ -12,7 +12,12 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # 30, not 15: the httpapi package alone runs ~525s under -race on this runner
+    # before the consumer-portal work (each acceptance test builds its own env,
+    # which re-runs the entire migration set, so a test costs ~17-40s and the
+    # package grows with the route table). The test step's own `-timeout 25m` is
+    # the budget that matters; this cap only has to stay above it.
+    timeout-minutes: 30
 
     services:
       postgres:
@@ -69,7 +74,13 @@ jobs:
           # service-container database: running packages in parallel lets one
           # package's fixtures (and the identity bootstrap test, which deletes and
           # recreates the instance admin) interfere with another's.
-          go test -count=1 -race -p 1 -v ./... 2>&1 | tee /tmp/go-test.log
+          # -timeout 25m: Go's default is 10m per test binary, and the httpapi
+          # package already spent 525s of that before this card. Run
+          # 40560104623 died at exactly 600s with every test up to that point
+          # passing - that is the default being the wrong budget for a package
+          # that builds a fresh env (full migration set) per acceptance test, not
+          # a test that hangs.
+          go test -count=1 -race -p 1 -v -timeout 25m ./... 2>&1 | tee /tmp/go-test.log
           # A skip is a failure here. The whole point of S0 is that the
           # cross-producer harness (AC-20) actually executes against Postgres;
           # a green run that silently skipped it is the bug this closes.
