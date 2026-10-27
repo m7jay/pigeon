@@ -73,11 +73,13 @@ type Data interface {
 	// filtered by consumerID, the caller's own consumer from the session claim. A
 	// foreign or deleted id is ErrNotFound, so guessing another consumer's id is a
 	// 404 whether it is an endpoint, a pause, a delete or a subscription.
-	CreateConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, name, url string) (store.EndpointCreated, error)
+	CreateConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID string, in store.NewConsumerEndpoint) (store.EndpointCreated, error)
 	GetConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.Endpoint, error)
-	SetConsumerEndpointPaused(ctx context.Context, sc store.Scope, consumerID, endpointID string, paused bool) (store.Endpoint, error)
+	UpdateConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string, p store.ConsumerEndpointPatch) (store.Endpoint, error)
+	RotateConsumerEndpointSecret(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.EndpointSecret, error)
 	DeleteConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string) error
 	VerifyConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID, token string) error
+	ListSubscribableEventTypes(ctx context.Context, sc store.Scope) ([]string, error)
 	ListConsumerSubscriptions(ctx context.Context, sc store.Scope, consumerID, endpointID string) ([]store.Subscription, error)
 	CreateConsumerSubscription(ctx context.Context, sc store.Scope, consumerID, endpointID, eventType string) (store.Subscription, error)
 	DeleteConsumerSubscription(ctx context.Context, sc store.Scope, consumerID, endpointID, eventType string) error

@@ -319,6 +319,14 @@ var crossProducerCases = map[string]cpCase{
 			}
 		},
 	},
+	"GET /v1/consumer/event-types": {
+		build:      func(a, b *tenant) (string, any) { return "/v1/consumer/event-types", nil },
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusOK,
+		// The list is scoped to B's producer: A's type name must not appear in it
+		// even though the route takes no identifier to aim with.
+		leaks: func(a, b *tenant) []string { return []string{a.EventTypeName} },
+	},
 	"GET /v1/consumer/endpoints/{endpointID}": {
 		build:      func(a, b *tenant) (string, any) { return "/v1/consumer/endpoints/" + a.EndpointID, nil },
 		credential: func(a, b *tenant) string { return b.ConsumerToken },
@@ -328,6 +336,11 @@ var crossProducerCases = map[string]cpCase{
 		build: func(a, b *tenant) (string, any) {
 			return "/v1/consumer/endpoints/" + a.EndpointID, map[string]bool{"paused": true}
 		},
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusNotFound,
+	},
+	"POST /v1/consumer/endpoints/{endpointID}/rotate": {
+		build:      func(a, b *tenant) (string, any) { return "/v1/consumer/endpoints/" + a.EndpointID + "/rotate", nil },
 		credential: func(a, b *tenant) string { return b.ConsumerToken },
 		want:       http.StatusNotFound,
 	},

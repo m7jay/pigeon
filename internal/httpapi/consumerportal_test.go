@@ -17,8 +17,10 @@ func bodyOf(t *testing.T, e *env, method, path, token string, body any) []byte {
 
 // seedSubscribableEventType registers an event type the consumer can subscribe
 // to. Event types are ingest-credential routes (FR-201), so this uses the tenant
-// API key, exactly as the producer would. Pigeon does not yet model a per-type
-// subscribable flag, so a registered type is subscribable.
+// API key, exactly as the producer would. A freshly registered type is publicly
+// subscribable by default (migration 0008), which is what makes AC-38 - a consumer
+// subscribing with no producer action - possible; the producer opts a type out with
+// PATCH /v1/event-types/{name} (see TestConsumerPortalSubscribableGate).
 func seedSubscribableEventType(t *testing.T, e *env, tn *tenant) string {
 	t.Helper()
 	name := strings.ReplaceAll(tn.Slug, "-", "") + ".order"
@@ -70,6 +72,57 @@ func TestConsumerPortalSelfService(t *testing.T) {
 	}
 	if resumed := decode[endpointJSON](t, bodyOf(t, e, http.MethodPatch, "/v1/consumer/endpoints/"+endpointID, tok, map[string]bool{"paused": false})); resumed.Status != "active" {
 		t.Fatalf("resume did not take: status = %q", resumed.Status)
+	}
+
+	// Edit the endpoint (UI-13): rename it, move it, and set the notification
+	// email. All three are one PATCH - the same request the portal posts.
+	edited := decode[endpointJSON](t, bodyOf(t, e, http.MethodPatch, "/v1/consumer/endpoints/"+endpointID, tok, map[string]any{
+		"name": "my-hook-renamed", "url": "https://1.0.0.1/hook2", "notification_email": "consumer-ops@example.test",
+	}))
+	if edited.Name != "my-hook-renamed" || edited.URL != "https://1.0.0.1/hook2" {
+		t.Fatalf("edit did not take: %+v", edited)
+	}
+	if edited.NotificationEmail == nil || *edited.NotificationEmail != "consumer-ops@example.test" {
+		t.Fatalf("notification email = %v, want consumer-ops@example.test (UI-13)", edited.NotificationEmail)
+	}
+	// The email is validated at that edge, and "" is how it is cleared.
+	if cleared := decode[endpointJSON](t, bodyOf(t, e, http.MethodPatch, "/v1/consumer/endpoints/"+endpointID, tok, map[string]any{
+		"notification_email": "",
+	})); cleared.NotificationEmail != nil {
+		t.Fatalf("clearing the notification email left %q", *cleared.NotificationEmail)
+	}
+	if code, raw := e.do(http.MethodPatch, "/v1/consumer/endpoints/"+endpointID, tok, map[string]any{
+		"notification_email": "not-an-address",
+	}); code != http.StatusUnprocessableEntity {
+		t.Fatalf("malformed notification email: status = %d (%s), want 422", code, raw)
+	}
+	// Moving an endpoint onto a private address is refused by the same FR-402 check
+	// registration runs - and refused before the row moves.
+	if code, raw := e.do(http.MethodPatch, "/v1/consumer/endpoints/"+endpointID, tok, map[string]any{
+		"url": "https://169.254.169.254/latest/meta-data/",
+	}); code != http.StatusUnprocessableEntity {
+		t.Fatalf("private-range URL on edit: status = %d (%s), want 422", code, raw)
+	}
+
+	// Rotate the signing secret (UI-13). The new secret comes back once, the stored
+	// one changes, and the endpoint needs no re-verification to keep delivering.
+	rotated := decode[endpointRotatedJSON](t, bodyOf(t, e, http.MethodPost, "/v1/consumer/endpoints/"+endpointID+"/rotate", tok, nil))
+	if !strings.HasPrefix(rotated.SigningSecret, "whsec_") || rotated.SigningSecretHint == "" {
+		t.Fatalf("rotate did not return a whsec_ secret and hint: %+v", rotated)
+	}
+	if rotated.SigningSecret == created.SigningSecret {
+		t.Fatal("rotate returned the secret that was already in use")
+	}
+	var stored string
+	if err := e.admin.QueryRow(context.Background(),
+		`select signing_secret from endpoints where id = $1`, endpointID).Scan(&stored); err != nil {
+		t.Fatalf("read the stored signing secret: %v", err)
+	}
+	if stored != rotated.SigningSecret {
+		t.Fatalf("the rotated secret was not persisted (stored %q)", stored)
+	}
+	if got := decode[endpointJSON](t, bodyOf(t, e, http.MethodGet, "/v1/consumer/endpoints/"+endpointID, tok, nil)); !got.Verified || got.Status != "active" {
+		t.Fatalf("rotation disturbed the endpoint: %+v", got)
 	}
 
 	// Subscribe, list, opt out (UI-14).
@@ -142,6 +195,7 @@ func TestConsumerPortalForeignResourcesAreNotFound(t *testing.T) {
 		{http.MethodPatch, "/v1/consumer/endpoints/" + a.EndpointID, map[string]bool{"paused": true}},
 		{http.MethodDelete, "/v1/consumer/endpoints/" + a.EndpointID, nil},
 		{http.MethodPost, "/v1/consumer/endpoints/" + a.EndpointID + "/verify", map[string]string{"token": a.EndpointVerifyToken}},
+		{http.MethodPost, "/v1/consumer/endpoints/" + a.EndpointID + "/rotate", nil},
 		{http.MethodPost, "/v1/consumer/endpoints/" + a.EndpointID + "/subscriptions", map[string]string{"event_type": name}},
 		{http.MethodDelete, "/v1/consumer/endpoints/" + a.EndpointID + "/subscriptions/" + name, nil},
 	} {
@@ -168,4 +222,99 @@ func TestConsumerPortalForeignResourcesAreNotFound(t *testing.T) {
 	if list.Endpoints[0].ID == a.EndpointID || list.Endpoints[0].ConsumerID == a.ConsumerID {
 		t.Fatalf("B's list leaked A's consumer resource id %q", list.Endpoints[0].ID)
 	}
+}
+
+// TestConsumerPortalSubscribableGate is UI-14's gate from both ends: the producer
+// decides whether a type may be subscribed to, and both the read the portal's
+// subscribe control uses (GET /v1/consumer/event-types) and the write it posts
+// (POST .../subscriptions) answer with that decision, so a control the API would
+// refuse can never be offered and a script gets the same answer as the portal.
+func TestConsumerPortalSubscribableGate(t *testing.T) {
+	e := setup(t)
+	b := e.seedTenant(t, "m2b-gate-b")
+	tok := b.ConsumerToken
+	name := seedSubscribableEventType(t, e, b)
+
+	created := decode[endpointCreatedJSON](t, bodyOf(t, e, http.MethodPost, "/v1/consumer/endpoints", tok, map[string]string{
+		"name": "gate-hook", "url": "https://1.1.1.1/hook",
+	}))
+	endpointID := created.ID
+
+	// offers reports whether the consumer's subscribable list currently names the
+	// type: the read side of the gate, exactly what the portal renders as options.
+	offers := func() bool {
+		list := decode[struct {
+			EventTypes []struct {
+				Name string `json:"name"`
+			} `json:"event_types"`
+		}](t, bodyOf(t, e, http.MethodGet, "/v1/consumer/event-types", tok, nil))
+		for _, et := range list.EventTypes {
+			if et.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	// subscribe reports the status and body of the write side of the gate.
+	subscribe := func() (int, []byte) {
+		return e.do(http.MethodPost, "/v1/consumer/endpoints/"+endpointID+"/subscriptions", tok,
+			map[string]string{"event_type": name})
+	}
+
+	// A freshly registered type is open, so it is offered and accepted. UI-14's gate
+	// is not a wall in front of a consumer's own self-service (AC-38).
+	if !offers() {
+		t.Fatalf("a newly registered event type is not offered to the consumer: %s", name)
+	}
+	if code, raw := subscribe(); code != http.StatusCreated {
+		t.Fatalf("subscribing to an open type: status = %d (%s), want 201", code, raw)
+	}
+	// Opt straight back out, so the later re-open assertion starts from no pair and
+	// cannot pass or fail on a duplicate (409) instead of the gate.
+	if code, raw := e.do(http.MethodDelete, "/v1/consumer/endpoints/"+endpointID+"/subscriptions/"+name, tok, nil); code != http.StatusNoContent {
+		t.Fatalf("opting out: status = %d (%s), want 204", code, raw)
+	}
+
+	// The producer closes the gate. No consumer-side action is needed for the
+	// refusal to take: the decision is the producer's, enforced server-side.
+	patchEventType(t, e, b, name, map[string]any{"publicly_subscribable": false})
+	if offers() {
+		t.Fatalf("a closed event type is still offered to the consumer: %s", name)
+	}
+	code, raw := subscribe()
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("subscribing to a closed type: status = %d (%s), want 422", code, raw)
+	}
+	if !strings.Contains(string(raw), "publicly subscribable") {
+		t.Fatalf("the refusal does not name UI-14's reason: %s", raw)
+	}
+
+	// A disabled type is refused for the other reason (FR-305): it can never be
+	// published, so a subscription to it would set up a delivery that cannot happen.
+	patchEventType(t, e, b, name, map[string]any{"publicly_subscribable": true, "enabled": false})
+	if offers() {
+		t.Fatalf("a disabled event type is still offered to the consumer: %s", name)
+	}
+	code, raw = subscribe()
+	if code != http.StatusUnprocessableEntity || !strings.Contains(string(raw), "disabled") {
+		t.Fatalf("subscribing to a disabled type: status = %d (%s), want 422 naming the type is disabled", code, raw)
+	}
+
+	// Re-opening the gate restores self-service without touching the consumer's
+	// endpoint: the two sides of UI-14 are one decision, read and enforced once.
+	patchEventType(t, e, b, name, map[string]any{"enabled": true})
+	if !offers() {
+		t.Fatalf("re-opened event type is not offered to the consumer: %s", name)
+	}
+	if code, raw := subscribe(); code != http.StatusCreated {
+		t.Fatalf("subscribing after re-opening the gate: status = %d (%s), want 201", code, raw)
+	}
+}
+
+// patchEventType applies a producer-side PATCH to one event type with the tenant's
+// own ingest credential, asserting it took. It is the producer's half of UI-14.
+func patchEventType(t *testing.T, e *env, tn *tenant, name string, body map[string]any) {
+	t.Helper()
+	code, raw := e.do(http.MethodPatch, "/v1/event-types/"+name, tn.KeyPlain, body)
+	mustStatus(t, code, raw, http.StatusOK)
 }

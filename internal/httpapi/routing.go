@@ -66,16 +66,20 @@ type endpointJSON struct {
 	ConsumerID string `json:"consumer_id"`
 	Name       string `json:"name"`
 	URL        string `json:"url"`
-	Internal   bool   `json:"internal"`
-	Status     string `json:"status"`
-	Verified   bool   `json:"verified"`
-	CreatedAt  string `json:"created_at"`
+	// NotificationEmail is UI-13's consumer-configured failure-notification
+	// address; null until the consumer user sets one.
+	NotificationEmail *string `json:"notification_email"`
+	Internal          bool    `json:"internal"`
+	Status            string  `json:"status"`
+	Verified          bool    `json:"verified"`
+	CreatedAt         string  `json:"created_at"`
 }
 
 func toEndpointJSON(ep store.Endpoint) endpointJSON {
 	return endpointJSON{
 		ID: ep.ID, ConsumerID: ep.ConsumerID, Name: ep.Name, URL: ep.URL,
-		Internal: ep.Internal, Status: ep.Status, Verified: ep.Verified, CreatedAt: ts(ep.CreatedAt),
+		NotificationEmail: ep.NotificationEmail,
+		Internal:          ep.Internal, Status: ep.Status, Verified: ep.Verified, CreatedAt: ts(ep.CreatedAt),
 	}
 }
 
