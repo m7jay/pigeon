@@ -15,11 +15,103 @@ import "sync"
 type Metrics struct {
 	mu            sync.Mutex
 	nonDeliveries map[string]int64
+	counters      map[string]int64
 }
+
+// The counter names the delivery and flusher paths advance. They exist because
+// LOG-2 and AC-33 require the volume a log line would have carried to live in a
+// counter instead: "no per-success log lines; log volume stays under the
+// documented bound; counters advance". Every name is also exposed at GET
+// /metrics, so an operator reads the same numbers the log gate suppressed.
+const (
+	// DeliveriesDelivered counts successful attempts (OBS-4's success half).
+	DeliveriesDelivered = "pigeon_deliveries_delivered_total"
+	// DeliveriesRetried counts retryable failures that were re-queued (FR-805).
+	DeliveriesRetried = "pigeon_deliveries_retried_total"
+	// DeliveriesFailedTerminal counts deliveries that ended failed (FR-806, §9).
+	DeliveriesFailedTerminal = "pigeon_deliveries_failed_terminal_total"
+	// AttemptsBuffered counts evidence rows handed to the Redis buffer (D-1).
+	AttemptsBuffered = "pigeon_attempts_buffered_total"
+	// AttemptsFlushed counts evidence rows that reached Postgres (FR-815).
+	AttemptsFlushed = "pigeon_attempts_flushed_total"
+	// AttemptsConflicted counts buffered rows Postgres already had. A non-zero
+	// value is an anomaly worth an alarm, never a lost row: the buffer's replay
+	// after a crash re-inserts the same (delivery_id, attempt) on purpose.
+	AttemptsConflicted = "pigeon_attempts_conflicted_total"
+	// FlushBatches counts flush transactions (the denominator of FR-815's rows
+	// per transaction, which is what the batching claim is about).
+	FlushBatches = "pigeon_attempt_flush_batches_total"
+	// FlushErrors counts flush attempts that failed; the batch stays in Redis.
+	FlushErrors = "pigeon_attempt_flush_errors_total"
+	// SuccessLogsEmitted and SuccessLogsSuppressed are LOG-2's own accounting:
+	// the emitted/suppressed split is the evidence that the bound held.
+	SuccessLogsEmitted    = "pigeon_success_logs_emitted_total"
+	SuccessLogsSuppressed = "pigeon_success_logs_suppressed_total"
+	// AttemptBufferPending is the buffer depth at the last flush pass. A gauge,
+	// not a counter (OBS-9's queue depth in the same spirit).
+	AttemptBufferPending = "pigeon_attempt_buffer_pending"
+)
 
 // New builds an empty Metrics.
 func New() *Metrics {
-	return &Metrics{nonDeliveries: map[string]int64{}}
+	return &Metrics{nonDeliveries: map[string]int64{}, counters: map[string]int64{}}
+}
+
+// Inc advances a counter by one. A nil Metrics is a no-op, so a worker
+// constructed without metrics (unit tests, the pre-S6 wiring) needs no guard at
+// every call site.
+func (m *Metrics) Inc(name string) { m.Add(name, 1) }
+
+// Add advances a counter by n.
+func (m *Metrics) Add(name string, n int64) {
+	if m == nil || name == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.counters == nil {
+		m.counters = map[string]int64{}
+	}
+	m.counters[name] += n
+}
+
+// Set records a gauge's current value.
+func (m *Metrics) Set(name string, v int64) {
+	if m == nil || name == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.counters == nil {
+		m.counters = map[string]int64{}
+	}
+	m.counters[name] = v
+}
+
+// Counter reads one counter. A name never recorded reads as 0.
+func (m *Metrics) Counter(name string) int64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.counters[name]
+}
+
+// CounterSnapshot returns a copy of every counter, so a reader (the /metrics
+// scrape, or a test asserting AC-33's "counters advance") sees a consistent view
+// without holding the lock.
+func (m *Metrics) CounterSnapshot() map[string]int64 {
+	if m == nil {
+		return map[string]int64{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]int64, len(m.counters))
+	for k, v := range m.counters {
+		out[k] = v
+	}
+	return out
 }
 
 // RecordNonDelivery advances the counter for one §7.5a reason. The reason IS the
