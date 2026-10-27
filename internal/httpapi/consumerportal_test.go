@@ -18,7 +18,7 @@ func bodyOf(t *testing.T, e *env, method, path, token string, body any) []byte {
 // seedSubscribableEventType registers an event type the consumer can subscribe
 // to. Event types are ingest-credential routes (FR-201), so this uses the tenant
 // API key, exactly as the producer would. A freshly registered type is publicly
-// subscribable by default (migration 0008), which is what makes AC-38 - a consumer
+// subscribable by default (migration 0009), which is what makes AC-38 - a consumer
 // subscribing with no producer action - possible; the producer opts a type out with
 // PATCH /v1/event-types/{name} (see TestConsumerPortalSubscribableGate).
 func seedSubscribableEventType(t *testing.T, e *env, tn *tenant) string {
