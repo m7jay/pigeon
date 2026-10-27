@@ -1,4 +1,4 @@
--- 0009_partitioning.sql — SB-1/SB-2: deliveries and attempts become daily range
+-- 0010_partitioning.sql — SB-1/SB-2: deliveries and attempts become daily range
 -- partitions so retention can drop whole days instead of DELETE.
 --
 -- Why this is a swap and not an ALTER: PostgreSQL cannot convert a plain table
