@@ -14,17 +14,21 @@ import (
 // so every replica contends for the same lock and only one wins.
 const sweeperLockID int64 = 0x70696765_6e5f7377 // "pigen_sw"
 
+// MaxSweepInterval is D-6's ceiling on the recovery latency: a delivery whose lease
+// has lapsed MUST be re-queued within 10 s, so the sweep cadence is a hard maximum,
+// not a default. NewSweeper clamps to it and internal/config clamps
+// PIGEON_SWEEPER_INTERVAL the same way, so no single setting can void D-6.
+const MaxSweepInterval = 10 * time.Second
+
 // SweeperOptions configures the sweeper.
 type SweeperOptions struct {
 	// URL is the DSN for the dedicated connection that holds the leadership lock.
 	// It must stay open for the sweeper's lifetime; closing it releases the lock.
 	URL string
-	// Interval is the sweep cadence. It MUST be ≤ the D-6 window so a crashed
-	// worker's deliveries are re-queued within 10 s. Defaults to 5 s.
+	// Interval is the sweep cadence: it MUST be ≤ 10 s (D-6), so a crashed
+	// worker's deliveries are re-queued within the window, and it is clamped to
+	// MaxSweepInterval. Defaults to 5 s.
 	Interval time.Duration
-	// WindowSeconds is the requeue lookback (D-6): re-queue any lease that lapsed
-	// within it. Defaults to 10.
-	WindowSeconds int
 	// LockWait is how long to keep competing for the lock before giving up boot.
 	// Defaults to 60 s.
 	LockWait time.Duration
@@ -34,7 +38,7 @@ type SweeperOptions struct {
 // StoreRequeuer is the subset of *store.Store the sweeper needs, so the sweeper
 // can be constructed against a real or fake store in tests.
 type StoreRequeuer interface {
-	SweeperRequeue(ctx context.Context, windowSeconds int) (int, error)
+	SweeperRequeue(ctx context.Context) (int, error)
 }
 
 // Sweeper re-queues deliveries whose lease has lapsed (D-6) under a single
@@ -52,8 +56,10 @@ func NewSweeper(st StoreRequeuer, opts SweeperOptions) *Sweeper {
 	if opts.Interval <= 0 {
 		opts.Interval = 5 * time.Second
 	}
-	if opts.WindowSeconds <= 0 {
-		opts.WindowSeconds = 10
+	if opts.Interval > MaxSweepInterval {
+		// D-6 is a ceiling, not an aspiration (FR-802's idiom): a slower tick
+		// would widen how long a crashed worker's delivery stays unclaimed.
+		opts.Interval = MaxSweepInterval
 	}
 	if opts.LockWait <= 0 {
 		opts.LockWait = 60 * time.Second
@@ -75,7 +81,7 @@ func (s *Sweeper) Run(ctx context.Context) error {
 		return err
 	}
 	defer release()
-	s.log.Info("sweeper started", "interval_ms", s.opts.Interval.Milliseconds(), "window_s", s.opts.WindowSeconds)
+	s.log.Info("sweeper started", "interval_ms", s.opts.Interval.Milliseconds())
 
 	ticker := time.NewTicker(s.opts.Interval)
 	defer ticker.Stop()
@@ -84,7 +90,7 @@ func (s *Sweeper) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if n, err := s.store.SweeperRequeue(ctx, s.opts.WindowSeconds); err != nil {
+			if n, err := s.store.SweeperRequeue(ctx); err != nil {
 				s.log.Warn("sweeper: requeue failed", "error", err)
 			} else if n > 0 {
 				s.log.Info("sweeper: re-queued expired leases", "requeued", n)

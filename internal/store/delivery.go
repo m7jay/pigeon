@@ -157,11 +157,15 @@ func (s *Store) RequeueDelivery(ctx context.Context, deliveryID int64, backoff t
 	})
 }
 
-// SweeperRequeue re-queues every delivery whose lease has lapsed within the last
-// windowSeconds (D-6) and returns how many it touched, so the operator alerter
-// can raise on a cluster that recovered a burst of crashed-worker deliveries.
-func (s *Store) SweeperRequeue(ctx context.Context, windowSeconds int) (int, error) {
-	rows, err := s.pool.Query(ctx, `select pigeon_sweeper_requeue($1)`, windowSeconds)
+// SweeperRequeue re-queues ANY delivery whose lease has lapsed (D-6) and returns
+// how many it touched, so the operator alerter can raise on a cluster that
+// recovered a burst of crashed-worker deliveries. There is no lower bound on how
+// long ago the lease lapsed: a lease that expired while no sweep was running (a
+// leadership move, a stalled tick) is exactly the case D-6 exists for, and it must
+// never be left for the worker's opportunistic claim loop to find by accident. A
+// retry's backoff lease is always in the future, so it is never touched.
+func (s *Store) SweeperRequeue(ctx context.Context) (int, error) {
+	rows, err := s.pool.Query(ctx, `select pigeon_sweeper_requeue()`)
 	if err != nil {
 		return 0, fmt.Errorf("sweeper requeue: %w", err)
 	}

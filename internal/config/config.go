@@ -16,6 +16,12 @@ import (
 	"time"
 )
 
+// maxSweeperInterval is D-6's ceiling on the sweep cadence: a lease that has
+// lapsed must be re-queued within 10 s. internal/delivery enforces the same
+// ceiling in NewSweeper (delivery.MaxSweepInterval); it is repeated here rather
+// than imported so the config package stays a leaf.
+const maxSweeperInterval = 10 * time.Second
+
 // Config is the whole runtime configuration. There are no flags and no config
 // files: environment only, per OPS-3.
 type Config struct {
@@ -65,8 +71,7 @@ type Config struct {
 	DeliveryMaxConnsPerHost int           // PIGEON_DELIVERY_MAX_CONNS_PER_HOST (FR-817)
 	DeliveryPollInterval    time.Duration // PIGEON_DELIVERY_POLL_INTERVAL
 	DeliveryUserAgent       string        // PIGEON_DELIVERY_USER_AGENT (FR-810)
-	SweeperInterval         time.Duration // PIGEON_SWEEPER_INTERVAL (<= 10 s, D-6)
-	SweeperWindowSeconds    int           // PIGEON_SWEEPER_WINDOW_SECONDS (D-6)
+	SweeperInterval         time.Duration // PIGEON_SWEEPER_INTERVAL (<= 10 s, D-6; clamped in Load)
 	SweeperLockURL          string        // PIGEON_SWEEPER_LOCK_URL (defaults to DatabaseURL)
 	SweeperLockWait         time.Duration // PIGEON_SWEEPER_LOCK_WAIT
 
@@ -105,7 +110,6 @@ func defaults() Config {
 		DeliveryMaxConnsPerHost:   1,
 		DeliveryPollInterval:      time.Second,
 		SweeperInterval:           5 * time.Second,
-		SweeperWindowSeconds:      10,
 		SweeperLockWait:           60 * time.Second,
 	}
 }
@@ -185,9 +189,6 @@ func Load() (Config, error) {
 	if c.SweeperInterval, err = envDuration("PIGEON_SWEEPER_INTERVAL", c.SweeperInterval); err != nil {
 		return Config{}, err
 	}
-	if c.SweeperWindowSeconds, err = envInt("PIGEON_SWEEPER_WINDOW_SECONDS", c.SweeperWindowSeconds); err != nil {
-		return Config{}, err
-	}
 	c.SweeperLockURL = env("PIGEON_SWEEPER_LOCK_URL", c.SweeperLockURL)
 	if c.SweeperLockWait, err = envDuration("PIGEON_SWEEPER_LOCK_WAIT", c.SweeperLockWait); err != nil {
 		return Config{}, err
@@ -196,6 +197,13 @@ func Load() (Config, error) {
 	// receiver that cannot acknowledge inside it is treated as unavailable.
 	if c.DeliveryTimeout > 5*time.Second {
 		c.DeliveryTimeout = 5 * time.Second
+	}
+	// D-6: the sweeper MUST re-queue any lease that has lapsed within 10 s, so its
+	// cadence is a ceiling in the same sense — a slower tick silently widens how
+	// long a crashed worker's delivery stays unclaimed. It is clamped rather than
+	// rejected so one careless env var cannot void a P0 requirement.
+	if c.SweeperInterval > maxSweeperInterval {
+		c.SweeperInterval = maxSweeperInterval
 	}
 	// The sweeper's leadership-lock connection defaults to the runtime DSN.
 	if c.SweeperLockURL == "" {
@@ -258,6 +266,9 @@ func (c Config) Validate() error {
 	}
 	if c.DeliveryMaxAttempts < 1 {
 		problems = append(problems, "PIGEON_DELIVERY_MAX_ATTEMPTS must be >= 1")
+	}
+	if c.DeliveryMaxBodyBytes < 0 {
+		problems = append(problems, "PIGEON_DELIVERY_MAX_BODY_BYTES must be >= 0 (0 disables capture, SB-4)")
 	}
 	if c.DeliveryMaxConnsPerHost < 1 {
 		problems = append(problems, "PIGEON_DELIVERY_MAX_CONNS_PER_HOST must be >= 1 (FR-817)")
