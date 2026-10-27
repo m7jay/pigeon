@@ -121,7 +121,8 @@ jobs:
             TestComposeSplitsTheMigratorFromTheRuntimeRole \
             TestConsumerPortalSelfService \
             TestConsumerPortalForeignResourcesAreNotFound \
-            TestConsumerPortalSubscribableGate
+            TestConsumerPortalSubscribableGate \
+            TestCoreDoesNotDependOnThePortal
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
