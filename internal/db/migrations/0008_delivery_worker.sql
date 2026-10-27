@@ -277,17 +277,19 @@ as $$
 $$;
 
 -- ---------------------------------------------------------------------------
--- Sweeper (D-6): re-queue every delivery whose lease has lapsed within the last
--- p_window_seconds, so a crashed worker costs one lease interval, not a lost
--- delivery. A lapsed-lease pending row is already claimable; the sweeper stamps
--- its lease to now() (a durable "re-queued at this time" marker) and returns the
--- ids of the rows it touched, so the caller counts them for the operator
--- alerter. It is the guaranteed path: the worker claim loop is opportunistic,
--- this runs on a fixed cadence ≤ the D-6 window. It returns a set (not a scalar
--- count) so an empty result is zero rows, not a null, and the count is exact no
--- matter how many rows were recovered in one sweep.
+-- Sweeper (D-6): re-queue EVERY delivery whose lease has lapsed, so a crashed
+-- worker costs one lease interval, not a lost delivery. "Any" is literal: a lease
+-- that lapsed while no sweep was running (a leadership move, a stalled tick) is
+-- the case the requirement exists for, so there is no lookback bound here. A
+-- retry's backoff lease is in the future, so a requeued row is never clobbered.
+-- The sweeper stamps the lease to now() (a durable "re-queued at this time"
+-- marker) and returns the ids of the rows it touched, so the caller counts them
+-- for the operator alerter. It is the guaranteed path: the worker claim loop is
+-- opportunistic, this runs on a fixed cadence clamped to the D-6 10 s ceiling. It
+-- returns a set (not a scalar count) so an empty result is zero rows, not a null,
+-- and the count is exact no matter how many rows were recovered in one sweep.
 -- ---------------------------------------------------------------------------
-create or replace function pigeon_sweeper_requeue(p_window_seconds int default 10)
+create or replace function pigeon_sweeper_requeue()
     returns setof bigint
     language sql
     security definer
@@ -297,7 +299,6 @@ as $$
     set lease_expires_at = now()
     where status = 'pending'
       and lease_expires_at < now()
-      and lease_expires_at > now() - make_interval(secs => p_window_seconds)
     returning id;
 $$;
 
@@ -309,4 +310,4 @@ grant execute on function pigeon_record_attempt(bigint,int,text,text,int,text,in
 grant execute on function pigeon_complete_delivery(bigint,int,timestamptz,timestamptz) to current_user;
 grant execute on function pigeon_finalize_delivery(bigint,int,timestamptz) to current_user;
 grant execute on function pigeon_requeue_delivery(bigint,interval) to current_user;
-grant execute on function pigeon_sweeper_requeue(int) to current_user;
+grant execute on function pigeon_sweeper_requeue() to current_user;

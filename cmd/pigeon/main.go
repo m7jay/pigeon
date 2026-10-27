@@ -170,9 +170,9 @@ func run() error {
 	// a per-attempt timeout with no redirect following, classifies the outcome,
 	// and writes ONLY the completion / terminal transition plus one evidence row
 	// per failed attempt (a successful first attempt writes no attempt row,
-	// FR-811). The sweeper re-queues expired leases within the D-6 window under a
-	// single advisory-lock leaseholder (D-7). Both stop on ctx cancellation and
-	// let in-flight work drain (AC-21).
+	// FR-811). The sweeper re-queues any lease that has lapsed within the D-6 10 s
+	// ceiling under a single advisory-lock leaseholder (D-7). Both stop on ctx
+	// cancellation and let in-flight work drain (AC-21).
 	workersWG := &sync.WaitGroup{}
 	if cfg.DeliveryWorkers > 0 {
 		dw := delivery.New(st, delivery.Options{
@@ -198,16 +198,15 @@ func run() error {
 		}()
 
 		sw := delivery.NewSweeper(st, delivery.SweeperOptions{
-			URL:           cfg.SweeperLockURL,
-			Interval:      cfg.SweeperInterval,
-			WindowSeconds: cfg.SweeperWindowSeconds,
-			LockWait:      cfg.SweeperLockWait,
-			Logger:        log,
+			URL:      cfg.SweeperLockURL,
+			Interval: cfg.SweeperInterval,
+			LockWait: cfg.SweeperLockWait,
+			Logger:   log,
 		})
 		workersWG.Add(1)
 		go func() {
 			defer workersWG.Done()
-			log.Info("sweeper started", "interval_s", int(cfg.SweeperInterval.Seconds()), "window_s", cfg.SweeperWindowSeconds)
+			log.Info("sweeper started", "interval_s", int(cfg.SweeperInterval.Seconds()))
 			if err := sw.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Error("sweeper stopped unexpectedly", "error", err)
 			}
