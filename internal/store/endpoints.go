@@ -71,13 +71,18 @@ type EndpointCreated struct {
 const whsecPrefix = "whsec_"
 
 // createEndpointSecret mints a fresh signing secret and its hint. 32 bytes of
-// entropy, base64url, prefixed whsec_ so secret scanners can find a leaked one.
+// entropy, base64 with the STANDARD alphabet, prefixed whsec_ so secret scanners
+// can find a leaked one. The alphabet matters: a spec verifier decodes the value
+// after "whsec_" with a standard decoder, which does not fail on the URL-safe
+// "-"/"_" — it drops those bytes and derives a short key, so a URL-safe secret
+// would verify for roughly one endpoint in four. Unpadded, because the padding
+// carries no entropy and SecretBytes restores it.
 func createEndpointSecret() (secret, hint string, err error) {
 	raw := make([]byte, 32)
 	if _, err = rand.Read(raw); err != nil {
 		return "", "", fmt.Errorf("read entropy: %w", err)
 	}
-	secret = whsecPrefix + base64.RawURLEncoding.EncodeToString(raw)
+	secret = whsecPrefix + base64.RawStdEncoding.EncodeToString(raw)
 	if len(secret) > 16 {
 		hint = secret[:16]
 	} else {
