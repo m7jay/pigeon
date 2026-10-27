@@ -18,10 +18,25 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/m7jay/pigeon/internal/attemptbuf"
+	"github.com/m7jay/pigeon/internal/metrics"
 	"github.com/m7jay/pigeon/internal/store"
 )
+
+// The two D-2 attempt-log modes, as the worker names them. They are string
+// constants rather than a bool so a config value can be passed through
+// unchanged, and so an unknown value is visible at the boundary.
+const (
+	AttemptLogSync     = "sync"
+	AttemptLogBuffered = "buffered"
+)
+
+// defaultSuccessLogRPS is LOG-2's bound: above 100 successful deliveries a
+// second the success path increments counters instead of writing a line each.
+const defaultSuccessLogRPS = 100
 
 // Options configures a Worker. Zero values take their documented defaults, with
 // one exception: MaxBodyBytes's 0 is a meaningful setting ("capture nothing",
@@ -62,6 +77,25 @@ type Options struct {
 	// UserAgent identifies the platform (FR-810), e.g. "pigeon/1.0".
 	UserAgent string
 	Logger    *slog.Logger
+
+	// AttemptLog is D-2's mode: AttemptLogSync writes every attempt inline,
+	// AttemptLogBuffered pushes it to AttemptBuffer for the flusher to drain in
+	// batches (D-1, FR-815). The zero value is sync, so a Worker built without
+	// this option behaves exactly as S4 did; main passes the configured mode,
+	// whose default is buffered.
+	AttemptLog string
+	// AttemptBuffer is the Redis-side buffer (D-1). It is required by
+	// AttemptLogBuffered: a buffered worker with no buffer would be holding
+	// evidence in process memory, which is the failure mode D-1 exists to
+	// prevent, so such a worker writes inline and says so once instead.
+	AttemptBuffer *attemptbuf.Buffer
+	// Metrics carries the counters that replace per-success log lines (LOG-2,
+	// AC-33) and the delivery outcome counts.
+	Metrics *metrics.Metrics
+	// SuccessLogRPS bounds per-success log lines (LOG-2). 0 selects the default
+	// of 100; a negative value means "no gate" — every success logs, which is
+	// only sensible below a few hundred deliveries a second.
+	SuccessLogRPS int
 }
 
 // Worker leases, signs, and delivers deliveries. Safe to construct once and Run
@@ -71,6 +105,13 @@ type Worker struct {
 	opts    Options
 	log     *slog.Logger
 	clients *transportCache
+	metrics *metrics.Metrics
+	gate    *successLogGate
+
+	// noBufferLogged makes the "buffered mode without a buffer" warning a
+	// one-time event instead of one line per attempt (which would itself violate
+	// LOG-2, by hand).
+	noBufferLogged atomic.Bool
 }
 
 // New builds a Worker. A nil logger is replaced rather than panicked on.
@@ -111,12 +152,24 @@ func New(st *store.Store, opts Options) *Worker {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	return &Worker{
+	w := &Worker{
 		store:   st,
 		opts:    opts,
 		log:     opts.Logger,
 		clients: newTransportCache(opts.MaxConnsPerHost),
+		metrics: opts.Metrics,
 	}
+	// LOG-2's gate. A negative SuccessLogRPS is the explicit "log every success"
+	// escape hatch (only sensible below a few hundred deliveries a second); 0
+	// takes the requirement's default of 100.
+	if opts.SuccessLogRPS >= 0 {
+		rps := opts.SuccessLogRPS
+		if rps == 0 {
+			rps = defaultSuccessLogRPS
+		}
+		w.gate = newSuccessLogGate(rps, w.metrics)
+	}
+	return w
 }
 
 // Run starts the worker pool and blocks until ctx is cancelled, then drains: the
@@ -182,10 +235,11 @@ func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
 }
 
 // handle runs one delivery's attempt end to end. attemptNum is the 1-based number
-// for this attempt (AC-07): prior_attempts + 1, which equals NextAttempt because
-// attempt numbers are contiguous from 1.
+// for this attempt (AC-07): NextAttemptNumber combines the delivery row's counter
+// with the evidence-row count, so it stays correct while the previous attempt's
+// row is still in the Redis buffer (D-2).
 func (w *Worker) handle(ctx context.Context, d store.LeasedDelivery) {
-	attemptNum := d.PriorAttempts + 1
+	attemptNum := d.NextAttemptNumber()
 	attemptStart := time.Now()
 	first := firstAttemptOf(d, attemptStart)
 
@@ -218,12 +272,16 @@ func (w *Worker) handle(ctx context.Context, d store.LeasedDelivery) {
 		w.complete(ctx, d, attemptNum, first, duration)
 		return
 	}
-	w.fail(ctx, d, attemptNum, first, duration, res)
+	w.fail(ctx, d, attemptNum, first, attemptStart, duration, res)
 }
 
 // complete records the successful attempt: the four columns FR-811 promises, and
 // no attempt row (AC-28). A failed write leaves the delivery pending so it is
 // retried rather than lost.
+//
+// The success log line is gated (LOG-2): below SuccessLogRPS every success logs,
+// above it the counter advances and the line is suppressed. The counter advances
+// either way, so the volume the log line would have carried is never lost.
 func (w *Worker) complete(ctx context.Context, d store.LeasedDelivery, attempts int, first time.Time, duration time.Duration) {
 	done, err := w.store.CompleteDelivery(ctx, d.DeliveryID, attempts, first, time.Now())
 	if err != nil {
@@ -231,24 +289,45 @@ func (w *Worker) complete(ctx context.Context, d store.LeasedDelivery, attempts 
 			"delivery_id", d.DeliveryID, "error", err)
 		return
 	}
-	if done {
+	if !done {
+		// Another worker had already taken this row out of pending: not a
+		// success to count, and not a failure either.
+		w.log.Debug("delivery: completion was already recorded; nothing to do",
+			"delivery_id", d.DeliveryID, "attempts", attempts)
+		return
+	}
+	w.metrics.Inc(metrics.DeliveriesDelivered)
+	if w.gate.allow() {
 		w.log.Info("delivery delivered",
 			"delivery_id", d.DeliveryID, "attempts", attempts, "duration_ms", duration.Milliseconds())
 	}
 }
 
-// fail records the failed attempt as evidence (FR-804), then either re-leases the
-// delivery for its backoff (a retryable failure with budget left) or ends it
-// terminally (FR-806, or the retry budget is spent). A failed evidence write
-// stops short of advancing the delivery, so the attempt is redone on the next
-// lease rather than silently dropped.
-func (w *Worker) fail(ctx context.Context, d store.LeasedDelivery, attemptNum int, first time.Time, duration time.Duration, res attemptResult) {
+// fail records the failed attempt, then either re-leases the delivery for its
+// backoff (a retryable failure with budget left) or ends it terminally (FR-806,
+// or the retry budget is spent).
+//
+// The order is control first, evidence second, and that is deliberate:
+//
+//   - The control write is the one §6 promises cannot be lost, and it is also
+//     what advances the delivery's attempt counter (D-2). Writing it first means
+//     a crash between the two writes leaves a delivery with a correct state and a
+//     missing evidence row — the loss §6 already declares acceptable — instead of
+//     an evidence row whose attempt number the next attempt could reuse.
+//   - A failed control write writes no evidence at all: the delivery keeps its
+//     lease, the sweeper re-queues it (D-6), and the attempt is redone under the
+//     same number.
+//
+// Evidence then goes to the Redis buffer (D-1) in buffered mode, or inline in
+// sync mode (D-2). Both paths are best-effort by contract, and both are counted.
+func (w *Worker) fail(ctx context.Context, d store.LeasedDelivery, attemptNum int, first, attemptStart time.Time, duration time.Duration, res attemptResult) {
 	retryable := res.outcome == outcomeRetry
 	budgetLeft := attemptNum < w.opts.MaxAttempts
+	retryNow := retryable && budgetLeft
 
 	var nextRetry *time.Time
 	var backoff time.Duration
-	if retryable && budgetLeft {
+	if retryNow {
 		backoff = backoffFor(w.opts.BackoffBase, w.opts.BackoffMax, attemptNum, res.retryAfter)
 		t := time.Now().Add(backoff)
 		nextRetry = &t
@@ -271,19 +350,18 @@ func (w *Worker) fail(ctx context.Context, d store.LeasedDelivery, attemptNum in
 		ResponseBody:   res.body,
 		DurationMs:     int(duration.Milliseconds()),
 		NextRetryAt:    nextRetry,
-	}
-	if err := w.store.RecordAttempt(ctx, rec); err != nil {
-		w.log.Error("delivery: record attempt failed; attempt will be redone on next lease",
-			"delivery_id", d.DeliveryID, "attempt", attemptNum, "error", err)
-		return
+		OccurredAt:     attemptStart,
 	}
 
-	if retryable && budgetLeft {
-		if err := w.store.RequeueDelivery(ctx, d.DeliveryID, backoff); err != nil {
+	if retryNow {
+		if err := w.store.RequeueDelivery(ctx, d.DeliveryID, backoff, attemptNum); err != nil {
 			w.log.Error("delivery: requeue failed; delivery left for the sweeper (D-6)",
-				"delivery_id", d.DeliveryID, "error", err)
+				"delivery_id", d.DeliveryID, "attempt", attemptNum, "error", err)
 			return
 		}
+		w.metrics.Inc(metrics.DeliveriesRetried)
+		w.recordAttempt(ctx, rec)
+		// LOG-2: a failure always logs at warn, gated or not.
 		w.log.Warn("delivery attempt failed; will retry",
 			"delivery_id", d.DeliveryID, "attempt", attemptNum, "status", res.status,
 			"class", res.errorClass, "backoff_ms", backoff.Milliseconds())
@@ -295,12 +373,53 @@ func (w *Worker) fail(ctx context.Context, d store.LeasedDelivery, attemptNum in
 	done, err := w.store.FinalizeDelivery(ctx, d.DeliveryID, attemptNum, first)
 	if err != nil {
 		w.log.Error("delivery: finalize failed; delivery left pending for retry",
-			"delivery_id", d.DeliveryID, "error", err)
+			"delivery_id", d.DeliveryID, "attempt", attemptNum, "error", err)
 		return
 	}
 	if done {
+		w.metrics.Inc(metrics.DeliveriesFailedTerminal)
+	}
+	w.recordAttempt(ctx, rec)
+	if done {
 		w.log.Warn("delivery terminally failed",
 			"delivery_id", d.DeliveryID, "attempts", attemptNum, "status", res.status, "class", res.errorClass)
+	}
+}
+
+// recordAttempt writes one attempt's evidence, through the Redis buffer in
+// buffered mode and inline otherwise (D-1, D-2).
+//
+// A buffer push that fails is not dropped: the row is written inline instead, so
+// a Redis outage costs throughput rather than evidence. That degradation is
+// logged once per failure at warn, because it is a real state transition
+// (LOG-2) and an operator needs to see it.
+func (w *Worker) recordAttempt(ctx context.Context, rec store.AttemptRecord) {
+	if w.opts.AttemptLog == AttemptLogBuffered {
+		if w.opts.AttemptBuffer == nil {
+			if w.noBufferLogged.CompareAndSwap(false, true) {
+				w.log.Error("delivery: attempt_log.mode=buffered with no Redis buffer configured; writing attempt evidence inline (D-1)")
+			}
+		} else {
+			switch err := w.opts.AttemptBuffer.Push(ctx, rec); {
+			case err == nil:
+				w.metrics.Inc(metrics.AttemptsBuffered)
+				return
+			default:
+				if ctx.Err() != nil {
+					// Shutdown: the attempt was aborted, so there is nothing to
+					// record and no reason to write it inline either.
+					return
+				}
+				w.log.Warn("delivery: buffering the attempt failed; writing it inline instead (evidence keeps flowing, throughput does not)",
+					"delivery_id", rec.DeliveryID, "attempt", rec.Attempt, "error", err)
+			}
+		}
+	}
+	if err := w.store.RecordAttempt(ctx, rec); err != nil {
+		// The delivery state is already correct, so this is the bounded evidence
+		// loss §6 allows, not a lost attempt.
+		w.log.Error("delivery: recording the attempt inline failed; the delivery state is already advanced",
+			"delivery_id", rec.DeliveryID, "attempt", rec.Attempt, "error", err)
 	}
 }
 
