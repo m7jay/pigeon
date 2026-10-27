@@ -1,11 +1,13 @@
-BINARY  := bin/pigeon
-VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X main.version=$(VERSION)
+BINARY     := bin/pigeon
+PORTAL     := bin/consumer-portal
+VERSION    := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS    := -s -w -X main.version=$(VERSION)
 
-.PHONY: build test test-integration vet lint run compose-up compose-down migrate-check clean
+.PHONY: build test test-integration vet lint run run-portal compose-up compose-down migrate-check clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/pigeon
+	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(PORTAL) ./cmd/consumer-portal
 
 test:
 	go test ./...
@@ -25,7 +27,12 @@ lint: vet
 	@command -v golangci-lint >/dev/null && golangci-lint run ./... || echo "golangci-lint not installed; ran vet only"
 
 run:
-	go run ./cmd/pigeon
+	CGO_ENABLED=0 go run ./cmd/pigeon
+
+# Run the consumer portal locally. It needs a reachable core and a session secret;
+# sensible local defaults are used when the env is unset.
+run-portal:
+	CGO_ENABLED=0 PIGEON_CORE_API_URL=$${PIGEON_CORE_API_URL:-http://localhost:8080} PORTAL_SESSION_SECRET=$${PORTAL_SESSION_SECRET:-dev-insecure-secret} go run ./cmd/consumer-portal
 
 compose-up:
 	docker compose up -d --build
