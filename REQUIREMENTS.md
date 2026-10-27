@@ -925,18 +925,17 @@ session cookie's lifetime is the core session's own expiry, read from the login
 response's `expires_at`: a portal MUST NOT hold a session longer than the token it
 carries, and MUST NOT keep a second TTL constant of its own (AC-49, AC-50, AC-51).
 
-**How this relates to `docs/spec-gap-closure`** (approved at `78dcf43`, not yet
-merged). That amendment adds FR-112, FR-113 and AC-47: FR-112 cites FR-1009 for the
-session cookie's flags, and AC-47 asserts the consumer-portal end-to-end path - the
-*session* cookie's flags, a mutation without a CSRF token rejected, revocation inside
-5 s. AC-49 and AC-50 here are the shared invariant AC-47 does not state (every portal
-cookie, every state-changing `POST`, both portals, the anonymous routes included) and
-AC-51 is the lifetime leg AC-47 does not cover, so the three complement AC-47 rather
-than restate it. They take the next free ids because AC-44…AC-48 are defined by that
-amendment: whichever of the two lands second keeps the other's numbers instead of
-taking them, and the merge of the two is where FR-113's "a CSRF token on mutations"
-(a portal-to-core call, a hop no CSRF attack traverses) is reconciled with this
-paragraph - S10 MUST NOT implement a second token beside this one.
+**How this relates to `docs/spec-gap-closure`**, which has landed and is the source of
+§16's AC-44…AC-48 and of FR-112/FR-113. FR-112 cites FR-1009 for the session cookie's
+flags, and AC-47 asserts the consumer-portal end-to-end path - the *session* cookie's
+flags, a mutation without a CSRF token rejected, revocation inside 5 s. AC-49 and AC-50
+here are the shared invariant AC-47 does not state (every portal cookie, every
+state-changing `POST`, both portals, the anonymous routes included) and AC-51 is the
+lifetime leg AC-47 does not cover, so the three complement AC-47 rather than restate it.
+FR-113's "a CSRF token on mutations" is the browser-to-portal token above and not a
+second token on the portal-to-core hop: the portal presents its bearer to the core and
+no CSRF token, because a CSRF attack does not traverse that hop - S10 MUST NOT implement
+a second token beside this one.
 
 ---
 
@@ -1028,10 +1027,11 @@ paragraph - S10 MUST NOT implement a second token beside this one.
 | AC-50 | A state-changing `POST` to a portal route - the anonymous `/login` and `/invite` included - with the CSRF token absent or not matching the session cookie: a cross-origin form, or a same-origin request with the hidden field stripped | `403` and no state change; the same `POST` carrying the token the page rendered succeeds |
 | AC-51 | Core `PIGEON_SESSION_TTL=24h`, then log in to a portal; repeat at `15m` | The session cookie's `Max-Age` is the 24 h / 15 m the core issued (from the login response's `expires_at`), not the 12 h constant the portal used to hardcode |
 
-AC-44…AC-48 are defined by `docs/spec-gap-closure` (approved, unmerged) - AC-47 is its
-consumer-session criterion and overlaps AC-49/AC-50 in scope; the three portal-security
-criteria appended here take the next free ids for that reason, so neither amendment
-renumbers the other.
+AC-44…AC-48 are defined above, by the gap amendment that landed as
+`docs/spec-gap-closure` - AC-47 is its consumer-session criterion and overlaps
+AC-49/AC-50 in scope; the three portal-security criteria take the ids after it for that
+reason, so §16's table reads as one contiguous AC-44…AC-51 block and no criterion
+restates another.
 
 ### 16.5 Fault injection matrix
 
@@ -1117,7 +1117,7 @@ Recorded so they are not relitigated in review.
 | Deployables | Three: core, producer portal, consumer portal | Different audiences, auth, branding and release cadence. Svix ships no portal in OSS and Hook0's themes stop at a logo, so this is the differentiator, and fusing them is what made the production portal internal-only. Portals are thin API consumers, so the core can run without either |
 | Transport, compute | Kafka and serverless both rejected | Argued once in §0.1; not restated here |
 | The six specification gaps | Closed, see `SPEC.md`'s amendments A-1…A-6 | Six places these requirements were silent, contradictory or untestable. Recorded with mechanism and trade-off so they are not re-argued per slice, and so a slice that needs one does not invent its own |
-| Portal session security (FR-1009) | `HttpOnly` + `Secure` + `SameSite=Lax` on every portal cookie; CSRF via a stateless HMAC double-submit token bound to the portal's own session cookie and verified on every state-changing `POST`, the anonymous `/login` and `/invite` included; the session cookie's lifetime is the core session's `expires_at`, with no portal-side TTL constant (AC-49…AC-51) | `SameSite=Lax` alone loses to Chrome's Lax+POST 2-minute window on a freshly set cookie and to any same-site sibling origin — and UI-19 puts the consumer portal on the producer's own domain, where such siblings exist. A `PORTAL_SESSION_TTL` knob would drift from `PIGEON_SESSION_TTL` and re-create the cookie-outlives-token mismatch this decision removes. The token costs no server storage because the portal renders its own form server-side and can HMAC the nonce under the cookie secret it already holds. AC-47 (gap A-5, unmerged) already asserts the consumer session cookie's flags and the CSRF rejection, so AC-49/AC-50 state the shared invariant and AC-51 the lifetime leg it lacks instead of restating it; A-5's `csrf_secret` on the session record would put a second token on the portal-to-core hop, which no CSRF attack traverses - that is reconciled when the two amendments merge, not implemented as a second mechanism |
+| Portal session security (FR-1009) | `HttpOnly` + `Secure` + `SameSite=Lax` on every portal cookie; CSRF via a stateless HMAC double-submit token bound to the portal's own session cookie and verified on every state-changing `POST`, the anonymous `/login` and `/invite` included; the session cookie's lifetime is the core session's `expires_at`, with no portal-side TTL constant (AC-49…AC-51) | `SameSite=Lax` alone loses to Chrome's Lax+POST 2-minute window on a freshly set cookie and to any same-site sibling origin — and UI-19 puts the consumer portal on the producer's own domain, where such siblings exist. A `PORTAL_SESSION_TTL` knob would drift from `PIGEON_SESSION_TTL` and re-create the cookie-outlives-token mismatch this decision removes. The token costs no server storage because the portal renders its own form server-side and can HMAC the nonce under the cookie secret it already holds. AC-47 (gap A-5) already asserts the consumer session cookie's flags and the CSRF rejection, so AC-49/AC-50 state the shared invariant and AC-51 the lifetime leg it lacks instead of restating it; A-5's `csrf_secret` on the session record would have put a second token on the portal-to-core hop, which no CSRF attack traverses, so A-5's mechanism no longer carries one and FR-113 names this single browser-to-portal token - not a second mechanism |
 
 ---
 
