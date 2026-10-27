@@ -1,0 +1,54 @@
+{{/* Fragments: rendered without the page layout, swapped in place by htmx. Each
+     reads the same view models the content templates use. */}}
+
+{{define "frag:endpoints/list"}}
+{{if .Endpoints}}
+<table class="data-table">
+  <thead><tr><th>Name</th><th>URL</th><th>Status</th><th>Verified</th><th>Actions</th></tr></thead>
+  <tbody id="endpoints-list">
+  {{range .Endpoints}}
+    <tr>
+      <td><a href="/endpoints/{{.ID}}">{{.Name}}</a></td>
+      <td class="mono muted">{{.URL}}</td>
+      <td>{{template "badge" .Status}}</td>
+      <td>{{if .Verified}}{{template "badge" "active"}}{{else}}{{template "badge" "unverified"}}{{end}}</td>
+      <td class="row-actions">
+        <a class="btn btn-sm btn-secondary" href="/endpoints/{{.ID}}">View</a>
+        <form hx-post="/endpoints/{{.ID}}/{{if .Paused}}resume{{else}}pause{{end}}" hx-target="#endpoints-list" hx-swap="outerHTML">
+          <button class="btn btn-sm" type="submit">{{if .Paused}}Resume{{else}}Pause{{end}}</button>
+        </form>
+        <form hx-post="/endpoints/{{.ID}}/delete" hx-target="#endpoints-list" hx-swap="outerHTML" hx-confirm="Delete this endpoint?">
+          <button class="btn btn-sm btn-danger" type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">No endpoints yet. Register one above.</p>
+{{end}}
+{{end}}
+
+{{define "frag:subs/list"}}
+{{if .}}
+<table class="data-table">
+  <thead><tr><th>Event type</th><th>Status</th><th>Actions</th></tr></thead>
+  <tbody id="subs-list">
+  {{range .}}
+    <tr>
+      <td class="mono">{{.EventType}}</td>
+      <td>{{template "badge" .Status}}</td>
+      <td>
+        <form hx-post="/endpoints/{{.EndpointID}}/subscriptions/{{.EventType}}/delete" hx-target="#subs-list" hx-swap="outerHTML">
+          <button class="btn btn-sm btn-danger" type="submit">Opt out</button>
+        </form>
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">Not subscribed to any event type on this endpoint yet.</p>
+{{end}}
+{{end}}

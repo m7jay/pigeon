@@ -1,0 +1,32 @@
+{{define "content"}}
+<h1>Your endpoints</h1>
+<p class="page-sub">Register where events are delivered, verify ownership, and choose which event types each endpoint subscribes to (UI-13, UI-14).</p>
+
+{{if .Data.Created}}
+<div class="notice">
+  <strong>Endpoint created.</strong> Copy your signing secret and verification token now — the secret is shown exactly once and cannot be retrieved again.
+  <div class="kv" style="margin-top:0.5rem">
+    <dt>Signing secret</dt><dd class="mono">{{.Data.Created.Secret}}</dd>
+    <dt>Verification token</dt><dd class="mono">{{.Data.Created.VerificationToken}}</dd>
+  </div>
+  <form method="post" action="/endpoints/{{.Data.Created.ID}}/verify" class="inline" style="margin-top:0.5rem">
+    <input type="hidden" name="token" value="{{.Data.Created.VerificationToken}}">
+    <button class="btn btn-sm" type="submit">Verify now</button>
+  </form>
+</div>
+{{end}}
+
+<div class="card">
+  <h2>Register an endpoint</h2>
+  <form method="post" action="/endpoints">
+    <div class="form-row"><label for="name">Name</label><input id="name" type="text" name="name" required placeholder="production webhook"></div>
+    <div class="form-row"><label for="url">URL</label><input id="url" type="url" name="url" required placeholder="https://you.example.com/hooks"></div>
+    <button class="btn" type="submit">Register</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Endpoints</h2>
+  {{template "frag:endpoints/list" .Data}}
+</div>
+{{end}}

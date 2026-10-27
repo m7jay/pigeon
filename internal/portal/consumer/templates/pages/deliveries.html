@@ -1,0 +1,11 @@
+{{define "content"}}
+<h1>Delivery log</h1>
+<p class="page-sub">Your deliveries, scoped to your own consumer (UI-15), with replay bounded by the same limits as the API (UI-16).</p>
+<div class="notice">
+  The delivery inspect and replay API is a separate slice and is not live on this
+  instance yet. When it is, this page will list your consumer's deliveries with
+  attempt detail and a replay control, and nothing here will change — the portal
+  only ever calls endpoints the API also exposes. Until then there is no
+  delivery data to show.
+</div>
+{{end}}
