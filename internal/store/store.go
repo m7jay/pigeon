@@ -19,6 +19,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -104,10 +106,19 @@ func (p Principal) Scope() Scope { return Scope{ProducerID: p.ProducerID, Env: p
 // fail closed, which is safe but useless).
 type Store struct {
 	pool *pgxpool.Pool
+
+	// ensured caches which daily partitions this process has already confirmed
+	// exist, so fan-out does not call the partition DDL primitive once per event
+	// (SB-1). Entries expire quickly; the sweeper keeps partitions created ahead,
+	// so a miss here is the rare backlog case, not the common path.
+	ensureMu sync.Mutex
+	ensured  map[string]time.Time
 }
 
 // New wraps a pool. A nil pool is a programming error, not a runtime condition.
-func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+func New(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool, ensured: map[string]time.Time{}}
+}
 
 // Pool exposes the pool for the few callers that run their own transaction
 // (migrations, readiness probes). It is not a licence to write SQL elsewhere:
