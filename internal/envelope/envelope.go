@@ -10,19 +10,21 @@ package envelope
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
 )
 
-// hmac256 is the Standard Webhooks primitive: HMAC-SHA256 over the signed
+// hmac256 is the Standard Webhooks primitive: base64(HMAC-SHA256) over the signed
 // content. Kept local so the verifier (in the consumer portal, S2b) and this
-// signer use the identical construction.
+// signer use the identical construction. The Standard Webhooks spec renders the
+// digest as base64, not hex — hex would not verify against a real consumer.
 func hmac256(secret, content []byte) string {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(content)
-	return hex.EncodeToString(mac.Sum(nil))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
 
 // Envelope is §10 exactly. Fields map one-to-one to the documented shape; the
