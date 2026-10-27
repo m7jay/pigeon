@@ -14,11 +14,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/m7jay/pigeon/internal/broker"
 	"github.com/m7jay/pigeon/internal/config"
 	"github.com/m7jay/pigeon/internal/db"
+	"github.com/m7jay/pigeon/internal/delivery"
 	"github.com/m7jay/pigeon/internal/httpapi"
 	"github.com/m7jay/pigeon/internal/identity"
 	"github.com/m7jay/pigeon/internal/metrics"
@@ -161,6 +163,57 @@ func run() error {
 	}
 
 	errCh := make(chan error, 1)
+
+	// S4: the delivery worker and its sweeper. The worker drains the deliveries
+	// table directly, the way the relay drains the outbox: it leases a due
+	// delivery, signs the envelope with the endpoint's own secret, POSTs it under
+	// a per-attempt timeout with no redirect following, classifies the outcome,
+	// and writes ONLY the completion / terminal transition plus one evidence row
+	// per failed attempt (a successful first attempt writes no attempt row,
+	// FR-811). The sweeper re-queues expired leases within the D-6 window under a
+	// single advisory-lock leaseholder (D-7). Both stop on ctx cancellation and
+	// let in-flight work drain (AC-21).
+	workersWG := &sync.WaitGroup{}
+	if cfg.DeliveryWorkers > 0 {
+		dw := delivery.New(st, delivery.Options{
+			Workers:         cfg.DeliveryWorkers,
+			Lease:           cfg.DeliveryLease,
+			Timeout:         cfg.DeliveryTimeout,
+			MaxBodyBytes:    cfg.DeliveryMaxBodyBytes,
+			BackoffBase:     cfg.DeliveryBackoffBase,
+			BackoffMax:      cfg.DeliveryBackoffMax,
+			MaxAttempts:     cfg.DeliveryMaxAttempts,
+			MaxConnsPerHost: cfg.DeliveryMaxConnsPerHost,
+			PollInterval:    cfg.DeliveryPollInterval,
+			UserAgent:       "pigeon/" + version,
+			Logger:          log,
+		})
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			log.Info("delivery worker started", "workers", cfg.DeliveryWorkers)
+			if err := dw.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("delivery worker stopped unexpectedly", "error", err)
+			}
+		}()
+
+		sw := delivery.NewSweeper(st, delivery.SweeperOptions{
+			URL:           cfg.SweeperLockURL,
+			Interval:      cfg.SweeperInterval,
+			WindowSeconds: cfg.SweeperWindowSeconds,
+			LockWait:      cfg.SweeperLockWait,
+			Logger:        log,
+		})
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			log.Info("sweeper started", "interval_s", int(cfg.SweeperInterval.Seconds()), "window_s", cfg.SweeperWindowSeconds)
+			if err := sw.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("sweeper stopped unexpectedly", "error", err)
+			}
+		}()
+	}
+
 	go func() {
 		log.Info("core listening", "addr", cfg.HTTPAddr, "version", version)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -182,6 +235,21 @@ func run() error {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("graceful shutdown: %w", err)
 	}
+
+	// D-3: the workers drain too. Each returns once its in-flight attempt unwinds
+	// (its context was cancelled with the parent, FR-819), so waiting here keeps
+	// AC-21 honest — a delivery mid-attempt is left pending under its lease rather
+	// than killed into a lost or half-written state. Bounded by the same grace.
+	if cfg.DeliveryWorkers > 0 {
+		done := make(chan struct{})
+		go func() { workersWG.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-shutdownCtx.Done():
+			log.Warn("shutdown grace elapsed before workers drained")
+		}
+	}
+
 	log.Info("stopped cleanly")
 	return nil
 }

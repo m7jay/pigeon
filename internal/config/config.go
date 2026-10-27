@@ -53,6 +53,23 @@ type Config struct {
 	CoreReplicas    int32 // PIGEON_CORE_REPLICAS
 	DBReservedConns int32 // PIGEON_DB_RESERVED_CONNS
 
+	// Delivery worker (S4) and sweeper. The timeout is capped at the FR-802 hard
+	// ceiling of 5 s in Load.
+	DeliveryWorkers         int           // PIGEON_DELIVERY_WORKERS (0 disables the worker)
+	DeliveryLease           time.Duration // PIGEON_DELIVERY_LEASE
+	DeliveryTimeout         time.Duration // PIGEON_DELIVERY_TIMEOUT (<= 5 s, FR-802)
+	DeliveryMaxBodyBytes    int           // PIGEON_DELIVERY_MAX_BODY_BYTES (FR-804)
+	DeliveryBackoffBase     time.Duration // PIGEON_DELIVERY_BACKOFF_BASE
+	DeliveryBackoffMax      time.Duration // PIGEON_DELIVERY_BACKOFF_MAX
+	DeliveryMaxAttempts     int           // PIGEON_DELIVERY_MAX_ATTEMPTS
+	DeliveryMaxConnsPerHost int           // PIGEON_DELIVERY_MAX_CONNS_PER_HOST (FR-817)
+	DeliveryPollInterval    time.Duration // PIGEON_DELIVERY_POLL_INTERVAL
+	DeliveryUserAgent       string        // PIGEON_DELIVERY_USER_AGENT (FR-810)
+	SweeperInterval         time.Duration // PIGEON_SWEEPER_INTERVAL (<= 10 s, D-6)
+	SweeperWindowSeconds    int           // PIGEON_SWEEPER_WINDOW_SECONDS (D-6)
+	SweeperLockURL          string        // PIGEON_SWEEPER_LOCK_URL (defaults to DatabaseURL)
+	SweeperLockWait         time.Duration // PIGEON_SWEEPER_LOCK_WAIT
+
 	// Observability
 	LogLevel slog.Level // PIGEON_LOG_LEVEL
 	LogJSON  bool       // PIGEON_LOG_JSON
@@ -78,6 +95,18 @@ func defaults() Config {
 		RateLimitPerProducerBurst: 400,
 		CoreReplicas:              1,
 		DBReservedConns:           5,
+		DeliveryWorkers:           1,
+		DeliveryLease:             40 * time.Second,
+		DeliveryTimeout:           5 * time.Second,
+		DeliveryMaxBodyBytes:      2048,
+		DeliveryBackoffBase:       30 * time.Second,
+		DeliveryBackoffMax:        time.Hour,
+		DeliveryMaxAttempts:       15,
+		DeliveryMaxConnsPerHost:   1,
+		DeliveryPollInterval:      time.Second,
+		SweeperInterval:           5 * time.Second,
+		SweeperWindowSeconds:      10,
+		SweeperLockWait:           60 * time.Second,
 	}
 }
 
@@ -124,6 +153,53 @@ func Load() (Config, error) {
 	}
 	if c.DBReservedConns, err = envInt32("PIGEON_DB_RESERVED_CONNS", c.DBReservedConns); err != nil {
 		return Config{}, err
+	}
+	if c.DeliveryWorkers, err = envInt("PIGEON_DELIVERY_WORKERS", c.DeliveryWorkers); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryLease, err = envDuration("PIGEON_DELIVERY_LEASE", c.DeliveryLease); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryTimeout, err = envDuration("PIGEON_DELIVERY_TIMEOUT", c.DeliveryTimeout); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryMaxBodyBytes, err = envInt("PIGEON_DELIVERY_MAX_BODY_BYTES", c.DeliveryMaxBodyBytes); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryBackoffBase, err = envDuration("PIGEON_DELIVERY_BACKOFF_BASE", c.DeliveryBackoffBase); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryBackoffMax, err = envDuration("PIGEON_DELIVERY_BACKOFF_MAX", c.DeliveryBackoffMax); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryMaxAttempts, err = envInt("PIGEON_DELIVERY_MAX_ATTEMPTS", c.DeliveryMaxAttempts); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryMaxConnsPerHost, err = envInt("PIGEON_DELIVERY_MAX_CONNS_PER_HOST", c.DeliveryMaxConnsPerHost); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryPollInterval, err = envDuration("PIGEON_DELIVERY_POLL_INTERVAL", c.DeliveryPollInterval); err != nil {
+		return Config{}, err
+	}
+	c.DeliveryUserAgent = env("PIGEON_DELIVERY_USER_AGENT", c.DeliveryUserAgent)
+	if c.SweeperInterval, err = envDuration("PIGEON_SWEEPER_INTERVAL", c.SweeperInterval); err != nil {
+		return Config{}, err
+	}
+	if c.SweeperWindowSeconds, err = envInt("PIGEON_SWEEPER_WINDOW_SECONDS", c.SweeperWindowSeconds); err != nil {
+		return Config{}, err
+	}
+	c.SweeperLockURL = env("PIGEON_SWEEPER_LOCK_URL", c.SweeperLockURL)
+	if c.SweeperLockWait, err = envDuration("PIGEON_SWEEPER_LOCK_WAIT", c.SweeperLockWait); err != nil {
+		return Config{}, err
+	}
+	// FR-802: 5 s is a hard ceiling on the per-attempt timeout, not a default; a
+	// receiver that cannot acknowledge inside it is treated as unavailable.
+	if c.DeliveryTimeout > 5*time.Second {
+		c.DeliveryTimeout = 5 * time.Second
+	}
+	// The sweeper's leadership-lock connection defaults to the runtime DSN.
+	if c.SweeperLockURL == "" {
+		c.SweeperLockURL = c.DatabaseURL
 	}
 	if c.ShutdownGrace, err = envDuration("PIGEON_SHUTDOWN_GRACE", c.ShutdownGrace); err != nil {
 		return Config{}, err
@@ -176,6 +252,15 @@ func (c Config) Validate() error {
 	}
 	if c.DBReservedConns < 0 {
 		problems = append(problems, "PIGEON_DB_RESERVED_CONNS must be >= 0")
+	}
+	if c.DeliveryWorkers < 0 {
+		problems = append(problems, "PIGEON_DELIVERY_WORKERS must be >= 0 (0 disables the worker)")
+	}
+	if c.DeliveryMaxAttempts < 1 {
+		problems = append(problems, "PIGEON_DELIVERY_MAX_ATTEMPTS must be >= 1")
+	}
+	if c.DeliveryMaxConnsPerHost < 1 {
+		problems = append(problems, "PIGEON_DELIVERY_MAX_CONNS_PER_HOST must be >= 1 (FR-817)")
 	}
 	if c.RateLimitPerKeyRPS < 0 || c.RateLimitPerProducerRPS < 0 {
 		problems = append(problems, "rate limits must be >= 0 (0 disables the limit)")
