@@ -49,16 +49,35 @@ type subRow struct {
 	Status     string
 }
 
-type endpointDetail struct {
-	ID            string
-	Name          string
-	URL           string
-	Status        string
-	Verified      bool
-	Paused        bool
-	VerifyToken   string
-	CreatedAt     string
+// subsView is the subscription panel: the caller's subscriptions plus, when a
+// subscribe attempt was refused, the API's reason (UI-14's gate answers 422 for a
+// type the producer has not left publicly subscribable). It is a struct rather
+// than a bare slice so the panel can show that refusal where the user acted.
+type subsView struct {
 	Subscriptions []subRow
+	Error         string
+}
+
+type endpointDetail struct {
+	ID                string
+	Name              string
+	URL               string
+	Status            string
+	Verified          bool
+	Paused            bool
+	NotificationEmail string
+	CreatedAt         string
+	// RotatedSecret is set only on the render that follows a rotation (UI-13):
+	// the new signing secret exists in exactly one API response, so the page that
+	// shows it is rendered from that response rather than redirected to.
+	RotatedSecret string
+	// Subs is the subscription panel (UI-14).
+	Subs subsView
+	// AvailableTypes is the set the subscribe control offers: exactly the event
+	// types the producer has left open to public subscription, from
+	// GET /v1/consumer/event-types. Offering a free-text field would offer a control
+	// the API refuses.
+	AvailableTypes []string
 }
 
 type snippetView struct {
@@ -78,6 +97,14 @@ type listEndpointsResponse struct {
 		Verified  bool   `json:"verified"`
 		CreatedAt string `json:"created_at"`
 	} `json:"endpoints"`
+}
+
+// listSubscribableTypesResponse is GET /v1/consumer/event-types (UI-14): the types
+// the producer has left open to public subscription.
+type listSubscribableTypesResponse struct {
+	EventTypes []struct {
+		Name string `json:"name"`
+	} `json:"event_types"`
 }
 
 type listSubscriptionsResponse struct {
@@ -298,40 +325,141 @@ func (h *Handler) endpointCreate(w http.ResponseWriter, r *http.Request) {
 
 // endpointDetail shows one endpoint with verify/pause/delete and its subscriptions.
 func (h *Handler) endpointDetail(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	detail, ok := h.endpointDetailView(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	h.renderPage(w, r, "endpoint", detail.Name, "endpoints", detail)
+}
+
+// endpointDetailView reads everything the detail page renders for one of the
+// caller's own endpoints: the row, the subscriptions panel and the event types
+// open to public subscription. ok is false when the read could not be answered,
+// in which case the caller has already had a response written for it (a redirect
+// to login or to the list). It exists so the rotate handler can render the same
+// page with the new secret attached.
+func (h *Handler) endpointDetailView(w http.ResponseWriter, r *http.Request, id string) (endpointDetail, bool) {
 	resp, err := h.coreReq(r, http.MethodGet, "/v1/consumer/endpoints/"+id, nil)
 	if notAuthed(resp, err, w, r, h) {
-		return
+		return endpointDetail{}, false
 	}
 	if resp.Status == http.StatusNotFound {
 		http.Redirect(w, r, "/endpoints", http.StatusSeeOther)
-		return
+		return endpointDetail{}, false
 	}
 	var ep struct {
 		ID, Name, URL, Status, CreatedAt string
 		Verified                         bool
+		NotificationEmail                *string `json:"notification_email"`
 	}
 	_ = json.Unmarshal(resp.Body, &ep)
 	detail := endpointDetail{
 		ID: ep.ID, Name: ep.Name, URL: ep.URL, Status: ep.Status,
 		Verified: ep.Verified, Paused: ep.Status == "paused", CreatedAt: ep.CreatedAt,
 	}
-	// Its subscriptions, for the detail page's subscription panel.
-	sresp, err := h.coreReq(r, http.MethodGet, "/v1/consumer/endpoints/"+id+"/subscriptions", nil)
-	if err == nil && sresp.Status == http.StatusOK {
-		var ls listSubscriptionsResponse
-		_ = json.Unmarshal(sresp.Body, &ls)
-		for _, s := range ls.Subscriptions {
-			detail.Subscriptions = append(detail.Subscriptions, subRow{
-				EndpointID: id, EventType: s.EventType, Status: s.Status,
-			})
-		}
+	if ep.NotificationEmail != nil {
+		detail.NotificationEmail = *ep.NotificationEmail
 	}
-	h.renderPage(w, r, "endpoint", ep.Name, "endpoints", detail)
+	// The endpoint's subscriptions for the panel, and the types the subscribe
+	// control may offer (UI-14). Both are plain API reads: the portal decides
+	// nothing here that the API does not already answer.
+	detail.Subs = subsView{Subscriptions: h.endpointSubscriptions(r, id)}
+	detail.AvailableTypes = h.subscribableTypes(r)
+	return detail, true
+}
+
+// endpointRotate mints a fresh signing secret for one of the caller's own
+// endpoints (UI-13: "rotate their own secret"). The API answers with the new
+// secret exactly once, so this handler renders the detail page straight from that
+// response instead of redirecting - and it deliberately does not park the secret
+// in the flash cookie, which is unsigned and would then carry a credential.
+func (h *Handler) endpointRotate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	resp, err := h.coreReq(r, http.MethodPost, "/v1/consumer/endpoints/"+id+"/rotate", nil)
+	if notAuthed(resp, err, w, r, h) {
+		return
+	}
+	if resp.Status != http.StatusCreated {
+		h.setFlash(w, "error", coreErrorMessage(resp))
+		http.Redirect(w, r, "/endpoints/"+id, http.StatusSeeOther)
+		return
+	}
+	var rotated struct {
+		SigningSecret string `json:"signing_secret"`
+	}
+	_ = json.Unmarshal(resp.Body, &rotated)
+	detail, ok := h.endpointDetailView(w, r, id)
+	if !ok {
+		return
+	}
+	detail.RotatedSecret = rotated.SigningSecret
+	h.renderPage(w, r, "endpoint", detail.Name, "endpoints", detail)
+}
+
+// endpointSubscriptions reads one of the caller's endpoints' subscriptions for the
+// panel. A network error or a refusal renders an empty panel rather than an error
+// page: the panel is additive to the endpoint the page is about.
+func (h *Handler) endpointSubscriptions(r *http.Request, id string) []subRow {
+	subs := []subRow{}
+	resp, err := h.coreReq(r, http.MethodGet, "/v1/consumer/endpoints/"+id+"/subscriptions", nil)
+	if err != nil || resp.Status != http.StatusOK {
+		return subs
+	}
+	var ls listSubscriptionsResponse
+	_ = json.Unmarshal(resp.Body, &ls)
+	for _, s := range ls.Subscriptions {
+		subs = append(subs, subRow{EndpointID: id, EventType: s.EventType, Status: s.Status})
+	}
+	return subs
+}
+
+// subscribableTypes reads UI-14's list: the event types the producer has left open
+// to public subscription, so the subscribe control offers only what the API will
+// accept.
+func (h *Handler) subscribableTypes(r *http.Request) []string {
+	resp, err := h.coreReq(r, http.MethodGet, "/v1/consumer/event-types", nil)
+	if err != nil || resp.Status != http.StatusOK {
+		return nil
+	}
+	var lt listSubscribableTypesResponse
+	_ = json.Unmarshal(resp.Body, &lt)
+	out := make([]string, 0, len(lt.EventTypes))
+	for _, t := range lt.EventTypes {
+		out = append(out, t.Name)
+	}
+	return out
+}
+
+// endpointEdit applies UI-13's edits - name, URL, notification email - to one of
+// the caller's own endpoints. It is the same PATCH the API exposes, so the new URL
+// is re-checked for SSRF (FR-402) and a foreign id is a 404 (AC-39) with no
+// portal-side special case.
+func (h *Handler) endpointEdit(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	id := r.PathValue("id")
+	resp, err := h.coreReq(r, http.MethodPatch, "/v1/consumer/endpoints/"+id, map[string]string{
+		"name":               strings.TrimSpace(r.FormValue("name")),
+		"url":                strings.TrimSpace(r.FormValue("url")),
+		"notification_email": strings.TrimSpace(r.FormValue("notification_email")),
+	})
+	if notAuthed(resp, err, w, r, h) {
+		return
+	}
+	if resp.Status == http.StatusOK {
+		h.setFlash(w, "success", "Endpoint updated.")
+	} else {
+		h.setFlash(w, "error", coreErrorMessage(resp))
+	}
+	http.Redirect(w, r, "/endpoints/"+id, http.StatusSeeOther)
 }
 
 // endpointVerify answers the ownership challenge (FR-403) so the endpoint can
-// receive live events.
+// receive live events. The token is the one shown once at registration: the page
+// asks the user to paste it, because the portal holds no copy of it (only its
+// hash is stored) and a pre-filled hidden field would post an empty token.
 func (h *Handler) endpointVerify(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -381,7 +509,9 @@ func (h *Handler) endpointDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 // subscribe opts an endpoint into an event type (UI-14). Returns the refreshed
-// subscriptions fragment.
+// subscriptions fragment; a refusal (the type is not publicly subscribable, or is
+// disabled) is shown in the panel rather than swallowed, so the consumer sees the
+// API's reason where they acted.
 func (h *Handler) subscribe(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -394,7 +524,13 @@ func (h *Handler) subscribe(w http.ResponseWriter, r *http.Request) {
 	if notAuthed(resp, err, w, r, h) {
 		return
 	}
-	h.renderSubsFragment(w, r, id)
+	// Re-read after the attempt either way, so the panel shows the new state on
+	// success and the unchanged state next to the reason on refusal.
+	view := subsView{Subscriptions: h.endpointSubscriptions(r, id)}
+	if resp.Status != http.StatusCreated {
+		view.Error = coreErrorMessage(resp)
+	}
+	h.r.Fragment(w, http.StatusOK, "frag:subs/list", view)
 }
 
 // unsubscribe opts an endpoint out of an event type (UI-14). Returns the
@@ -410,21 +546,37 @@ func (h *Handler) unsubscribe(w http.ResponseWriter, r *http.Request) {
 	h.renderSubsFragment(w, r, id)
 }
 
-// deliveries is the delivery-log page (UI-15/UI-16). The inspect/replay API is a
-// separate slice, so the page renders the placeholder that states the dependency.
+// deliveries is the delivery-log page (UI-15/UI-16). The inspect and replay API it
+// reads is a separate slice (S7), so the page states the dependency plainly instead
+// of rendering an empty log that would read as "you have no deliveries". The
+// requirement is tracked as a card parented on S7, not by this notice.
 func (h *Handler) deliveries(w http.ResponseWriter, r *http.Request) {
 	h.renderPage(w, r, "deliveries", "Delivery log", "deliveries", nil)
 }
 
-// snippet renders a Standard Webhooks verification snippet for a whsec secret
-// (UI-18). It is generated server-side from values the user typed and never sent
-// to the core API.
-func (h *Handler) snippet(w http.ResponseWriter, r *http.Request) {
-	endpointID := r.URL.Query().Get("endpoint")
-	whsec := r.URL.Query().Get("whsec")
-	view := snippetView{EndpointID: endpointID, Whsec: whsec}
-	if whsec != "" {
-		view.Snippet = webhookSnippet(whsec)
+// snippetForm renders the verification-snippet form (UI-18). A logged-in user only;
+// the secret is entered on the next request, never in a query string.
+func (h *Handler) snippetForm(w http.ResponseWriter, r *http.Request) {
+	h.renderPage(w, r, "snippet", "Webhook snippet", "snippet", snippetView{
+		EndpointID: r.URL.Query().Get("endpoint"),
+	})
+}
+
+// snippetSubmit renders a Standard Webhooks verification snippet for a whsec secret
+// (UI-18). The secret arrives in the POST body - not a GET query parameter, where it
+// would land in access logs, browser history and any shared link - and it is used
+// only to render this page: it is not forwarded to the core API and not stored.
+func (h *Handler) snippetSubmit(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	view := snippetView{
+		EndpointID: strings.TrimSpace(r.FormValue("endpoint")),
+		Whsec:      strings.TrimSpace(r.FormValue("whsec")),
+	}
+	if view.Whsec != "" {
+		view.Snippet = webhookSnippet(view.Whsec)
 	}
 	h.renderPage(w, r, "snippet", "Webhook snippet", "snippet", view)
 }
@@ -454,16 +606,7 @@ func (h *Handler) fragEndpoints(w http.ResponseWriter, r *http.Request) {
 // renderSubsFragment fetches an endpoint's subscriptions and renders the subs
 // fragment for the htmx swap.
 func (h *Handler) renderSubsFragment(w http.ResponseWriter, r *http.Request, id string) {
-	resp, err := h.coreReq(r, http.MethodGet, "/v1/consumer/endpoints/"+id+"/subscriptions", nil)
-	subs := []subRow{}
-	if err == nil && resp.Status == http.StatusOK {
-		var ls listSubscriptionsResponse
-		_ = json.Unmarshal(resp.Body, &ls)
-		for _, s := range ls.Subscriptions {
-			subs = append(subs, subRow{EndpointID: id, EventType: s.EventType, Status: s.Status})
-		}
-	}
-	h.r.Fragment(w, http.StatusOK, "frag:subs/list", subs)
+	h.r.Fragment(w, http.StatusOK, "frag:subs/list", subsView{Subscriptions: h.endpointSubscriptions(r, id)})
 }
 
 // notAuthed handles the "no valid session" case shared by every data handler: a

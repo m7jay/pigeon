@@ -120,6 +120,8 @@ func (h *Handler) Handler() http.Handler {
 	mux.HandleFunc("GET /endpoints", h.requireLogin(h.endpointsList))
 	mux.HandleFunc("POST /endpoints", h.requireLogin(h.endpointCreate))
 	mux.HandleFunc("GET /endpoints/{id}", h.requireLogin(h.endpointDetail))
+	mux.HandleFunc("POST /endpoints/{id}/edit", h.requireLogin(h.endpointEdit))
+	mux.HandleFunc("POST /endpoints/{id}/rotate", h.requireLogin(h.endpointRotate))
 	mux.HandleFunc("POST /endpoints/{id}/verify", h.requireLogin(h.endpointVerify))
 	mux.HandleFunc("POST /endpoints/{id}/pause", h.requireLogin(h.endpointSetPaused(true)))
 	mux.HandleFunc("POST /endpoints/{id}/resume", h.requireLogin(h.endpointSetPaused(false)))
@@ -129,7 +131,11 @@ func (h *Handler) Handler() http.Handler {
 	mux.HandleFunc("GET /frag/endpoints", h.requireLogin(h.fragEndpoints))
 
 	mux.HandleFunc("GET /deliveries", h.requireLogin(h.deliveries))
-	mux.HandleFunc("GET /snippet", h.snippet)
+	// UI-18: the snippet form and its generation are both behind login, and the
+	// secret is posted (never a query parameter), so it stays out of access logs,
+	// browser history and shared links.
+	mux.HandleFunc("GET /snippet", h.requireLogin(h.snippetForm))
+	mux.HandleFunc("POST /snippet", h.requireLogin(h.snippetSubmit))
 	return mux
 }
 

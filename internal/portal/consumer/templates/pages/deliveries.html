@@ -3,9 +3,10 @@
 <p class="page-sub">Your deliveries, scoped to your own consumer (UI-15), with replay bounded by the same limits as the API (UI-16).</p>
 <div class="notice">
   The delivery inspect and replay API is a separate slice and is not live on this
-  instance yet. When it is, this page will list your consumer's deliveries with
-  attempt detail and a replay control, and nothing here will change — the portal
-  only ever calls endpoints the API also exposes. Until then there is no
-  delivery data to show.
+  instance yet, so there is no delivery data to show. This page is deliberately not
+  an empty log: it says why it is empty rather than implying you have had no
+  deliveries. When that API ships, this page lists your consumer's deliveries with
+  attempt detail and a replay control, and nothing else here changes - the portal
+  only ever calls endpoints the API also exposes.
 </div>
 {{end}}
