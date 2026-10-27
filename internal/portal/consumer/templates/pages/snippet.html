@@ -1,0 +1,14 @@
+{{define "content"}}
+<h1>Standard Webhooks verification snippet</h1>
+<p class="page-sub">Verify signatures on payloads sent to your endpoint, using your <span class="mono">whsec_</span> signing secret (UI-18). The secret is entered here and never sent to the API — the snippet is generated in your browser.</p>
+<div class="card">
+  <form method="get" action="/snippet">
+    <div class="form-row"><label for="endpoint">Endpoint ID</label><input id="endpoint" type="text" name="endpoint" value="{{.Data.EndpointID}}" placeholder="end_…"></div>
+    <div class="form-row"><label for="whsec">Signing secret (<span class="mono">whsec_…</span>)</label><input id="whsec" type="text" name="whsec" value="{{.Data.Whsec}}" placeholder="whsec_…"></div>
+    <button class="btn btn-sm" type="submit">Generate snippet</button>
+  </form>
+  {{if .Data.Whsec}}
+  <pre class="snippet">{{.Data.Snippet}}</pre>
+  {{end}}
+</div>
+{{end}}

@@ -1,0 +1,36 @@
+{{define "content"}}
+<h1>{{.Data.Name}}</h1>
+<div class="card">
+  <dl class="kv">
+    <dt>ID</dt><dd class="mono">{{.Data.ID}}</dd>
+    <dt>URL</dt><dd class="mono">{{.Data.URL}}</dd>
+    <dt>Status</dt><dd>{{template "badge" .Data.Status}}</dd>
+    <dt>Verified</dt><dd>{{if .Data.Verified}}{{template "badge" "active"}}{{else}}{{template "badge" "unverified"}}{{end}}</dd>
+    <dt>Created</dt><dd>{{.Data.CreatedAt}}</dd>
+  </dl>
+  <div class="row-actions" style="margin-top:0.75rem">
+    {{if not .Data.Verified}}
+    <form method="post" action="/endpoints/{{.Data.ID}}/verify">
+      <input type="hidden" name="token" value="{{.Data.VerifyToken}}">
+      <button class="btn btn-sm" type="submit">Verify endpoint</button>
+    </form>
+    {{end}}
+    <form method="post" action="/endpoints/{{.Data.ID}}/{{if .Data.Paused}}resume{{else}}pause{{end}}">
+      <button class="btn btn-sm btn-secondary" type="submit">{{if .Data.Paused}}Resume{{else}}Pause{{end}}</button>
+    </form>
+    <form method="post" action="/endpoints/{{.Data.ID}}/delete" onsubmit="return confirm('Delete this endpoint? It will stop receiving events.')">
+      <button class="btn btn-sm btn-danger" type="submit">Delete</button>
+    </form>
+    <a class="btn btn-sm btn-secondary" href="/snippet?endpoint={{.Data.ID}}">Webhook snippet</a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Subscriptions</h2>
+  <form method="post" action="/endpoints/{{.Data.ID}}/subscriptions" class="inline">
+    <input type="text" name="event_type" placeholder="event type name" required style="width:auto;max-width:24rem">
+    <button class="btn btn-sm" type="submit">Subscribe</button>
+  </form>
+  <div style="margin-top:0.75rem">{{template "frag:subs/list" .Data.Subscriptions}}</div>
+</div>
+{{end}}
