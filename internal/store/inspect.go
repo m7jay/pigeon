@@ -291,7 +291,7 @@ func (s *Store) GetDelivery(ctx context.Context, sc Scope, id int64) (DeliveryDe
 
 // attemptsFor reads one delivery's attempt rows in attempt order (FR-1102's
 // "ordered attempts", which is the (delivery_id, attempt) unique index's own
-// order in 0008). 0009 gives the tenant a select policy on `attempts`, which is
+// order in 0008). 0011 gives the tenant a select policy on `attempts`, which is
 // what makes this a read rather than a definer function: the write path stays
 // the definer functions in 0008, and the policy's predicate is the delivery's
 // own scope, so a row of another tenant's delivery is invisible here too.
