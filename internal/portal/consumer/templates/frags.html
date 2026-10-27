@@ -31,11 +31,12 @@
 {{end}}
 
 {{define "frag:subs/list"}}
-{{if .}}
+{{if .Error}}<p class="flash flash-error">The subscription was not added: {{.Error}}</p>{{end}}
+{{if .Subscriptions}}
 <table class="data-table">
   <thead><tr><th>Event type</th><th>Status</th><th>Actions</th></tr></thead>
   <tbody id="subs-list">
-  {{range .}}
+  {{range .Subscriptions}}
     <tr>
       <td class="mono">{{.EventType}}</td>
       <td>{{template "badge" .Status}}</td>
