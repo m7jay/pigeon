@@ -141,3 +141,44 @@ func TestLoadRejectsGarbage(t *testing.T) {
 		t.Fatal("Load accepted a non-numeric PIGEON_DB_MAX_CONNS")
 	}
 }
+
+// TestLoadClampsTheSweeperInterval is D-6: a lapsed lease must be re-queued within
+// 10 s, so the sweep cadence is a ceiling. Without the clamp one env var silently
+// voids the recovery guarantee, which is the class of configuration OPS-7 refuses
+// to start on (FR-802's timeout is clamped the same way).
+func TestLoadClampsTheSweeperInterval(t *testing.T) {
+	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
+	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+	t.Setenv("PIGEON_SWEEPER_INTERVAL", "2m")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.SweeperInterval != maxSweeperInterval {
+		t.Fatalf("SweeperInterval = %s, want it clamped to %s (D-6)", c.SweeperInterval, maxSweeperInterval)
+	}
+	// A faster cadence is a choice, not a violation: it is left alone.
+	t.Setenv("PIGEON_SWEEPER_INTERVAL", "3s")
+	c, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.SweeperInterval != 3*time.Second {
+		t.Fatalf("SweeperInterval = %s, want the configured 3s", c.SweeperInterval)
+	}
+}
+
+// TestValidateRefusesANegativeBodyCaptureCap: 0 disables response-body capture
+// (SB-4), so a negative value from the environment is a configuration error rather
+// than a silent "use the default".
+func TestValidateRefusesANegativeBodyCaptureCap(t *testing.T) {
+	c := valid()
+	c.DeliveryMaxBodyBytes = -1
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate accepted a negative PIGEON_DELIVERY_MAX_BODY_BYTES")
+	}
+	c.DeliveryMaxBodyBytes = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate rejected 0, which SB-4 requires to mean \"capture nothing\": %v", err)
+	}
+}
