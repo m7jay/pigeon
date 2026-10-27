@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -454,6 +455,101 @@ var crossProducerCases = map[string]cpCase{
 			}
 		},
 	},
+
+	// --- S7: the inspect and replay surface (§11, FR-1101..FR-1111) --------
+
+	"GET /v1/producer/deliveries": {
+		build: func(a, b *tenant) (string, any) { return "/v1/producer/deliveries?env=live", nil },
+		want:  http.StatusOK,
+		// A collection route has no id to 404, so it proves absence instead: B's
+		// endpoint, event and delivery must not appear in A's list (FR-1101).
+		leaks: func(a, b *tenant) []string {
+			return []string{b.EndpointID, b.DeliveryEventID, fmt.Sprintf("\"id\":%d", b.DeliveryID)}
+		},
+	},
+	"GET /v1/producer/deliveries/dedupe": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/deliveries/dedupe?env=live&endpoint_id=" + b.EndpointID +
+				"&event_id=" + b.DeliveryEventID, nil
+		},
+		// FR-903 asked about another tenant's endpoint is a miss (FR-108), not an
+		// answer about whether that endpoint was a duplicate.
+		want: http.StatusNotFound,
+	},
+	"GET /v1/producer/deliveries/{deliveryID}": {
+		build: func(a, b *tenant) (string, any) {
+			return fmt.Sprintf("/v1/producer/deliveries/%d?env=live", b.DeliveryID), nil
+		},
+		want: http.StatusNotFound,
+	},
+	"POST /v1/producer/deliveries/replay": {
+		build: func(a, b *tenant) (string, any) {
+			// Aimed at B's endpoint with a key of its own: the selection is empty
+			// in A's scope, so this must create nothing anywhere (FR-1106).
+			return "/v1/producer/deliveries/replay?env=live", map[string]any{
+				"endpoint_id": b.EndpointID, "idempotency_key": "cp-probe-replay",
+			}
+		},
+		want: http.StatusOK,
+		after: func(t *testing.T, e *env, created []byte) {
+			a, b := e.tenantFor(t, "cp-alpha"), e.tenantFor(t, "cp-beta")
+			res := decode[replayJSONBody](t, created)
+			if res.Matched != 0 || res.Created != 0 || len(res.DeliveryIDs) != 0 {
+				t.Fatalf("a replay aimed at another tenant's endpoint = %+v, want an empty selection", res)
+			}
+			// Neither tenant gained a replay, and B's delivery is untouched.
+			if n := e.countRows(t,
+				`select count(*) from deliveries where producer_id in ($1, $2) and replay_of_delivery_id is not null`,
+				a.ID, b.ID); n != 0 {
+				t.Fatalf("the cross-producer replay created %d deliveries", n)
+			}
+			e.expectDeliveryUntouched(t, b.DeliveryID)
+		},
+	},
+	"GET /v1/producer/events/{eventID}": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/events/" + b.DeliveryEventID + "?env=live", nil
+		},
+		want: http.StatusNotFound,
+	},
+	"GET /v1/consumer/deliveries": {
+		// A consumer session carries its own consumer: this case presents B's and
+		// proves the answer holds only B's rows (FR-1105), never A's.
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		build:      func(a, b *tenant) (string, any) { return "/v1/consumer/deliveries", nil },
+		want:       http.StatusOK,
+		leaks: func(a, b *tenant) []string {
+			return []string{a.EndpointID, a.DeliveryEventID, fmt.Sprintf("\"id\":%d", a.DeliveryID)}
+		},
+	},
+	"GET /v1/consumer/deliveries/{deliveryID}": {
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		build: func(a, b *tenant) (string, any) {
+			return fmt.Sprintf("/v1/consumer/deliveries/%d", a.DeliveryID), nil
+		},
+		want: http.StatusNotFound,
+	},
+	"POST /v1/consumer/deliveries/replay": {
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		build: func(a, b *tenant) (string, any) {
+			// The body names A's consumer explicitly; the session's claim must win
+			// (FR-110), so this replays B's own deliveries and nothing of A's.
+			return "/v1/consumer/deliveries/replay", map[string]any{
+				"consumer_id": a.ConsumerID, "status": "delivered", "idempotency_key": "cp-probe-consumer-replay",
+			}
+		},
+		want: http.StatusOK,
+		after: func(t *testing.T, e *env, created []byte) {
+			a := e.tenantFor(t, "cp-alpha")
+			res := decode[replayJSONBody](t, created)
+			for _, id := range res.DeliveryIDs {
+				if id == a.DeliveryID {
+					t.Fatalf("a consumer replay reached producer A's delivery %d", id)
+				}
+			}
+			e.expectDeliveryUntouched(t, a.DeliveryID)
+		},
+	},
 }
 
 // notProducerScoped classifies every route that is not part of the producer-scoped
@@ -503,6 +599,12 @@ func TestCrossProducerRequestsAreNotFound(t *testing.T) {
 	// prove is absent from the other tenant.
 	seedCrossProducerEventType(t, e, a)
 	seedCrossProducerEventType(t, e, b)
+
+	// And one delivered delivery each, on a consumer-routed type of its own, so
+	// the inspect and replay routes (FR-1101..FR-1111) have a real delivery id
+	// and event id in every tenant to aim across the tenant boundary.
+	seedCrossProducerDelivery(t, e, a)
+	seedCrossProducerDelivery(t, e, b)
 
 	// A's owner session, aimed at every one of B's identifiers — except on the two
 	// routes that take no identifier, where the case presents B's own credential
