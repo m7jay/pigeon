@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -1169,18 +1168,4 @@ func TestDedupeAnswerWasThisADuplicate(t *testing.T) {
 	if got := errorCode(t, raw); got != "dedupe_key_required" {
 		t.Fatalf("error code = %q, want dedupe_key_required", got)
 	}
-}
-
-// jsonBody is a debugging aid for the assertions above: it renders a response
-// body indented so a failure in CI is readable.
-func jsonBody(raw []byte) string {
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return string(raw)
-	}
-	pretty, err := json.MarshalIndent(out, "", "  ")
-	if err != nil {
-		return string(raw)
-	}
-	return string(pretty)
 }
