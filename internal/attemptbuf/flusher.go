@@ -14,7 +14,7 @@ import (
 
 // Sink is the Postgres side of the flush: one call inserts one batch in ONE
 // transaction (FR-815). *store.Store implements it against the batched
-// SECURITY DEFINER function in 0009.
+// SECURITY DEFINER function in 0010.
 //
 // It returns how many rows the transaction actually inserted; a row Postgres
 // already had (a replay of the same buffered attempt after a crash) is not an

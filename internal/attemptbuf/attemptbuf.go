@@ -35,6 +35,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -128,6 +129,11 @@ type Buffer struct {
 	log      *slog.Logger
 	metrics  *metrics.Metrics
 
+	// groupMu serializes group creation. Push runs from many worker
+	// goroutines and Read/Reclaim from the flusher, so the "created yet?"
+	// check and the create must not race (the -race detector flags the bare
+	// bool).
+	groupMu    sync.Mutex
 	groupReady bool
 }
 
@@ -241,6 +247,8 @@ func (b *Buffer) Depth(ctx context.Context) (int64, error) {
 // not exist. It is idempotent (BUSYGROUP) and is called before any read, so a
 // flusher that starts before the first push still sees every entry.
 func (b *Buffer) ensureGroup(ctx context.Context) error {
+	b.groupMu.Lock()
+	defer b.groupMu.Unlock()
 	if b.groupReady {
 		return nil
 	}

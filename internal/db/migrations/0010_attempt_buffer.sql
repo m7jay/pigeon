@@ -1,4 +1,4 @@
--- 0009_attempt_buffer.sql — S6: the buffered evidence path, and the attempt
+-- 0010_attempt_buffer.sql — S6: the buffered evidence path, and the attempt
 -- counter that must not depend on it.
 --
 -- Two things change here, and they belong together.

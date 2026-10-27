@@ -43,6 +43,15 @@ func (f *fakeSink) batchCount() int {
 	return len(f.batches)
 }
 
+// rowCount is the race-free read of rows. Tests poll it from the test goroutine
+// while Run's goroutine increments rows inside RecordAttempts, so reading the
+// field directly is a data race the -race detector (rightly) fails on.
+func (f *fakeSink) rowCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rows
+}
+
 func newTestFlusher(t *testing.T, batch int) (*Flusher, *fakeSink, *Buffer) {
 	t.Helper()
 	buf, _ := newTestBuffer(t)
@@ -179,8 +188,8 @@ func TestDrainEmptiesTheBuffer(t *testing.T) {
 	if depth, _ := buf.Depth(ctx); depth != 0 {
 		t.Fatalf("buffer depth after Drain = %d, want 0", depth)
 	}
-	if sink.rows != 7 {
-		t.Fatalf("sink inserted %d rows, want 7", sink.rows)
+	if sink.rowCount() != 7 {
+		t.Fatalf("sink inserted %d rows, want 7", sink.rowCount())
 	}
 }
 
@@ -256,9 +265,9 @@ func TestRunDrainsOnCancellation(t *testing.T) {
 
 	// Wait for the first pass to insert the five entries, then cancel.
 	deadline := time.Now().Add(2 * time.Second)
-	for sink.rows < 5 {
+	for sink.rowCount() < 5 {
 		if time.Now().After(deadline) {
-			t.Fatalf("Run did not flush within 2s; rows=%d", sink.rows)
+			t.Fatalf("Run did not flush within 2s; rows=%d", sink.rowCount())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -293,7 +302,7 @@ func TestRunRetriesAStuckBatch(t *testing.T) {
 	go func() { done <- fl.Run(ctx) }()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for sink.rows < 1 {
+	for sink.rowCount() < 1 {
 		if time.Now().After(deadline) {
 			t.Fatalf("Run did not retry the failed batch within 2s; batches=%d", sink.batchCount())
 		}
