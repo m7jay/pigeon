@@ -22,6 +22,9 @@ func valid() Config {
 		RateLimitPerProducerRPS:   200,
 		RateLimitPerProducerBurst: 400,
 		LogLevel:                  0,
+		DeliveryWorkers:           1,
+		DeliveryMaxAttempts:       15,
+		DeliveryMaxConnsPerHost:   1,
 	}
 }
 
