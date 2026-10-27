@@ -434,6 +434,46 @@ func TestFragmentSwapTargetsSitOnTheFragmentRoot(t *testing.T) {
 	}
 }
 
+// TestFragmentControlsPostNativelyToo is the other half of the round-3 finding.
+// A form carrying only hx-* attributes has no method and no action, so when the
+// htmx script never loads the browser falls back to a GET of the current URL: the
+// portal's GET catch-all answers 303 to /endpoints, and the control the user just
+// pressed does nothing at all. Every mutating control must therefore carry a real
+// method and action as well, so the no-JavaScript path posts to the same handler
+// the htmx path does.
+func TestFragmentControlsPostNativelyToo(t *testing.T) {
+	core := newFakeCore(t)
+	seedEndpointsPage(t, core, true)
+	// One active and one paused endpoint, because the list renders exactly one of
+	// pause/resume per row - the control that matches the row's current state.
+	core.on(http.MethodGet, "/v1/consumer/endpoints",
+		`{"endpoints":[`+
+			`{"id":"end1","name":"orders-hook","url":"https://1.1.1.1/hook","status":"active","verified":true,"created_at":"2026-01-01T00:00:00Z"},`+
+			`{"id":"end2","name":"refunds-hook","url":"https://1.1.1.1/refunds","status":"paused","verified":true,"created_at":"2026-01-01T00:00:00Z"}`+
+			`]}`, http.StatusOK)
+	h := testHandlerAt(t, core.srv.URL)
+
+	// Each entry is the action a control must be able to reach without htmx, and
+	// the page that renders that control. seedEndpointsPage gives end1 a single
+	// "order.shipped" subscription, so that is the opt-out control on its page.
+	for _, tc := range []struct{ action, page string }{
+		{"/endpoints/end1/pause", "/endpoints"},
+		{"/endpoints/end2/resume", "/endpoints"},
+		{"/endpoints/end1/delete", "/endpoints"},
+		{"/endpoints/end1/subscriptions/order.shipped/delete", "/endpoints/end1"},
+	} {
+		body := signedIn(t, h, http.MethodGet, tc.page, nil).Body.String()
+		want := `<form method="post" action="` + tc.action + `"`
+		if !strings.Contains(body, want) {
+			t.Fatalf("%s does not render a native form for %s:\n%s", tc.page, tc.action, body)
+		}
+		// And the htmx attributes stay: progressive enhancement, not a replacement.
+		if !strings.Contains(body, `hx-post="`+tc.action+`"`) {
+			t.Fatalf("%s lost the hx-post attribute for %s:\n%s", tc.page, tc.action, body)
+		}
+	}
+}
+
 // TestSubscribeUpdatesThePanelOrRedirects is the round-2 finding that the detail
 // page's subscribe control broke the page (UI-14's primary flow). The form posted
 // plainly while the handler answered with the bare `frag:subs/list`, so the browser

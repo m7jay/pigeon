@@ -23,10 +23,16 @@
       <td>{{if .Verified}}{{template "badge" "active"}}{{else}}{{template "badge" "unverified"}}{{end}}</td>
       <td class="row-actions">
         <a class="btn btn-sm btn-secondary" href="/endpoints/{{.ID}}">View</a>
-        <form hx-post="/endpoints/{{.ID}}/{{if .Paused}}resume{{else}}pause{{end}}" hx-target="#endpoints-list" hx-swap="outerHTML">
+        {{/* method and action are the no-JavaScript path; hx-post is what runs when
+             htmx is there. A form with only hx-* attributes falls back to a GET of
+             the current URL when the script never loads, so the button appears to
+             work and changes nothing. */}}
+        <form method="post" action="/endpoints/{{.ID}}/{{if .Paused}}resume{{else}}pause{{end}}"
+              hx-post="/endpoints/{{.ID}}/{{if .Paused}}resume{{else}}pause{{end}}" hx-target="#endpoints-list" hx-swap="outerHTML">
           <button class="btn btn-sm" type="submit">{{if .Paused}}Resume{{else}}Pause{{end}}</button>
         </form>
-        <form hx-post="/endpoints/{{.ID}}/delete" hx-target="#endpoints-list" hx-swap="outerHTML" hx-confirm="Delete this endpoint?">
+        <form method="post" action="/endpoints/{{.ID}}/delete"
+              hx-post="/endpoints/{{.ID}}/delete" hx-target="#endpoints-list" hx-swap="outerHTML" hx-confirm="Delete this endpoint?">
           <button class="btn btn-sm btn-danger" type="submit">Delete</button>
         </form>
       </td>
@@ -52,7 +58,8 @@
       <td class="mono">{{.EventType}}</td>
       <td>{{template "badge" .Status}}</td>
       <td>
-        <form hx-post="/endpoints/{{.EndpointID}}/subscriptions/{{.EventType}}/delete" hx-target="#subs-list" hx-swap="outerHTML">
+        <form method="post" action="/endpoints/{{.EndpointID}}/subscriptions/{{.EventType}}/delete"
+              hx-post="/endpoints/{{.EndpointID}}/subscriptions/{{.EventType}}/delete" hx-target="#subs-list" hx-swap="outerHTML">
           <button class="btn btn-sm btn-danger" type="submit">Opt out</button>
         </form>
       </td>

@@ -294,7 +294,7 @@ func (h *Handler) endpointsList(w http.ResponseWriter, r *http.Request) {
 		for _, e := range le.Endpoints {
 			view.Endpoints = append(view.Endpoints, endpointRow{
 				ID: e.ID, Name: e.Name, URL: e.URL, Status: e.Status,
-				Verified: e.Verified, CreatedAt: e.CreatedAt,
+				Verified: e.Verified, Paused: e.Status == "paused", CreatedAt: e.CreatedAt,
 			})
 		}
 	}
