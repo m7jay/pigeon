@@ -37,13 +37,38 @@ type LeasedDelivery struct {
 	OccurredAt     time.Time
 	Payload        []byte
 	// PriorAttempts is how many failed attempt rows already exist. It is only
-	// for logging; the authoritative next number is NextAttempt, derived from the
-	// rows so a crash that left a partial write cannot hand out a duplicate (AC-07).
+	// for logging; the authoritative next number is NextAttemptNumber, derived
+	// from this and the delivery row's own counter (D-2).
 	PriorAttempts int
+	// RowAttempts is deliveries.attempts: the control-state attempt counter,
+	// advanced by pigeon_requeue_delivery when a retry is scheduled. It is
+	// always current, including in buffered mode where the evidence rows are
+	// still sitting in Redis.
+	RowAttempts int
 	// FirstAttemptAt is the time of the earliest failed attempt, or nil on a
 	// first attempt. The completing worker records it as deliveries.first_attempt_at
 	// so the timestamp is stable across the re-claims a crash produces.
 	FirstAttemptAt *time.Time
+}
+
+// NextAttemptNumber is the 1-based number for this attempt (AC-07, FR-902).
+//
+// It is the maximum of the two counters, never just the evidence-row count:
+//   - deliveries.attempts is advanced by the requeue that schedules the retry, so
+//     it is current even when the previous attempt's row is still buffered in
+//     Redis (D-2: the attempt counter MUST NOT depend on the attempt buffer);
+//   - the evidence-row count is the authority for a database written before this
+//     counter existed, and for sync mode, where both advance together.
+//
+// Taking the maximum means a buffered database and a synchronous one number the
+// same attempts identically, which is what AC-07's "no duplicate attempt numbers"
+// needs in both modes.
+func (d LeasedDelivery) NextAttemptNumber() int {
+	n := d.PriorAttempts
+	if d.RowAttempts > n {
+		n = d.RowAttempts
+	}
+	return n + 1
 }
 
 // ClaimDelivery leases the next due pending delivery with SKIP LOCKED (FR-813,
@@ -57,11 +82,11 @@ func (s *Store) ClaimDelivery(ctx context.Context, lease time.Duration) (LeasedD
 	var d LeasedDelivery
 	err := s.pool.QueryRow(ctx, `select delivery_id, event_id, producer_id, env, endpoint_id,
 		endpoint_url, signing_secret, event_type, payload_version, coalesce(consumer_ref, ''),
-		occurred_at, payload, prior_attempts, first_attempt_at
+		occurred_at, payload, prior_attempts, row_attempts, first_attempt_at
 		from pigeon_claim_delivery($1)`, lease,
 	).Scan(&d.DeliveryID, &d.EventID, &d.ProducerID, &d.Env, &d.EndpointID,
 		&d.EndpointURL, &d.SigningSecret, &d.EventType, &d.PayloadVersion,
-		&d.ConsumerRef, &d.OccurredAt, &d.Payload, &d.PriorAttempts, &d.FirstAttemptAt)
+		&d.ConsumerRef, &d.OccurredAt, &d.Payload, &d.PriorAttempts, &d.RowAttempts, &d.FirstAttemptAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return d, false, nil
 	}
@@ -72,8 +97,10 @@ func (s *Store) ClaimDelivery(ctx context.Context, lease time.Duration) (LeasedD
 }
 
 // NextAttempt is the 1-based number for the next attempt on a delivery (AC-07):
-// max(existing attempts) + 1, so a worker that re-claims a delivery whose
-// partial write it must account for never reuses a number.
+// max(the delivery row's counter, existing attempts) + 1, so a worker that
+// re-claims a delivery whose evidence is still buffered — or whose partial write
+// it must account for — never reuses a number. It reads the same two counters
+// LeasedDelivery.NextAttemptNumber combines, for callers that hold only an id.
 func (s *Store) NextAttempt(ctx context.Context, deliveryID int64) (int, error) {
 	var n int
 	if err := s.pool.QueryRow(ctx, `select pigeon_next_attempt($1)`, deliveryID).Scan(&n); err != nil {
@@ -95,20 +122,75 @@ type AttemptRecord struct {
 	// NextRetryAt is when the next attempt is scheduled (a retryable failure), or
 	// nil on the last attempt of a delivery (terminal failure or success).
 	NextRetryAt *time.Time
+	// OccurredAt is when the attempt happened. The buffered path carries it
+	// because the flush can be up to §6's 1 s later: the row records the attempt
+	// time, not the flush time. A zero value means "now", which is what the
+	// inline path (sync mode) uses.
+	OccurredAt time.Time
 }
 
-// RecordAttempt writes one failed-attempt row with synchronous_commit=off
-// (FR-812): §6 already declares a ≤1 s tail of evidence loss acceptable, and the
-// row is re-derivable from the retry anyway. It is idempotent on (delivery_id,
-// attempt), so a worker that double-writes the same attempt is a no-op, not a
-// duplicate (AC-07).
+// RecordAttempt writes one failed-attempt row. It is the sync-mode path (D-2)
+// and is a one-row batch of RecordAttempts, so both modes apply SB-4's body cap
+// and the attempt timestamp identically.
 func (s *Store) RecordAttempt(ctx context.Context, r AttemptRecord) error {
-	return db.EvidenceTx(ctx, s.pool, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `select pigeon_record_attempt($1,$2,$3,$4,$5,$6,$7,$8)`,
-			r.DeliveryID, r.Attempt, r.Outcome, r.ErrorClass, r.ResponseStatus,
-			r.ResponseBody, r.DurationMs, r.NextRetryAt)
-		return err
+	_, err := s.RecordAttempts(ctx, []AttemptRecord{r})
+	return err
+}
+
+// RecordAttempts writes a whole batch of failed-attempt rows in ONE transaction
+// with synchronous_commit=off (FR-812, FR-815): §6 already declares a ≤1 s tail
+// of evidence loss acceptable, and paying an fsync per batch of rows whose loss
+// is pre-declared is incoherent (L3).
+//
+// It returns how many rows were actually inserted. A row Postgres already has is
+// not an error and is not counted — the buffer's own crash recovery replays
+// entries on purpose, and the unique (delivery_id, attempt) key makes the replay
+// a no-op, so a caller that sees a smaller count than its batch knows a genuine
+// attempt-number collision happened rather than a duplicate delivery.
+func (s *Store) RecordAttempts(ctx context.Context, batch []AttemptRecord) (int, error) {
+	if len(batch) == 0 {
+		return 0, nil
+	}
+	ids := make([]int64, len(batch))
+	attempts := make([]int32, len(batch))
+	outcomes := make([]string, len(batch))
+	classes := make([]string, len(batch))
+	statuses := make([]*int32, len(batch))
+	bodies := make([]string, len(batch))
+	durations := make([]int32, len(batch))
+	nextRetries := make([]*time.Time, len(batch))
+	occurred := make([]*time.Time, len(batch))
+	for i, r := range batch {
+		ids[i] = r.DeliveryID
+		attempts[i] = int32(r.Attempt)
+		outcomes[i] = r.Outcome
+		classes[i] = r.ErrorClass
+		if r.ResponseStatus != nil {
+			st := int32(*r.ResponseStatus)
+			statuses[i] = &st
+		}
+		bodies[i] = r.ResponseBody
+		durations[i] = int32(r.DurationMs)
+		nextRetries[i] = r.NextRetryAt
+		if !r.OccurredAt.IsZero() {
+			t := r.OccurredAt
+			occurred[i] = &t
+		}
+	}
+	// The body cap is applied again here, in SQL, from the configured value: the
+	// rows are zipped positionally by one multi-argument unnest, so a body can
+	// never be paired with another row's delivery (SB-4, FR-815).
+	bodyCap := int32(s.attemptBodyCap)
+	var inserted int
+	err := db.EvidenceTx(ctx, s.pool, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `select pigeon_record_attempts($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			ids, attempts, outcomes, classes, statuses, bodies, durations, nextRetries, occurred, bodyCap,
+		).Scan(&inserted)
 	})
+	if err != nil {
+		return 0, fmt.Errorf("record %d attempts: %w", len(batch), err)
+	}
+	return inserted, nil
 }
 
 // CompleteDelivery records the successful attempt: it sets the four columns
@@ -145,14 +227,20 @@ func (s *Store) FinalizeDelivery(ctx context.Context, deliveryID int64, attempts
 }
 
 // RequeueDelivery schedules the next attempt after a retryable failure by pushing
-// the lease into the future (the backoff). The row is not claimable until the
+// the lease into the future (the backoff), and advances the delivery row's attempt
+// counter to this attempt's number (D-2). The row is not claimable until the
 // backoff elapses, so the retry cadence lives in the lease, not in a worker sleep.
-// It runs with synchronous_commit=on: a lost requeue just leaves the lease at the
-// claim value and the sweeper covers it (D-6) — a "just retried if lost" control
-// write, not evidence.
-func (s *Store) RequeueDelivery(ctx context.Context, deliveryID int64, backoff time.Duration) error {
+//
+// It runs with synchronous_commit=on: it is control state. The counter matters
+// because it is what makes the next attempt number correct while this attempt's
+// evidence row may still be sitting in the Redis buffer — the attempt number MUST
+// NOT depend on the attempt buffer, and this is the write that keeps it
+// independent of it. A lost requeue just leaves the lease at the claim value and
+// the sweeper covers it (D-6), and a re-delivered requeue cannot walk the counter
+// backwards (the function takes greatest()).
+func (s *Store) RequeueDelivery(ctx context.Context, deliveryID int64, backoff time.Duration, attempt int) error {
 	return db.ControlTx(ctx, s.pool, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `select pigeon_requeue_delivery($1,$2)`, deliveryID, backoff)
+		_, err := tx.Exec(ctx, `select pigeon_requeue_delivery($1,$2,$3)`, deliveryID, backoff, attempt)
 		return err
 	})
 }

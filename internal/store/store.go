@@ -104,10 +104,36 @@ func (p Principal) Scope() Scope { return Scope{ProducerID: p.ProducerID, Env: p
 // fail closed, which is safe but useless).
 type Store struct {
 	pool *pgxpool.Pool
+	// attemptBodyCap is SB-4's truncation applied on the database side of the
+	// evidence insert: 0 stores no body at all, a negative value stores it as
+	// given. It defaults to the 2 KB SB-4 default; main wires the configured
+	// PIGEON_DELIVERY_MAX_BODY_BYTES through WithAttemptBodyCap so the cap is a
+	// setting rather than a constant.
+	attemptBodyCap int
+}
+
+// DefaultAttemptBodyCap is SB-4's default per-row cost control: the first 2 KB
+// of a response body, configurable down to 0.
+const DefaultAttemptBodyCap = 2048
+
+// Option configures a Store at construction.
+type Option func(*Store)
+
+// WithAttemptBodyCap sets SB-4's database-side body cap. The worker also
+// truncates at capture with the same configured value; this is the second half,
+// so a row cannot exceed the cap even if a future caller forgets.
+func WithAttemptBodyCap(n int) Option {
+	return func(s *Store) { s.attemptBodyCap = n }
 }
 
 // New wraps a pool. A nil pool is a programming error, not a runtime condition.
-func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+func New(pool *pgxpool.Pool, opts ...Option) *Store {
+	s := &Store{pool: pool, attemptBodyCap: DefaultAttemptBodyCap}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
 
 // Pool exposes the pool for the few callers that run their own transaction
 // (migrations, readiness probes). It is not a licence to write SQL elsewhere:
