@@ -292,6 +292,91 @@ var crossProducerCases = map[string]cpCase{
 			}
 		},
 	},
+	// Consumer portal self-service (M2b, UI-13/UI-14). These are scoped by the
+	// consumer id on the session claim, not by a tenant id in the path, so the
+	// cross-producer proof is cross-CONSUMER: B's consumer session must 404 on
+	// every one of A's endpoint and subscription ids when aimed directly (AC-39's
+	// "including by guessing ids"), while the two collection routes see only B's
+	// own. Aiming A's ids with B's token is order-independent, because A's ids
+	// never belong to B's consumer however the other cases mutate B's own rows.
+	"GET /v1/consumer/endpoints": {
+		build:      func(a, b *tenant) (string, any) { return "/v1/consumer/endpoints", nil },
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusOK,
+		leaks:      func(a, b *tenant) []string { return []string{a.EndpointID, a.ConsumerID, a.ConsumerRef} },
+	},
+	"POST /v1/consumer/endpoints": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/consumer/endpoints", map[string]string{"name": "cp-consumer-probe", "url": "https://1.1.1.1/hook"}
+		},
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusCreated,
+		leaks:      func(a, b *tenant) []string { return []string{a.EndpointID, a.ConsumerID} },
+		after: func(t *testing.T, e *env, created []byte) {
+			b := e.tenantFor(t, "cp-beta")
+			if ep := decode[endpointCreatedJSON](t, created); ep.ConsumerID != b.ConsumerID {
+				t.Fatalf("a consumer registered an endpoint under consumer %q, want %q (FR-110)", ep.ConsumerID, b.ConsumerID)
+			}
+		},
+	},
+	"GET /v1/consumer/event-types": {
+		build:      func(a, b *tenant) (string, any) { return "/v1/consumer/event-types", nil },
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusOK,
+		// The list is scoped to B's producer: A's type name must not appear in it
+		// even though the route takes no identifier to aim with.
+		leaks: func(a, b *tenant) []string { return []string{a.EventTypeName} },
+	},
+	"GET /v1/consumer/endpoints/{endpointID}": {
+		build:      func(a, b *tenant) (string, any) { return "/v1/consumer/endpoints/" + a.EndpointID, nil },
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusNotFound,
+	},
+	"PATCH /v1/consumer/endpoints/{endpointID}": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/consumer/endpoints/" + a.EndpointID, map[string]bool{"paused": true}
+		},
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusNotFound,
+	},
+	"POST /v1/consumer/endpoints/{endpointID}/rotate": {
+		build:      func(a, b *tenant) (string, any) { return "/v1/consumer/endpoints/" + a.EndpointID + "/rotate", nil },
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusNotFound,
+	},
+	"DELETE /v1/consumer/endpoints/{endpointID}": {
+		build:      func(a, b *tenant) (string, any) { return "/v1/consumer/endpoints/" + a.EndpointID, nil },
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusNotFound,
+	},
+	"POST /v1/consumer/endpoints/{endpointID}/verify": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/consumer/endpoints/" + a.EndpointID + "/verify", map[string]string{"token": a.EndpointVerifyToken}
+		},
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusNotFound,
+	},
+	"GET /v1/consumer/endpoints/{endpointID}/subscriptions": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/consumer/endpoints/" + a.EndpointID + "/subscriptions", nil
+		},
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusNotFound,
+	},
+	"POST /v1/consumer/endpoints/{endpointID}/subscriptions": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/consumer/endpoints/" + a.EndpointID + "/subscriptions", map[string]string{"event_type": b.EventTypeName}
+		},
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusNotFound,
+	},
+	"DELETE /v1/consumer/endpoints/{endpointID}/subscriptions/{eventType}": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/consumer/endpoints/" + a.EndpointID + "/subscriptions/" + b.EventTypeName, nil
+		},
+		credential: func(a, b *tenant) string { return b.ConsumerToken },
+		want:       http.StatusNotFound,
+	},
 	// Ingest and event types (FR-301..FR-306, FR-601..FR-607). None of the three
 	// takes a cross-tenant identifier in the path - publish and event-type writes
 	// are scoped by the credential - so the cross-producer proof is that the row

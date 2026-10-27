@@ -1,0 +1,8 @@
+{{define "nav"}}
+<nav class="nav">
+  <a href="/me" class="{{if eqs .ActiveNav "me"}}active{{end}}">Me</a>
+  <a href="/endpoints" class="{{if eqs .ActiveNav "endpoints"}}active{{end}}">Endpoints</a>
+  <a href="/deliveries" class="{{if eqs .ActiveNav "deliveries"}}active{{end}}">Deliveries</a>
+  <a href="/snippet" class="{{if eqs .ActiveNav "snippet"}}active{{end}}">Webhook snippet</a>
+</nav>
+{{end}}

@@ -162,16 +162,19 @@ type createEventTypeRequest struct {
 // eventTypeJSON is the wire view of a registered event type. It is deliberately
 // the same shape for create and list so a producer reads one thing.
 type eventTypeJSON struct {
-	Name           string            `json:"name"`
-	ProducerID     string            `json:"producer_id"`
-	Env            string            `json:"env"`
-	RoutingMode    string            `json:"routing_mode"`
-	EventClass     string            `json:"event_class"`
-	PayloadSchema  json.RawMessage   `json:"payload_schema"`
-	PayloadVersion int               `json:"payload_version"`
-	Enabled        bool              `json:"enabled"`
-	Examples       []json.RawMessage `json:"examples"`
-	CreatedAt      time.Time         `json:"created_at"`
+	Name           string          `json:"name"`
+	ProducerID     string          `json:"producer_id"`
+	Env            string          `json:"env"`
+	RoutingMode    string          `json:"routing_mode"`
+	EventClass     string          `json:"event_class"`
+	PayloadSchema  json.RawMessage `json:"payload_schema"`
+	PayloadVersion int             `json:"payload_version"`
+	Enabled        bool            `json:"enabled"`
+	// PubliclySubscribable is UI-14's gate, read back so a producer can see whether
+	// consumer users may subscribe to this type.
+	PubliclySubscribable bool              `json:"publicly_subscribable"`
+	Examples             []json.RawMessage `json:"examples"`
+	CreatedAt            time.Time         `json:"created_at"`
 }
 
 func toEventTypeJSON(et store.EventType) eventTypeJSON {
@@ -182,7 +185,8 @@ func toEventTypeJSON(et store.EventType) eventTypeJSON {
 	return eventTypeJSON{
 		Name: et.Name, ProducerID: et.ProducerID, Env: et.Env, RoutingMode: et.RoutingMode,
 		EventClass: et.EventClass, PayloadSchema: et.PayloadSchema, PayloadVersion: et.PayloadVersion,
-		Enabled: et.Enabled, Examples: examples, CreatedAt: et.CreatedAt,
+		Enabled: et.Enabled, PubliclySubscribable: et.PubliclySubscribable,
+		Examples: examples, CreatedAt: et.CreatedAt,
 	}
 }
 
@@ -230,18 +234,22 @@ func (s *Server) handleListEventTypes(w http.ResponseWriter, r *http.Request) {
 }
 
 // patchEventTypeRequest is the PATCH /v1/event-types/{name} body. An omitted (nil)
-// field is left unchanged; both are optional so {"enabled": false} and
-// {"payload_version": 2} are each valid single-field patches.
+// field is left unchanged; all are optional so {"enabled": false},
+// {"payload_version": 2} and {"publicly_subscribable": false} are each valid
+// single-field patches.
 type patchEventTypeRequest struct {
 	Enabled        *bool `json:"enabled"`
 	PayloadVersion *int  `json:"payload_version"`
+	// PubliclySubscribable is UI-14's gate: whether consumer users may subscribe to
+	// this type from the consumer portal.
+	PubliclySubscribable *bool `json:"publicly_subscribable"`
 }
 
-// handlePatchEventType is PATCH /v1/event-types/{name}: disable/enable (FR-305)
-// and version bump (FR-304) on one type in the caller's environment. Name,
-// producer, env, routing_mode and event_class are immutable and cannot be named
-// here. An unknown name in the caller's environment is a 404, never a 403
-// (FR-108 + FR-103).
+// handlePatchEventType is PATCH /v1/event-types/{name}: disable/enable (FR-305),
+// version bump (FR-304) and UI-14's publicly-subscribable gate on one type in the
+// caller's environment. Name, producer, env, routing_mode and event_class are
+// immutable and cannot be named here. An unknown name in the caller's environment
+// is a 404, never a 403 (FR-108 + FR-103).
 func (s *Server) handlePatchEventType(w http.ResponseWriter, r *http.Request) {
 	p, ok := principalFrom(r.Context())
 	if !ok {
@@ -253,8 +261,9 @@ func (s *Server) handlePatchEventType(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	et, err := s.deps.Data.PatchEventType(r.Context(), p.Scope(), r.PathValue("name"), store.EventTypePatch{
-		Enabled:        in.Enabled,
-		PayloadVersion: in.PayloadVersion,
+		Enabled:              in.Enabled,
+		PayloadVersion:       in.PayloadVersion,
+		PubliclySubscribable: in.PubliclySubscribable,
 	})
 	if err != nil {
 		s.storeError(w, r, err)

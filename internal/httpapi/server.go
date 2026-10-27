@@ -68,6 +68,23 @@ type Data interface {
 	ListSubscriptionsForEndpoint(ctx context.Context, sc store.Scope, endpointID string) ([]store.Subscription, error)
 	CreateSubscription(ctx context.Context, sc store.Scope, in store.NewSubscription) (store.Subscription, error)
 	DeleteSubscription(ctx context.Context, sc store.Scope, endpointID, eventType string) error
+
+	// M2b consumer self-service (UI-13, UI-14, AC-39): the same operations as the
+	// producer-facing methods above, but every read and write is additionally
+	// filtered by consumerID, the caller's own consumer from the session claim. A
+	// foreign or deleted id is ErrNotFound, so guessing another consumer's id is a
+	// 404 whether it is an endpoint, a pause, a delete or a subscription.
+	CreateConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID string, in store.NewConsumerEndpoint) (store.EndpointCreated, error)
+	GetConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.Endpoint, error)
+	UpdateConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string, p store.ConsumerEndpointPatch) (store.Endpoint, error)
+	RotateConsumerEndpointSecret(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.EndpointSecret, error)
+	DeleteConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string) error
+	VerifyConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID, token string) error
+	ListSubscribableEventTypes(ctx context.Context, sc store.Scope) ([]string, error)
+	ListConsumerSubscriptions(ctx context.Context, sc store.Scope, consumerID, endpointID string) ([]store.Subscription, error)
+	CreateConsumerSubscription(ctx context.Context, sc store.Scope, consumerID, endpointID, eventType string) (store.Subscription, error)
+	DeleteConsumerSubscription(ctx context.Context, sc store.Scope, consumerID, endpointID, eventType string) error
+
 	InviteConsumerUser(ctx context.Context, sc store.Scope, actor store.Actor, consumerID, email string) (store.Invite, error)
 	ListConsumerUsers(ctx context.Context, sc store.Scope, consumerID string) ([]store.ConsumerUser, error)
 	RevokeConsumerUser(ctx context.Context, sc store.Scope, consumerID, userID string) error

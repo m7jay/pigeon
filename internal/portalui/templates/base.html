@@ -1,0 +1,28 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{if .Title}}{{.Title}} · {{end}}{{.Brand.Name}}</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <style>{{.Brand.CSS}}</style>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">
+    {{if .Brand.LogoURL}}<img class="brand-logo" src="{{.Brand.LogoURL}}" alt="logo">{{end}}
+    <span class="brand-name">{{.Brand.Name}}</span>
+    {{if .Brand.Company}}<span class="brand-company">{{.Brand.Company}}</span>{{end}}
+  </a>
+  {{template "nav" .}}
+  <div class="topbar-spacer"></div>
+  {{template "userbox" .}}
+</header>
+<main class="content">
+  {{if .Flash}}{{template "flash" .}}{{end}}
+  {{template "content" .}}
+</main>
+<footer class="footer"><span>Powered by an event delivery API.</span></footer>
+<script src="/assets/htmx.min.js"></script>
+</body>
+</html>{{end}}

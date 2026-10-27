@@ -28,13 +28,16 @@ type Endpoint struct {
 	ConsumerID string
 	Name       string
 	URL        string
-	Internal   bool
-	Status     string // active | paused | deleted
-	Verified   bool
-	VerifiedAt time.Time
-	PausedAt   time.Time
-	DeletedAt  time.Time
-	CreatedAt  time.Time
+	// NotificationEmail is UI-13's consumer-configured address. Null until the
+	// consumer user sets one; the consumer portal and the API both read it back.
+	NotificationEmail *string
+	Internal          bool
+	Status            string // active | paused | deleted
+	Verified          bool
+	VerifiedAt        *time.Time // null until the ownership challenge is answered
+	PausedAt          time.Time
+	DeletedAt         time.Time
+	CreatedAt         time.Time
 }
 
 // NewEndpoint is a POST to register an endpoint. Internal is FR-402's escape hatch
@@ -131,12 +134,12 @@ func (s *Store) CreateEndpoint(ctx context.Context, sc Scope, in NewEndpoint) (E
 				(id, producer_id, env, consumer_id, name, url, internal,
 				 verification_token_hash, verification_hint, signing_secret, signing_secret_hint)
 			values ($1,$2,$3,$4,$5,$6,$7, $8, $9, $10, $11)
-			returning id, consumer_id, name, url, internal, status,
+			returning id, consumer_id, name, url, notification_email, internal, status,
 				verified_at is not null, coalesce(verified_at, now()),
 				coalesce(paused_at, now()), coalesce(deleted_at, now()), created_at`,
 			id.New("end"), sc.ProducerID, sc.Env, in.ConsumerID, in.Name, in.URL, in.Internal,
 			tokenHash(token), token[:8], secret, hint,
-		).Scan(&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.Internal, &ep.Status,
+		).Scan(&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
 			&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt)
 		return mapPgError(err, ErrConflict, ErrNotFound)
 	})
@@ -152,7 +155,7 @@ func (s *Store) CreateEndpoint(ctx context.Context, sc Scope, in NewEndpoint) (E
 	}, nil
 }
 
-const endpointSelectCols = `id, consumer_id, name, url, internal, status,
+const endpointSelectCols = `id, consumer_id, name, url, notification_email, internal, status,
 	verified_at is not null as verified, verified_at,
 	coalesce(paused_at, now()) as paused_at, coalesce(deleted_at, now()) as deleted_at, created_at`
 
@@ -164,7 +167,7 @@ func (s *Store) GetEndpoint(ctx context.Context, sc Scope, endpointID string) (E
 		err := tx.QueryRow(ctx, `select `+endpointSelectCols+`
 			from endpoints where producer_id = $1 and env = $2 and id = $3 and status <> 'deleted'`,
 			sc.ProducerID, sc.Env, endpointID).Scan(
-			&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.Internal, &ep.Status,
+			&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
 			&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
@@ -193,7 +196,7 @@ func (s *Store) ListEndpointsForConsumer(ctx context.Context, sc Scope, consumer
 		defer rows.Close()
 		for rows.Next() {
 			var ep Endpoint
-			if err := rows.Scan(&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.Internal, &ep.Status,
+			if err := rows.Scan(&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
 				&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt); err != nil {
 				return err
 			}
@@ -250,7 +253,7 @@ func (s *Store) setEndpointStatus(ctx context.Context, sc Scope, endpointID, sta
 		return tx.QueryRow(ctx, `select `+endpointSelectCols+`
 			from endpoints where producer_id = $1 and env = $2 and id = $3`,
 			sc.ProducerID, sc.Env, endpointID).Scan(
-			&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.Internal, &ep.Status,
+			&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
 			&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt)
 	})
 	if err != nil {
