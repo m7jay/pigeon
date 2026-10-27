@@ -208,6 +208,23 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, reason := range sortedReasons(snap) {
 		_, _ = fmt.Fprintf(w, "pigeon_non_deliveries_total{reason=%q} %d\n", reason, snap[reason])
 	}
+	// S6: the delivery, attempt and LOG-2 gate counters. They are the volume the
+	// success log line would have carried, which is exactly what LOG-2/AC-33
+	// require to be readable from here rather than from the log stream.
+	counters := s.deps.Metrics.CounterSnapshot()
+	names := make([]string, 0, len(counters))
+	for name := range counters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		metricType := "counter"
+		if name == metrics.AttemptBufferPending {
+			metricType = "gauge"
+		}
+		_, _ = fmt.Fprintf(w, "# TYPE %s %s\n", name, metricType)
+		_, _ = fmt.Fprintf(w, "%s %d\n", name, counters[name])
+	}
 }
 
 // sortedReasons gives the series a stable, deterministic order so the scrape is
