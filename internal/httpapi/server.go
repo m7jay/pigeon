@@ -19,6 +19,7 @@ import (
 
 	"github.com/m7jay/pigeon/internal/metrics"
 	"github.com/m7jay/pigeon/internal/ratelimit"
+	"github.com/m7jay/pigeon/internal/retention"
 	"github.com/m7jay/pigeon/internal/store"
 )
 
@@ -116,6 +117,26 @@ type Deps struct {
 	// Metrics, when set, exposes the fan-out non-delivery counters (FR-508) at
 	// GET /metrics. Nil disables the route, which the unit tests want.
 	Metrics *metrics.Metrics
+
+	// Retention is the storage-budget surface: GET /v1/meta/usage (SB-6) and the
+	// publish gate that sheds load with 429 (SB-7). Nil means "no retention
+	// signal": the usage route answers 503 and publish never sheds, which is what
+	// the unit tests want. *retention.Manager implements it.
+	Retention Retention
+}
+
+// Retention is the read side of the storage budget. The interface exists so the
+// HTTP layer can be tested with "the disk is at 95%" (AC-18) without a database
+// or a full volume, and so this package does not depend on the retention
+// policy's internals.
+type Retention interface {
+	// Status is the SB-6 payload: volume usage against the budget, the partition
+	// catalogue with sizes and row estimates, and the configured windows.
+	Status(ctx context.Context) (retention.Status, error)
+	// IngestGate reports whether publish should shed load right now (SB-7). It
+	// refreshes its cached reading at most once per its configured TTL, so the
+	// hot publish path does not statfs the volume per request.
+	IngestGate(ctx context.Context) bool
 }
 
 // Server holds the router and its dependencies.
@@ -208,6 +229,15 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, reason := range sortedReasons(snap) {
 		_, _ = fmt.Fprintf(w, "pigeon_non_deliveries_total{reason=%q} %d\n", reason, snap[reason])
 	}
+	// SB-6's storage-budget counters. Emitted unconditionally: an alert rule on
+	// "partition drops started happening" needs the series to exist at zero, not
+	// only after the first drop.
+	_, _ = fmt.Fprintf(w, "# HELP pigeon_partition_drops_total Partitions dropped by retention because of the disk budget or age (SB-3).\n")
+	_, _ = fmt.Fprintf(w, "# TYPE pigeon_partition_drops_total counter\n")
+	_, _ = fmt.Fprintf(w, "pigeon_partition_drops_total %d\n", s.deps.Metrics.PartitionDropCount())
+	_, _ = fmt.Fprintf(w, "# HELP pigeon_publishes_shed_total Publishes refused with 429 because the disk was over budget (SB-7).\n")
+	_, _ = fmt.Fprintf(w, "# TYPE pigeon_publishes_shed_total counter\n")
+	_, _ = fmt.Fprintf(w, "pigeon_publishes_shed_total %d\n", s.deps.Metrics.ShedCount())
 }
 
 // sortedReasons gives the series a stable, deterministic order so the scrape is

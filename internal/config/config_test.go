@@ -25,6 +25,13 @@ func valid() Config {
 		DeliveryWorkers:           1,
 		DeliveryMaxAttempts:       15,
 		DeliveryMaxConnsPerHost:   1,
+		// S8's storage budget. Load() starts from defaults(), so a real deployment
+		// always has these set; a hand-built Config that leaves them zero is not a
+		// reference deployment. Validate refuses a 0% budget on purpose (SB-3).
+		RetentionMaxDiskPct:     80,
+		RetentionDeliveriesDays: 14,
+		RetentionAttemptsDays:   7,
+		RetentionEventsDays:     14,
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/m7jay/pigeon/internal/broker"
 	"github.com/m7jay/pigeon/internal/config"
@@ -26,6 +27,7 @@ import (
 	"github.com/m7jay/pigeon/internal/metrics"
 	"github.com/m7jay/pigeon/internal/ratelimit"
 	"github.com/m7jay/pigeon/internal/relay"
+	"github.com/m7jay/pigeon/internal/retention"
 	"github.com/m7jay/pigeon/internal/store"
 )
 
@@ -111,8 +113,35 @@ func run() error {
 	}
 
 	// nonDeliveryMetrics is FR-508's counter set, shared by the relay (which
-	// advances it as events fan out) and the /metrics scrape that reads it.
+	// advances it as events fan out) and the /metrics scrape that reads it. S8
+	// also records partition drops and shed publishes here (SB-6).
 	nonDeliveryMetrics := metrics.New()
+
+	// S8: the storage budget. The manager is the single place the disk budget is
+	// applied: the sweeper drives RunOnce under its leadership lease (D-7), and
+	// the API reads Status/IngestGate. The gauge measures PIGEON_DISK_DIR when it
+	// is set (core and Postgres sharing a volume), and falls back to pigeon's own
+	// database size against PIGEON_DISK_BYTES when the volume is not visible from
+	// this process — the honest reading in a split-container deployment. A gauge
+	// with neither signal reports "none" rather than a calm zero.
+	gauge := &retention.FilesystemGauge{
+		Dir:      cfg.DiskDir,
+		Bytes:    cfg.DiskBytes,
+		Database: st.DatabaseSize,
+	}
+	rm := retention.NewManager(st, gauge, retention.Options{
+		MaxDiskPct:          cfg.RetentionMaxDiskPct,
+		DeliveriesRetention: time.Duration(cfg.RetentionDeliveriesDays) * 24 * time.Hour,
+		AttemptsRetention:   time.Duration(cfg.RetentionAttemptsDays) * 24 * time.Hour,
+		EventsRetention:     time.Duration(cfg.RetentionEventsDays) * 24 * time.Hour,
+		Logger:              log,
+	})
+	log.Info("retention configured",
+		"max_disk_pct", cfg.RetentionMaxDiskPct,
+		"deliveries_days", cfg.RetentionDeliveriesDays,
+		"attempts_days", cfg.RetentionAttemptsDays,
+		"disk_dir", cfg.DiskDir, "disk_bytes", cfg.DiskBytes)
+
 	api := httpapi.New(httpapi.Deps{
 		Lookup: func(ctx context.Context, plaintext string) (store.Principal, error) {
 			return store.LookupAPIKey(ctx, pool, plaintext)
@@ -123,6 +152,8 @@ func run() error {
 		Data: st,
 		// FR-508: the fan-out non-delivery counters, exposed at GET /metrics.
 		Metrics: nonDeliveryMetrics,
+		// SB-6/SB-7: GET /v1/meta/usage and the publish 429 gate.
+		Retention: rm,
 		// FR-206: last_used_at is an evidence write and runs off the request path,
 		// inside the middleware that authenticated the key.
 		TouchKey:         st.TouchKey,
@@ -196,22 +227,32 @@ func run() error {
 				log.Error("delivery worker stopped unexpectedly", "error", err)
 			}
 		}()
-
-		sw := delivery.NewSweeper(st, delivery.SweeperOptions{
-			URL:      cfg.SweeperLockURL,
-			Interval: cfg.SweeperInterval,
-			LockWait: cfg.SweeperLockWait,
-			Logger:   log,
-		})
-		workersWG.Add(1)
-		go func() {
-			defer workersWG.Done()
-			log.Info("sweeper started", "interval_s", int(cfg.SweeperInterval.Seconds()))
-			if err := sw.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Error("sweeper stopped unexpectedly", "error", err)
-			}
-		}()
 	}
+
+	// The sweeper runs whether or not delivery workers do. It owns two jobs:
+	// recovering leases a crashed worker left behind (D-6) and the storage
+	// budget's partition drops (SB-3). An ingest-only deployment (DeliveryWorkers
+	// = 0) still needs the second, or its disk fills and nothing ever drops a
+	// partition. Running it always also gives the deployment one stable leadership
+	// holder (D-7), so AC-42's "exactly one partition dropped" holds no matter how
+	// many replicas and how many of them run workers. When there are no deliveries
+	// the requeue is a cheap no-op; the retention tick still does its work.
+	sw := delivery.NewSweeper(st, delivery.SweeperOptions{
+		URL:       cfg.SweeperLockURL,
+		Interval:  cfg.SweeperInterval,
+		LockWait:  cfg.SweeperLockWait,
+		Logger:    log,
+		Retention: rm,
+		Metrics:   nonDeliveryMetrics,
+	})
+	workersWG.Add(1)
+	go func() {
+		defer workersWG.Done()
+		log.Info("sweeper started", "interval_s", int(cfg.SweeperInterval.Seconds()))
+		if err := sw.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("sweeper stopped unexpectedly", "error", err)
+		}
+	}()
 
 	go func() {
 		log.Info("core listening", "addr", cfg.HTTPAddr, "version", version)

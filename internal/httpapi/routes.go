@@ -110,6 +110,10 @@ func (s *Server) routes() []route {
 		// FR-508: the fan-out non-delivery counters, one series per reason. Operator
 		// telemetry over the whole platform, so it is not tenant-scoped (admin only).
 		{http.MethodGet, "/metrics", kindAdmin, s.handleMetrics},
+		// SB-6: the storage budget as an operator sees it — volume usage against
+		// max_disk_pct, the partition catalogue with sizes and row estimates, and
+		// the retention windows. Infrastructure telemetry, so admin only.
+		{http.MethodGet, "/v1/meta/usage", kindAdmin, s.handleUsage},
 
 		// Producer membership and invitations (FR-104, FR-105, FR-109).
 		{http.MethodGet, "/v1/producer/members", kindMember, s.handleListMembers},

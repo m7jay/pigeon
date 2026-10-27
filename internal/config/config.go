@@ -59,6 +59,25 @@ type Config struct {
 	CoreReplicas    int32 // PIGEON_CORE_REPLICAS
 	DBReservedConns int32 // PIGEON_DB_RESERVED_CONNS
 
+	// Retention (SB-3, SB-5, SB-6, SB-7). The disk budget is a percentage of the
+	// volume that holds the data directory; the windows are the age defaults
+	// docs/retention.md documents. All four are configuration rather than
+	// migrations (FR-1104), because they depend on the operator's volume.
+	RetentionMaxDiskPct     int // PIGEON_RETENTION_MAX_DISK_PCT (default 80)
+	RetentionDeliveriesDays int // PIGEON_RETENTION_DELIVERIES_DAYS (default 14)
+	RetentionAttemptsDays   int // PIGEON_RETENTION_ATTEMPTS_DAYS (default 7)
+	RetentionEventsDays     int // PIGEON_RETENTION_EVENTS_DAYS (default 14)
+	// DiskDir is the directory whose filesystem is measured against the budget
+	// (usually the Postgres data directory, visible when core and postgres share
+	// a volume). Empty disables the filesystem reading, leaving the
+	// database-size fallback below.
+	DiskDir string // PIGEON_DISK_DIR
+	// DiskBytes, when set, is the volume size to compare against instead of the
+	// filesystem's own total. It is the fallback for a deployment where core
+	// cannot statfs the data directory: usage is then pigeon's own database size
+	// against this number, reported as source "database" in /v1/meta/usage.
+	DiskBytes uint64 // PIGEON_DISK_BYTES
+
 	// Delivery worker (S4) and sweeper. The timeout is capped at the FR-802 hard
 	// ceiling of 5 s in Load.
 	DeliveryWorkers         int           // PIGEON_DELIVERY_WORKERS (0 disables the worker)
@@ -73,7 +92,7 @@ type Config struct {
 	DeliveryUserAgent       string        // PIGEON_DELIVERY_USER_AGENT (FR-810)
 	SweeperInterval         time.Duration // PIGEON_SWEEPER_INTERVAL (<= 10 s, D-6; clamped in Load)
 	SweeperLockURL          string        // PIGEON_SWEEPER_LOCK_URL (defaults to DatabaseURL)
-	SweeperLockWait         time.Duration // PIGEON_SWEEPER_LOCK_WAIT
+	SweeperLockWait         time.Duration // PIGEON_SWEEPER_LOCK_WAIT (how long to compete before logging "standing by"; the replica keeps competing)
 
 	// Observability
 	LogLevel slog.Level // PIGEON_LOG_LEVEL
@@ -100,6 +119,10 @@ func defaults() Config {
 		RateLimitPerProducerBurst: 400,
 		CoreReplicas:              1,
 		DBReservedConns:           5,
+		RetentionMaxDiskPct:       80,
+		RetentionDeliveriesDays:   14,
+		RetentionAttemptsDays:     7,
+		RetentionEventsDays:       14,
 		DeliveryWorkers:           1,
 		DeliveryLease:             40 * time.Second,
 		DeliveryTimeout:           5 * time.Second,
@@ -156,6 +179,22 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if c.DBReservedConns, err = envInt32("PIGEON_DB_RESERVED_CONNS", c.DBReservedConns); err != nil {
+		return Config{}, err
+	}
+	if c.RetentionMaxDiskPct, err = envInt("PIGEON_RETENTION_MAX_DISK_PCT", c.RetentionMaxDiskPct); err != nil {
+		return Config{}, err
+	}
+	if c.RetentionDeliveriesDays, err = envInt("PIGEON_RETENTION_DELIVERIES_DAYS", c.RetentionDeliveriesDays); err != nil {
+		return Config{}, err
+	}
+	if c.RetentionAttemptsDays, err = envInt("PIGEON_RETENTION_ATTEMPTS_DAYS", c.RetentionAttemptsDays); err != nil {
+		return Config{}, err
+	}
+	if c.RetentionEventsDays, err = envInt("PIGEON_RETENTION_EVENTS_DAYS", c.RetentionEventsDays); err != nil {
+		return Config{}, err
+	}
+	c.DiskDir = env("PIGEON_DISK_DIR", c.DiskDir)
+	if c.DiskBytes, err = envBytes("PIGEON_DISK_BYTES", c.DiskBytes); err != nil {
 		return Config{}, err
 	}
 	if c.DeliveryWorkers, err = envInt("PIGEON_DELIVERY_WORKERS", c.DeliveryWorkers); err != nil {
@@ -279,6 +318,22 @@ func (c Config) Validate() error {
 	if c.RateLimitPerKeyBurst < 0 || c.RateLimitPerProducerBurst < 0 {
 		problems = append(problems, "rate-limit bursts must be >= 0")
 	}
+	// SB-3's budget and SB-5's windows. A 0% budget would drop history on an
+	// empty disk and a >100% one would never drop at all, so both are refusals
+	// rather than clamps: the operator meant something, and a silent clamp would
+	// hide it until the disk filled.
+	if c.RetentionMaxDiskPct < 1 || c.RetentionMaxDiskPct > 100 {
+		problems = append(problems, "PIGEON_RETENTION_MAX_DISK_PCT must be between 1 and 100 (SB-3)")
+	}
+	if c.RetentionDeliveriesDays < 1 {
+		problems = append(problems, "PIGEON_RETENTION_DELIVERIES_DAYS must be >= 1 (SB-5)")
+	}
+	if c.RetentionAttemptsDays < 1 {
+		problems = append(problems, "PIGEON_RETENTION_ATTEMPTS_DAYS must be >= 1 (SB-5)")
+	}
+	if c.RetentionEventsDays < 1 {
+		problems = append(problems, "PIGEON_RETENTION_EVENTS_DAYS must be >= 1 (SB-5)")
+	}
 	if len(problems) > 0 {
 		return fmt.Errorf("%w: %s", ErrUnsafeConfig, strings.Join(problems, "; "))
 	}
@@ -392,6 +447,36 @@ func envBool(key string, def bool) (bool, error) {
 		return def, fmt.Errorf("%w: %s=%q is not a boolean", ErrUnsafeConfig, key, raw)
 	}
 	return b, nil
+}
+
+// envBytes parses a size like 40GiB, 512MiB or a plain byte count, so an
+// operator can write the volume size in the units they think in. Suffixes are
+// binary (GiB = 1024^3) because that is what `du` and the filesystem report.
+func envBytes(key string, def uint64) (uint64, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return def, nil
+	}
+	s := strings.TrimSpace(raw)
+	mult := uint64(1)
+	for _, suf := range []struct {
+		suffix string
+		mult   uint64
+	}{
+		{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30}, {"TiB", 1 << 40},
+		{"K", 1 << 10}, {"M", 1 << 20}, {"G", 1 << 30}, {"T", 1 << 40},
+	} {
+		trimmed := strings.TrimSuffix(s, suf.suffix)
+		if trimmed != s {
+			s, mult = trimmed, suf.mult
+			break
+		}
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return def, fmt.Errorf("%w: %s=%q is not a size (e.g. 40GiB, 512MiB, 10737418240)", ErrUnsafeConfig, key, raw)
+	}
+	return n * mult, nil
 }
 
 func envDuration(key string, def time.Duration) (time.Duration, error) {
