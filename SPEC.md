@@ -548,15 +548,19 @@ client-held claim, no signed cookie.
 **Mechanism.**
 
 - Login mints the token and stores `sha256(token)` with `user_id`, `producer_id`,
-  `env`, `consumer_id`, `csrf_secret`, `expires_at` (absolute TTL, default 12 h) and
+  `env`, `consumer_id`, `expires_at` (absolute TTL, default 12 h) and
   `last_seen_at` (idle TTL default 30 min, written at most once a minute through the
-  `EvidenceTx` class so it costs no fsync). The cookie is `HttpOnly; Secure;
-  SameSite=Lax; Path=/` per FR-1009 and carries no data beyond the token.
+  `EvidenceTx` class so it costs no fsync). There is no per-session CSRF secret: the
+  browser-to-portal token is FR-1009's own (§14.2), minted by the portal from the
+  secret it already holds, so nothing about it belongs on the core's session record.
+  The cookie is `HttpOnly; Secure; SameSite=Lax; Path=/` per FR-1009 and carries no
+  data beyond the token.
 - The portal is a server-side API client: its handlers call the core over the network
-  with `Authorization: Bearer <that token>`, `X-Request-Id`, and a double-submit CSRF
-  token on mutations. The browser never holds a credential it can replay at another
-  host, and the API performs the filtering, so a compromised or buggy portal cannot
-  widen a result set it was handed.
+  with `Authorization: Bearer <that token>` and `X-Request-Id` only. No CSRF token
+  travels on that hop - it is not a hop a CSRF attack traverses, and the token the
+  portal's own forms carry is never forwarded (FR-113). The browser never holds a
+  credential it can replay at another host, and the API performs the filtering, so a
+  compromised or buggy portal cannot widen a result set it was handed.
 - The same token is a plain bearer, so AC-39's "a consumer user calls the API
   directly" is testable with the value from the cookie and without inventing a second
   credential type. A copyable long-lived consumer API token is not in v1.0; if it is

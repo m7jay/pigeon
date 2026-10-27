@@ -330,7 +330,7 @@ Priorities: **P0** ships or nothing · **P1** in the first release, cuttable und
 | FR-110 | A consumer user's credential MUST be bound to exactly one `consumer_id` at issuance, and every API request made with it MUST be filtered by that binding server-side, never by a field the client asserts. | P0 |
 | FR-111 | Consumer users MUST authenticate by emailed invitation or password reset; they MUST NOT be able to self-register into a producer. | P0 |
 | FR-112 | A portal session MUST be an opaque random token, stored only as a hash, delivered as an `HttpOnly; Secure; SameSite=Lax` cookie (FR-1009) and accepted by the API as a bearer; the scope binding MUST live in the session record, not in the token or the client. Revocation MUST take effect within 5 s. | P0 |
-| FR-113 | The consumer portal MUST call the core API over the network as a scoped client, presenting that session's bearer and a CSRF token on mutations, and MUST NOT authorise anything itself: a request the portal could make is a request the same token could make directly. | P0 |
+| FR-113 | The consumer portal MUST call the core API over the network as a scoped client, presenting that session's bearer, and MUST NOT authorise anything itself: a request the portal could make is a request the same token could make directly. The CSRF token on its own mutations is the browser-to-portal token of FR-1009 (§14.2), which the portal mints and verifies itself; it is not presented to the core, and no second token is minted for the portal-to-core hop. | P0 |
 
 ### 7.2 API keys (FR-2)
 
