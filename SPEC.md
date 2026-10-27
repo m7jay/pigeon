@@ -308,6 +308,13 @@ and is retried on the next tick.
 the configured `PIGEON_RETENTION_EVENTS_DAYS` window appears in the usage payload
 but no partitions are dropped for it. This is a known gap, not a silent promise.
 
+**SB-6's dashboard half has no dashboard to put it in.** SB-6 asks for the disk
+figure on "the dashboard and `GET /v1/meta/usage`". There is no operator dashboard in
+the tree (the consumer portal is tenant-facing), so the pressure signal ships as the
+admin-only JSON endpoint plus `pigeon_partition_drops_total` and
+`pigeon_publishes_shed_total` on `/metrics`, which an external dashboard or alert
+scrapes. If an operator UI lands later, it reads the same payload.
+
 ## Local toolchain
 
 Go 1.23+ is required. On this build host it is installed at
