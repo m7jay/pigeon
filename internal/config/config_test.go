@@ -25,6 +25,18 @@ func valid() Config {
 		DeliveryWorkers:           1,
 		DeliveryMaxAttempts:       15,
 		DeliveryMaxConnsPerHost:   1,
+		// S6: the reference deployment buffers attempt evidence in Redis (D-1)
+		// and keeps SB-5's default retention windows. The buffered default is
+		// only valid with a Redis URL, so a "valid config" must carry both.
+		RedisURL:             "redis://localhost:6379/0",
+		AttemptLogMode:       AttemptLogBuffered,
+		AttemptFlushBatch:    MinFlushBatch,
+		AttemptFlushInterval: time.Second,
+		AttemptFlushStale:    30 * time.Second,
+		SuccessLogRPS:        100,
+		RetentionDeliveries:  14 * 24 * time.Hour,
+		RetentionAttempts:    7 * 24 * time.Hour,
+		RetentionEvents:      14 * 24 * time.Hour,
 	}
 }
 
@@ -119,6 +131,7 @@ func TestParseLevel(t *testing.T) {
 
 func TestLoadFromEnvironment(t *testing.T) {
 	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
+	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0") // S6's default mode is buffered (D-1)
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
 	t.Setenv("PIGEON_LOG_LEVEL", "debug")
 	t.Setenv("PIGEON_DB_MAX_CONNS", "20")
@@ -148,6 +161,7 @@ func TestLoadRejectsGarbage(t *testing.T) {
 // to start on (FR-802's timeout is clamped the same way).
 func TestLoadClampsTheSweeperInterval(t *testing.T) {
 	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
+	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0") // S6's default mode is buffered (D-1)
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
 	t.Setenv("PIGEON_SWEEPER_INTERVAL", "2m")
 	c, err := Load()
@@ -180,5 +194,103 @@ func TestValidateRefusesANegativeBodyCaptureCap(t *testing.T) {
 	c.DeliveryMaxBodyBytes = 0
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate rejected 0, which SB-4 requires to mean \"capture nothing\": %v", err)
+	}
+}
+
+// TestLoadClampsTheAttemptFlushInterval is §6's evidence window: the attempt tail
+// may be up to 1 s behind, so the flush cadence is a ceiling like D-6's sweep
+// interval. Without the clamp one env var silently widens the durability window
+// the contract already states.
+func TestLoadClampsTheAttemptFlushInterval(t *testing.T) {
+	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
+	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0")
+	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+	t.Setenv("PIGEON_ATTEMPT_FLUSH_INTERVAL", "30s")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.AttemptFlushInterval != maxFlushInterval {
+		t.Fatalf("AttemptFlushInterval = %s, want it clamped to %s (§6)", c.AttemptFlushInterval, maxFlushInterval)
+	}
+	// Faster than the window is a choice, not a violation.
+	t.Setenv("PIGEON_ATTEMPT_FLUSH_INTERVAL", "100ms")
+	if c, err = Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.AttemptFlushInterval != 100*time.Millisecond {
+		t.Fatalf("AttemptFlushInterval = %s, want the configured 100ms", c.AttemptFlushInterval)
+	}
+}
+
+// TestLoadRaisesTheFlushBatchToTheFloor is FR-815: at least 2,000 rows per
+// transaction at the reference load. A configured value below the floor is raised
+// rather than refused, so one careless env var cannot turn the evidence path back
+// into single-row commits.
+func TestLoadRaisesTheFlushBatchToTheFloor(t *testing.T) {
+	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
+	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0")
+	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+	t.Setenv("PIGEON_ATTEMPT_FLUSH_BATCH", "10")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.AttemptFlushBatch != MinFlushBatch {
+		t.Fatalf("AttemptFlushBatch = %d, want it raised to FR-815's floor %d", c.AttemptFlushBatch, MinFlushBatch)
+	}
+	// Above the floor is a choice: a bigger batch is a bigger transaction, not a
+	// smaller one, so it is left alone.
+	t.Setenv("PIGEON_ATTEMPT_FLUSH_BATCH", "5000")
+	if c, err = Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.AttemptFlushBatch != 5000 {
+		t.Fatalf("AttemptFlushBatch = %d, want the configured 5000", c.AttemptFlushBatch)
+	}
+}
+
+// TestValidateRefusesBufferedEvidenceWithoutRedis is D-1: the buffer lives in
+// Redis, never in the worker's own memory. A buffered configuration with no Redis
+// is a refusal at boot, not a runtime surprise where attempts pile up in a
+// process that is about to be restarted.
+func TestValidateRefusesBufferedEvidenceWithoutRedis(t *testing.T) {
+	c := valid()
+	c.RedisURL = ""
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate accepted attempt_log.mode=buffered with no PIGEON_REDIS_URL")
+	}
+	// The explicit inline mode is the escape hatch, and it needs no Redis.
+	c.AttemptLogMode = AttemptLogSync
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate rejected sync mode without Redis: %v", err)
+	}
+	// An unknown mode is a refusal too, not a silent buffered.
+	c.AttemptLogMode = "sometimes"
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate accepted an unknown PIGEON_ATTEMPT_LOG_MODE")
+	}
+}
+
+// TestValidateRefusesNonPositiveRetention is SB-5: retention is configuration,
+// and a zero window is not "keep everything", it is "drop everything". Refusing
+// it is the difference between "operator sized history" and "operator erased it".
+func TestValidateRefusesNonPositiveRetention(t *testing.T) {
+	for _, zero := range []func(*Config){
+		func(c *Config) { c.RetentionDeliveries = 0 },
+		func(c *Config) { c.RetentionAttempts = 0 },
+		func(c *Config) { c.RetentionEvents = 0 },
+	} {
+		c := valid()
+		zero(&c)
+		if err := c.Validate(); err == nil {
+			t.Fatalf("Validate accepted a non-positive retention window: %+v", c)
+		}
+	}
+	// The defaults() bootstrap sets SB-5's windows, so they are configuration and
+	// not a migration constant.
+	d := defaults()
+	if d.RetentionDeliveries != 14*24*time.Hour || d.RetentionAttempts != 7*24*time.Hour || d.RetentionEvents != 14*24*time.Hour {
+		t.Fatalf("SB-5 defaults drifted: %s / %s / %s", d.RetentionDeliveries, d.RetentionAttempts, d.RetentionEvents)
 	}
 }

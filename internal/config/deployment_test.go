@@ -16,6 +16,9 @@ import (
 // all — the policies run for nobody. That is not a warning: it is a refusal.
 func TestMigratorRoleMustDifferFromTheRuntimeRole(t *testing.T) {
 	safe := defaults()
+	// S6's default is buffered evidence (D-1), and Validate refuses buffered mode
+	// without a Redis URL, so the reference split-role deployment must carry one.
+	safe.RedisURL = "redis://redis:6379/0"
 	safe.DatabaseURL = "postgres://pigeon_app:secret@db:5432/pigeon?sslmode=disable"
 	safe.MigrateDatabaseURL = "postgres://pigeon_migrator:secret@db:5432/pigeon?sslmode=disable"
 	safe.InstanceAdminPassword = "long-enough-admin-password"
