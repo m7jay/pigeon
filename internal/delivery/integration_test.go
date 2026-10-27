@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -184,9 +186,24 @@ func attemptRow(t *testing.T, admin *pgxpool.Pool, deliveryID int64) (attempt st
 }
 
 // verifySignature recomputes the Standard Webhooks signature the way a consumer
-// would (FR-1001/FR-1002) and compares. It does not call the signer.
+// would (FR-1001/FR-1002) and compares. It does not call the signer, and it
+// re-derives the key itself (strip "whsec_", pad, standard base64) rather than
+// through envelope.SecretBytes: a test that shares the signer's decode passes even
+// when both sides are wrong about the key, which is exactly how the wrapper-as-key
+// defect survived round 1.
 func verifySignature(secret, id, ts, body, sig string) bool {
-	mac := hmac.New(sha256.New, []byte(secret))
+	enc := strings.TrimPrefix(secret, "whsec_")
+	if enc == secret {
+		return false
+	}
+	if pad := len(enc) % 4; pad != 0 {
+		enc += strings.Repeat("=", 4-pad)
+	}
+	key, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil || len(key) == 0 {
+		return false
+	}
+	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(id + "." + ts + "."))
 	mac.Write([]byte(body))
 	want := "v1," + base64.StdEncoding.EncodeToString(mac.Sum(nil))
@@ -261,6 +278,33 @@ func TestSuccessfulDeliveryWritesNoAttemptRow(t *testing.T) {
 	}
 	if !verifySignature(secret, gotID, gotTS, string(gotBody), gotSig) {
 		t.Fatal("Webhook-Signature does not verify against the endpoint secret over <id>.<ts>.<body> (FR-1002)")
+	}
+	// The timestamp is integer Unix seconds of the attempt, not the event's
+	// created_at (FR-1001/FR-1003): a conforming consumer compares this header to
+	// its own clock, so an event-time stamp would already be outside the tolerance
+	// window by attempt 4 (§9's schedule).
+	ts, err := strconv.ParseInt(gotTS, 10, 64)
+	if err != nil {
+		t.Fatalf("Webhook-Timestamp = %q, want an integer Unix-seconds string (FR-1001)", gotTS)
+	}
+	if age := time.Since(time.Unix(ts, 0)); age < 0 || age > 30*time.Second {
+		t.Fatalf("Webhook-Timestamp = %s is %s from now; want the attempt time (FR-1001, FR-1003)", gotTS, age)
+	}
+	// FR-1001: the minted secret is "whsec_" + STANDARD base64. A spec consumer
+	// decodes it with the standard alphabet, which silently drops the URL-safe
+	// "-"/"_" rather than failing, so a URL-safe secret would derive a short key
+	// and verify for roughly one endpoint in four. The mint is unpadded; the
+	// verifier (and this assertion) restores the padding before decoding.
+	enc := strings.TrimPrefix(secret, "whsec_")
+	if pad := len(enc) % 4; pad != 0 {
+		enc += strings.Repeat("=", 4-pad)
+	}
+	raw, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil {
+		t.Fatalf("endpoint secret %q is not standard base64: %v", secret, err)
+	}
+	if len(raw) != 32 {
+		t.Fatalf("endpoint secret decodes to %d bytes, want 32", len(raw))
 	}
 }
 
@@ -528,45 +572,83 @@ func TestLeaseExpiryReclaimsWithoutDuplicateAttempts(t *testing.T) {
 	}
 }
 
-// TestSweeperRequeuesExpiredLease is D-6: the sweeper re-queues a lease that
-// lapsed within its window so a crashed worker costs one lease interval, not a
-// lost delivery. A lease older than the window is left alone (the previous sweep
-// would already have caught it).
+// seedAnotherDelivery publishes and fans out one more event on the stack
+// seedHarness already built, so a test can assert over more than one pending
+// delivery without re-seeding. The scope, event type and consumer ref are the
+// fixed ones seedHarness creates.
+func seedAnotherDelivery(t *testing.T, st *store.Store, admin *pgxpool.Pool, payload string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	sc := store.Scope{ProducerID: "prd_delac", Env: "test"}
+	pub, err := st.PublishEvent(ctx, sc, store.PublishInput{
+		EventType: "order.created", Payload: json.RawMessage(payload), ConsumerRef: ptr("school_1"),
+	})
+	if err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	if _, err := st.FanOutEvent(ctx, sc, pub.ID); err != nil {
+		t.Fatalf("FanOutEvent: %v", err)
+	}
+	var id int64
+	if err := admin.QueryRow(ctx, `select id from deliveries where event_id=$1 limit 1`, pub.ID).Scan(&id); err != nil {
+		t.Fatalf("resolve delivery id: %v", err)
+	}
+	return id
+}
+
+// ageLease moves a delivery's lease the given interval into the past.
+func ageLease(t *testing.T, admin *pgxpool.Pool, deliveryID int64, age string) {
+	t.Helper()
+	if _, err := admin.Exec(context.Background(),
+		`update deliveries set lease_expires_at = now() - $2::interval where id=$1`, deliveryID, age); err != nil {
+		t.Fatalf("age lease: %v", err)
+	}
+}
+
+// TestSweeperRequeuesExpiredLease is D-6: the sweeper re-queues ANY delivery whose
+// lease has lapsed. "Any" is literal — there is no lookback bound — because a lease
+// that lapsed while no sweep was running (a leadership move, a stalled tick) is
+// exactly the case the requirement exists for: leaving it to the worker's
+// opportunistic claim loop would make the sweeper's guarantee conditional. A
+// retry's backoff lease is in the future, so it must never be clobbered.
 func TestSweeperRequeuesExpiredLease(t *testing.T) {
 	st, admin := harness(t)
 	ctx := context.Background()
 
-	// Within the 10 s window: re-queued and immediately claimable.
+	// Just lapsed.
 	_, _, d1 := seedHarness(t, st, admin, "http://127.0.0.1:1/")
+	ageLease(t, admin, d1, "5 seconds")
+	// Long lapsed: re-queued too. This is the row the old lookback bound skipped.
+	d2 := seedAnotherDelivery(t, st, admin, `{"id":"o2"}`)
+	ageLease(t, admin, d2, "2 hours")
+	// Waiting out a backoff: its lease is in the future, so the sweeper leaves it.
+	d3 := seedAnotherDelivery(t, st, admin, `{"id":"o3"}`)
 	if _, err := admin.Exec(ctx,
-		`update deliveries set lease_expires_at = now() - interval '5 seconds' where id=$1`, d1); err != nil {
-		t.Fatalf("age lease: %v", err)
+		`update deliveries set lease_expires_at = now() + interval '1 hour' where id=$1`, d3); err != nil {
+		t.Fatalf("set future lease: %v", err)
 	}
-	n, err := st.SweeperRequeue(ctx, 10)
+
+	n, err := st.SweeperRequeue(ctx)
 	if err != nil {
 		t.Fatalf("SweeperRequeue: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("SweeperRequeue reclaimed %d, want 1 (D-6)", n)
+	if n != 2 {
+		t.Fatalf("SweeperRequeue reclaimed %d, want 2 (D-6 re-queues any lapsed lease)", n)
 	}
+	// A swept row is immediately claimable, with no waiting for the old lease.
 	if _, got, err := st.ClaimDelivery(ctx, 40*time.Second); err != nil {
 		t.Fatalf("claim after sweep: %v", err)
 	} else if !got {
 		t.Fatal("a swept delivery was not claimable")
 	}
-
-	// Outside the window: not reclaimed in this pass.
-	_, _, d2 := seedHarness(t, st, admin, "http://127.0.0.1:1/")
-	if _, err := admin.Exec(ctx,
-		`update deliveries set lease_expires_at = now() - interval '11 seconds' where id=$1`, d2); err != nil {
-		t.Fatalf("age lease: %v", err)
+	// The backoff row is untouched: a sweep must not turn every pending retry into
+	// an immediate attempt.
+	var lease sql.NullTime
+	if err := admin.QueryRow(ctx, `select lease_expires_at from deliveries where id=$1`, d3).Scan(&lease); err != nil {
+		t.Fatalf("read backoff lease: %v", err)
 	}
-	n, err = st.SweeperRequeue(ctx, 10)
-	if err != nil {
-		t.Fatalf("SweeperRequeue (window edge): %v", err)
-	}
-	if n != 0 {
-		t.Fatalf("SweeperRequeue reclaimed %d of an 11 s-old lease, want 0 (outside the D-6 window)", n)
+	if !lease.Valid || time.Until(lease.Time) < 30*time.Minute {
+		t.Fatalf("lease = %v; the sweeper clobbered a future backoff lease", lease)
 	}
 }
 

@@ -2,11 +2,56 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/m7jay/pigeon/internal/ssrf"
 )
+
+// TestEndpointSecretIsStandardWebhooksForm: FR-1001 issues secrets as "whsec_" +
+// base64 in the STANDARD alphabet. The alphabet is not cosmetic — a spec verifier
+// decodes the value after the prefix with a standard decoder, which does not fail
+// on the URL-safe "-"/"_": it drops those bytes and derives a short key, so a
+// URL-safe secret silently verifies for only about one endpoint in four. Minting
+// and signing therefore have to agree on the alphabet, and this is the mint's half.
+func TestEndpointSecretIsStandardWebhooksForm(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		secret, hint, err := createEndpointSecret()
+		if err != nil {
+			t.Fatalf("createEndpointSecret: %v", err)
+		}
+		if !strings.HasPrefix(secret, whsecPrefix) {
+			t.Fatalf("secret %q is missing the whsec_ prefix (FR-1001)", secret)
+		}
+		payload := strings.TrimPrefix(secret, whsecPrefix)
+		if strings.ContainsAny(payload, "-_") {
+			t.Fatalf("secret %q uses the URL-safe alphabet, which a spec verifier mis-decodes", secret)
+		}
+		// The mint is unpadded; a spec verifier restores the padding before
+		// decoding, and so must this assertion.
+		enc := payload
+		if pad := len(enc) % 4; pad != 0 {
+			enc += strings.Repeat("=", 4-pad)
+		}
+		raw, err := base64.StdEncoding.DecodeString(enc)
+		if err != nil {
+			t.Fatalf("secret %q is not standard base64: %v", secret, err)
+		}
+		if len(raw) != 32 {
+			t.Fatalf("secret decodes to %d bytes, want 32", len(raw))
+		}
+		if hint != secret[:16] {
+			t.Fatalf("hint = %q, want the first 16 characters of the secret", hint)
+		}
+		if seen[secret] {
+			t.Fatal("createEndpointSecret repeated a secret")
+		}
+		seen[secret] = true
+	}
+}
 
 // AC-19 / FR-402: an endpoint URL pointing at a private or metadata address, or
 // http in live, is rejected at registration before any row is written. Fail
