@@ -100,6 +100,15 @@ type Data interface {
 	ListEventTypes(ctx context.Context, sc store.Scope) ([]store.EventType, error)
 	PatchEventType(ctx context.Context, sc store.Scope, name string, p store.EventTypePatch) (store.EventType, error)
 	PublishEvent(ctx context.Context, sc store.Scope, in store.PublishInput) (store.PublishedEvent, error)
+
+	// Inspection and replay (§7.11, FR-1101..FR-1111). The delivery list and its
+	// filters, one delivery with its ordered attempts, the event-level view with
+	// its rollup, the dedupe answer and the bounded, idempotent replay.
+	ListDeliveries(ctx context.Context, sc store.Scope, f store.DeliveryFilter, limit int, cursor *int64) (store.DeliveryPage, error)
+	GetDelivery(ctx context.Context, sc store.Scope, id int64) (store.DeliveryDetail, error)
+	EventView(ctx context.Context, sc store.Scope, eventID string) (store.EventView, error)
+	DedupeAnswer(ctx context.Context, sc store.Scope, endpointID, eventID string) (store.DedupeAnswer, error)
+	ReplayDeliveries(ctx context.Context, sc store.Scope, in store.ReplayInput) (store.ReplayResult, error)
 }
 
 // Deps are the collaborators the handlers need. Nil Ready means "nothing to

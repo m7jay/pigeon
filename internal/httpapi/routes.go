@@ -145,7 +145,10 @@ func (s *Server) routes() []route {
 		{http.MethodGet, "/v1/producer/keys/{keyID}", kindMember, s.handleGetKey},
 		{http.MethodDelete, "/v1/producer/keys/{keyID}", kindOwner, s.handleRevokeKey},
 
-		// The consumer portal's own scope (FR-110).
+		// The consumer portal's own scope (FR-110). GET /v1/consumer/me is the
+		// session's self-description; the delivery routes below are FR-1105's
+		// "a consumer user sees only its own consumer's deliveries", which is
+		// also the API UI-15 and UI-16 are thin clients of (§14).
 		{http.MethodGet, "/v1/consumer/me", kindConsumer, s.handleConsumerMe},
 
 		// M2b, UI-13/UI-14: the consumer portal's self-service surface. Every route
@@ -168,6 +171,19 @@ func (s *Server) routes() []route {
 		{http.MethodGet, "/v1/consumer/endpoints/{endpointID}/subscriptions", kindConsumer, s.handleConsumerListSubscriptions},
 		{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/subscriptions", kindConsumer, s.handleConsumerCreateSubscription},
 		{http.MethodDelete, "/v1/consumer/endpoints/{endpointID}/subscriptions/{eventType}", kindConsumer, s.handleConsumerDeleteSubscription},
+
+		// Inspection and replay (§7.11, FR-1101..FR-1111). The producer surface
+		// is the management API UI-3 and UI-5 use; the consumer surface is
+		// FR-1105's scoped read and UI-16's scoped replay, with the consumer
+		// taken from the session claim rather than from the request.
+		{http.MethodGet, "/v1/producer/deliveries", kindMember, s.handleListDeliveries},
+		{http.MethodGet, "/v1/producer/deliveries/dedupe", kindMember, s.handleDedupeAnswer},
+		{http.MethodGet, "/v1/producer/deliveries/{deliveryID}", kindMember, s.handleGetDelivery},
+		{http.MethodPost, "/v1/producer/deliveries/replay", kindMember, s.handleReplayDeliveries},
+		{http.MethodGet, "/v1/producer/events/{eventID}", kindMember, s.handleEventView},
+		{http.MethodGet, "/v1/consumer/deliveries", kindConsumer, s.handleConsumerListDeliveries},
+		{http.MethodGet, "/v1/consumer/deliveries/{deliveryID}", kindConsumer, s.handleConsumerGetDelivery},
+		{http.MethodPost, "/v1/consumer/deliveries/replay", kindConsumer, s.handleConsumerReplayDeliveries},
 	}
 
 	if s.deps.SelfRegistration {
