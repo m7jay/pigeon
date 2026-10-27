@@ -361,7 +361,7 @@ var crossProducerCases = map[string]cpCase{
 			return "/v1/consumer/endpoints/" + a.EndpointID + "/subscriptions", nil
 		},
 		credential: func(a, b *tenant) string { return b.ConsumerToken },
-		want:       http.StatusOK,
+		want:       http.StatusNotFound,
 	},
 	"POST /v1/consumer/endpoints/{endpointID}/subscriptions": {
 		build: func(a, b *tenant) (string, any) {

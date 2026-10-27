@@ -397,11 +397,22 @@ func (s *Store) ListSubscribableEventTypes(ctx context.Context, sc Scope) ([]str
 }
 
 // ListConsumerSubscriptions returns the caller's subscriptions for one of their
-// own endpoints, newest pair first. An endpoint id that is not the caller's
-// yields an empty list, never another consumer's pairs (AC-39).
+// own endpoints, newest pair first. An endpoint id that is not the caller's is
+// ErrNotFound - the same 404 its sibling single-endpoint reads give (AC-39: "404
+// for every resource outside their consumer_id, including by guessing ids"). It
+// used to answer an empty 200 for a foreign id, which disagreed with the criterion
+// the slice is judged on and with every other route in this file, even though it
+// leaked nothing.
 func (s *Store) ListConsumerSubscriptions(ctx context.Context, sc Scope, consumerID, endpointID string) ([]Subscription, error) {
 	var out []Subscription
 	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
+		owned, err := consumerEndpointOwnedTx(ctx, tx, sc, consumerID, endpointID)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ErrNotFound
+		}
 		rows, err := tx.Query(ctx, `select s.id, s.endpoint_id, s.event_type, s.status, s.created_at
 			from subscriptions s
 			where s.producer_id = $1 and s.env = $2 and s.endpoint_id = $3 and s.status <> 'deleted'
