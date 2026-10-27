@@ -43,14 +43,13 @@ cookie with no `SameSite` (`handler.go:218`), and `SameSite=Lax` as its only CSR
 control. S10 owns it now (AC-49…AC-51). S9a/M2a inherits the fix by building on
 `internal/portal` and MUST NOT reintroduce a hardcoded `MaxAge` or a tokenless form.
 
-**AC-49…AC-51 are numbered past AC-48 on purpose.** `docs/spec-gap-closure` (approved
-at `78dcf43`, unmerged) defines AC-44…AC-48, and its AC-47 already asserts the consumer
-session cookie's flags and the CSRF rejection; this amendment adds the shared invariant
-and the lifetime leg AC-47 lacks. Whichever of the two lands second keeps the other's
-numbers. Both edit this file's S10 row and `REQUIREMENTS.md` §16's table in the same
-place, so the second to land rebases and reconciles AC-47 with AC-49/AC-50 in that edit.
-The 12 h constant is A-5's *default* session TTL, which is why it looked deliberate; it
-is wrong for every other `PIGEON_SESSION_TTL`.
+**AC-49…AC-51 were numbered past AC-48 on purpose.** `docs/spec-gap-closure` defines
+AC-44…AC-48, and its AC-47 already asserts the consumer session cookie's flags and the
+CSRF rejection; this amendment adds the shared invariant and the lifetime leg AC-47
+lacks. That amendment landed first, so AC-44…AC-51 are one contiguous block in
+`REQUIREMENTS.md` §16 and AC-47 keeps its own number on the S9 row above. The 12 h
+constant is A-5's *default* session TTL, which is why it looked deliberate; it is wrong
+for every other `PIGEON_SESSION_TTL`.
 
 ## Current state (S0) — closed
 
