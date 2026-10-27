@@ -193,8 +193,13 @@ func queryFanOutMatches(ctx context.Context, tx pgx.Tx, sc Scope, eventType, con
 
 // insertDeliveries batch-inserts one pending delivery per endpoint (FR-706: a
 // single round trip, never one per row), setting the lease at creation
-// (FR-813). ON CONFLICT (event_id, endpoint_id) DO NOTHING makes a re-fan-out a
-// no-op (FR-704). Returns how many rows were actually inserted (0 on a replay,
+// (FR-813). The lease is set to now() - a real timestamp, already due by the
+// time any worker claims the row (the claim's now() is strictly later), so a
+// fresh delivery is claimable immediately rather than waiting out an initial
+// interval. The 40 s lease that bounds a crashed worker's hold is applied by the
+// claim primitive when the worker leases the row, not here. ON CONFLICT
+// (event_id, endpoint_id) DO NOTHING makes a re-fan-out a no-op (FR-704). Returns
+// how many rows were actually inserted (0 on a replay,
 // when every row already exists), which the caller reports as the delivery count.
 func insertDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, consumerID string, endpoints []string) (int, error) {
 	if len(endpoints) == 0 {
@@ -203,7 +208,7 @@ func insertDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, consume
 	res, err := tx.Exec(ctx, `
 		insert into deliveries
 			(event_id, endpoint_id, producer_id, env, consumer_id, status, lease_expires_at)
-		select $1, ep, $2, $3, $4, 'pending', now() + interval '40 seconds'
+		select $1, ep, $2, $3, $4, 'pending', now()
 		from unnest($5::text[]) as ep
 		on conflict (event_id, endpoint_id) do nothing`,
 		eventID, sc.ProducerID, sc.Env, consumerID, endpoints)
