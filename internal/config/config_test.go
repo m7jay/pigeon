@@ -23,7 +23,10 @@ func valid() Config {
 		RateLimitPerProducerBurst: 400,
 		LogLevel:                  0,
 		DeliveryWorkers:           1,
-		DeliveryMaxAttempts:       15,
+		DeliveryMaxRetries:        15,
+		DeliveryRetryWindow:       72 * time.Hour,
+		DeliveryJitter:            0.2,
+		DeliveryConcurrency:       64,
 		DeliveryMaxConnsPerHost:   1,
 		// The reference deployment buffers attempt evidence in Redis (D-1) and
 		// keeps SB-5's default retention windows. The buffered mode is only valid
@@ -56,6 +59,12 @@ func TestValidateRefusesUnsafeConfigurations(t *testing.T) {
 		"short admin":     func(c *Config) { c.InstanceAdminPassword = "short" },
 		"tiny pool":       func(c *Config) { c.DBMaxConns = 1 },
 		"zero session":    func(c *Config) { c.SessionTTL = 0 },
+		// S5: the §9/FR-1302 bounds are refused where they are set, so a typo
+		// cannot ship a policy the requirements do not describe.
+		"window under an hour":   func(c *Config) { c.DeliveryRetryWindow = time.Minute },
+		"window over seven days": func(c *Config) { c.DeliveryRetryWindow = 8 * 24 * time.Hour },
+		"jitter over 100%":       func(c *Config) { c.DeliveryJitter = 1.5 },
+		"zero concurrency":       func(c *Config) { c.DeliveryConcurrency = 0 },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -138,6 +147,11 @@ func TestLoadFromEnvironment(t *testing.T) {
 	t.Setenv("PIGEON_LOG_LEVEL", "debug")
 	t.Setenv("PIGEON_DB_MAX_CONNS", "20")
 	t.Setenv("PIGEON_SESSION_TTL", "2h")
+	// S5: §9's retry policy and the FR-816 per-process cap are all configurable.
+	t.Setenv("PIGEON_DELIVERY_MAX_RETRIES", "7")
+	t.Setenv("PIGEON_DELIVERY_RETRY_WINDOW", "24h")
+	t.Setenv("PIGEON_DELIVERY_JITTER", "0.1")
+	t.Setenv("PIGEON_DELIVERY_CONCURRENCY", "16")
 
 	c, err := Load()
 	if err != nil {
@@ -145,6 +159,10 @@ func TestLoadFromEnvironment(t *testing.T) {
 	}
 	if c.DBMaxConns != 20 || c.SessionTTL != 2*time.Hour {
 		t.Fatalf("unexpected values: %+v", c)
+	}
+	if c.DeliveryMaxRetries != 7 || c.DeliveryRetryWindow != 24*time.Hour ||
+		c.DeliveryJitter != 0.1 || c.DeliveryConcurrency != 16 {
+		t.Fatalf("S5 delivery settings not read from the environment: %+v", c)
 	}
 }
 

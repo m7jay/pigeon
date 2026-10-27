@@ -208,17 +208,25 @@ func queryFanOutMatches(ctx context.Context, tx pgx.Tx, sc Scope, eventType, con
 // fresh delivery is claimable immediately rather than waiting out an initial
 // interval. The 40 s lease that bounds a crashed worker's hold is applied by the
 // claim primitive when the worker leases the row, not here. ON CONFLICT
-// (event_id, endpoint_id) DO NOTHING makes a re-fan-out a no-op (FR-704). Returns
-// how many rows were actually inserted (0 on a replay,
+// (event_id, endpoint_id, created_at) DO NOTHING makes a re-fan-out a no-op
+// (FR-704; the key carries created_at because the table is partitioned by day,
+// 0012). Returns how many rows were actually inserted (0 on a replay,
 // when every row already exists), which the caller reports as the delivery count.
+//
+// The endpoint ids are inserted as given, with no join back to `endpoints`:
+// queryFanOutMatches already read those endpoint rows in THIS transaction, so the
+// only thing a join could do is drop a delivery silently - and shrink FR-704's
+// count, which is what the caller reports to the producer - for an endpoint that
+// cannot be absent.
 func insertDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, consumerID string, eventAt time.Time, endpoints []string) (int, error) {
 	if len(endpoints) == 0 {
 		return 0, nil
 	}
 	res, err := tx.Exec(ctx, `
 		insert into deliveries
-			(event_id, endpoint_id, producer_id, env, consumer_id, status, lease_expires_at, created_at)
-		select $1, ep, $2, $3, $4, 'pending', now(), $6
+			(event_id, endpoint_id, producer_id, env, consumer_id, status,
+			 lease_expires_at, next_attempt_at, created_at)
+		select $1, ep, $2, $3, $4, 'pending', now(), now(), $6
 		from unnest($5::text[]) as ep
 		on conflict (event_id, endpoint_id, created_at) where replay_of_delivery_id is null do nothing`,
 		eventID, sc.ProducerID, sc.Env, consumerID, endpoints, eventAt)

@@ -97,15 +97,19 @@ type Config struct {
 	// against this number, reported as source "database" in /v1/meta/usage.
 	DiskBytes uint64 // PIGEON_DISK_BYTES
 
-	// Delivery worker (S4) and sweeper. The timeout is capped at the FR-802 hard
-	// ceiling of 5 s in Load.
+	// Delivery worker (S4), the S5 limits, and sweeper. The timeout is capped at
+	// the FR-802 hard ceiling of 5 s in Load.
 	DeliveryWorkers         int           // PIGEON_DELIVERY_WORKERS (0 disables the worker)
 	DeliveryLease           time.Duration // PIGEON_DELIVERY_LEASE
 	DeliveryTimeout         time.Duration // PIGEON_DELIVERY_TIMEOUT (<= 5 s, FR-802)
 	DeliveryMaxBodyBytes    int           // PIGEON_DELIVERY_MAX_BODY_BYTES (FR-804)
 	DeliveryBackoffBase     time.Duration // PIGEON_DELIVERY_BACKOFF_BASE
-	DeliveryBackoffMax      time.Duration // PIGEON_DELIVERY_BACKOFF_MAX
-	DeliveryMaxAttempts     int           // PIGEON_DELIVERY_MAX_ATTEMPTS
+	DeliveryBackoffMax      time.Duration // PIGEON_DELIVERY_BACKOFF_MAX (<= 12 h, §9)
+	DeliveryMaxRetries      int           // PIGEON_DELIVERY_MAX_RETRIES (§9: 15 retries, not attempts)
+	DeliveryRetryWindow     time.Duration // PIGEON_DELIVERY_RETRY_WINDOW (1 h - 7 d, §9; default 72 h)
+	DeliveryJitter          float64       // PIGEON_DELIVERY_JITTER (§9: 0.2 = ±20%)
+	DeliveryConcurrency     int           // PIGEON_DELIVERY_CONCURRENCY (FR-816 per-process cap)
+	DeliverySlotTTL         time.Duration // PIGEON_DELIVERY_SLOT_TTL (FR-1302; 0 = 3x timeout)
 	DeliveryMaxConnsPerHost int           // PIGEON_DELIVERY_MAX_CONNS_PER_HOST (FR-817)
 	DeliveryPollInterval    time.Duration // PIGEON_DELIVERY_POLL_INTERVAL
 	DeliveryUserAgent       string        // PIGEON_DELIVERY_USER_AGENT (FR-810)
@@ -163,8 +167,11 @@ func defaults() Config {
 		DeliveryTimeout:           5 * time.Second,
 		DeliveryMaxBodyBytes:      2048,
 		DeliveryBackoffBase:       30 * time.Second,
-		DeliveryBackoffMax:        time.Hour,
-		DeliveryMaxAttempts:       15,
+		DeliveryBackoffMax:        12 * time.Hour,
+		DeliveryMaxRetries:        15,
+		DeliveryRetryWindow:       72 * time.Hour,
+		DeliveryJitter:            0.2,
+		DeliveryConcurrency:       64,
 		DeliveryMaxConnsPerHost:   1,
 		DeliveryPollInterval:      time.Second,
 		SweeperInterval:           5 * time.Second,
@@ -252,7 +259,19 @@ func Load() (Config, error) {
 	if c.DeliveryBackoffMax, err = envDuration("PIGEON_DELIVERY_BACKOFF_MAX", c.DeliveryBackoffMax); err != nil {
 		return Config{}, err
 	}
-	if c.DeliveryMaxAttempts, err = envInt("PIGEON_DELIVERY_MAX_ATTEMPTS", c.DeliveryMaxAttempts); err != nil {
+	if c.DeliveryMaxRetries, err = envInt("PIGEON_DELIVERY_MAX_RETRIES", c.DeliveryMaxRetries); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryRetryWindow, err = envDuration("PIGEON_DELIVERY_RETRY_WINDOW", c.DeliveryRetryWindow); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryJitter, err = envFloat("PIGEON_DELIVERY_JITTER", c.DeliveryJitter); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryConcurrency, err = envInt("PIGEON_DELIVERY_CONCURRENCY", c.DeliveryConcurrency); err != nil {
+		return Config{}, err
+	}
+	if c.DeliverySlotTTL, err = envDuration("PIGEON_DELIVERY_SLOT_TTL", c.DeliverySlotTTL); err != nil {
 		return Config{}, err
 	}
 	if c.DeliveryMaxConnsPerHost, err = envInt("PIGEON_DELIVERY_MAX_CONNS_PER_HOST", c.DeliveryMaxConnsPerHost); err != nil {
@@ -383,8 +402,26 @@ func (c Config) Validate() error {
 	if c.DeliveryWorkers < 0 {
 		problems = append(problems, "PIGEON_DELIVERY_WORKERS must be >= 0 (0 disables the worker)")
 	}
-	if c.DeliveryMaxAttempts < 1 {
-		problems = append(problems, "PIGEON_DELIVERY_MAX_ATTEMPTS must be >= 1")
+	if c.DeliveryMaxRetries < 1 {
+		problems = append(problems, "PIGEON_DELIVERY_MAX_RETRIES must be >= 1 (§9: retries, so attempts = retries + 1)")
+	}
+	// The window bound is §9's per-endpoint range (1 h - 7 d). The deployment
+	// default is the same 72 h the endpoint default carries, and a global value
+	// outside the per-endpoint range would make the override meaningless: an
+	// endpoint could not express the policy the platform claims to support.
+	if c.DeliveryRetryWindow < time.Hour || c.DeliveryRetryWindow > 7*24*time.Hour {
+		problems = append(problems, "PIGEON_DELIVERY_RETRY_WINDOW must be between 1h and 168h (FR-1201, §9)")
+	}
+	// Jitter is bounded at 100%: beyond that the delay could be negative, and a
+	// negative backoff is not a backoff.
+	if c.DeliveryJitter < 0 || c.DeliveryJitter > 1 {
+		problems = append(problems, "PIGEON_DELIVERY_JITTER must be between 0 and 1 (§9: 0.2 = ±20%)")
+	}
+	if c.DeliveryConcurrency < 1 {
+		problems = append(problems, "PIGEON_DELIVERY_CONCURRENCY must be >= 1 (FR-816)")
+	}
+	if c.DeliverySlotTTL < 0 {
+		problems = append(problems, "PIGEON_DELIVERY_SLOT_TTL must be >= 0 (0 = three times the attempt timeout)")
 	}
 	if c.DeliveryMaxBodyBytes < 0 {
 		problems = append(problems, "PIGEON_DELIVERY_MAX_BODY_BYTES must be >= 0 (0 disables capture, SB-4)")

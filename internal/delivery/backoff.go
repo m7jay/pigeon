@@ -1,6 +1,7 @@
 package delivery
 
 import (
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -11,44 +12,43 @@ import (
 // delivery idle for hours on a single header.
 const maxRetryAfter = 300 * time.Second
 
-// backoffFor computes the delay before the next attempt. The schedule is
-// exponential in the attempt number — base, 2×base, 4×base, … — capped at
-// BackoffMax, so a persistently failing receiver backs off rather than hammering
-// it. FR-807: a Retry-After on 429/503 (≤ 300 s) wins over the computed value.
+// backoffFor computes the delay before the next attempt at §9's default factor
+// of 2. The schedule is exponential in the attempt number — base, 2×base,
+// 4×base, … — capped at BackoffMax, so a persistently failing receiver backs off
+// rather than hammering it. FR-807: a Retry-After on 429/503 (≤ 300 s) wins over
+// the computed value.
 //
 // AC-04's "backoff visible (30 s, 1 m)" is this function at the default base of
 // 30 s: after attempt 1 the delay is 30 s, after attempt 2 it is 60 s.
 func backoffFor(base, max time.Duration, attempt int, retryAfter time.Duration) time.Duration {
 	if retryAfter > 0 {
-		if retryAfter > maxRetryAfter {
-			retryAfter = maxRetryAfter
-		}
-		return retryAfter
+		return cappedRetryAfter(retryAfter)
 	}
+	return exponential(base, max, 2, attempt)
+}
+
+// exponential is the family backoffFor and RetryPolicy.Delay both draw from:
+// base × factor^(attempt-1), clamped to max. Factoring it out is what lets §9's
+// per-endpoint "factor" override be a number rather than a rewrite.
+//
+// Computed in float to avoid an int-duration overflow that a left shift would hit
+// around attempt 34; the cap then clamps it.
+func exponential(base, max time.Duration, factor float64, attempt int) time.Duration {
 	if base <= 0 {
 		base = time.Second
 	}
-	// Exponential, computed in float to avoid an int-duration overflow that a
-	// left shift would hit around attempt 34; the cap then clamps it.
+	if factor < 1 {
+		factor = 1
+	}
 	shift := attempt - 1
 	if shift < 0 {
 		shift = 0
 	}
-	d := float64(base) * powi(2, shift)
+	d := float64(base) * math.Pow(factor, float64(shift))
 	if d <= 0 || d > float64(max) {
 		return max
 	}
 	return time.Duration(d)
-}
-
-// powi is integer base**exp for small exp, returning a float so the caller can
-// clamp before it overflows a time.Duration.
-func powi(base int, exp int) float64 {
-	v := 1.0
-	for i := 0; i < exp; i++ {
-		v *= float64(base)
-	}
-	return v
 }
 
 // parseRetryAfter reads a Retry-After header from a 429/503 response and returns

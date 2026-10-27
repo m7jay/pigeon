@@ -49,6 +49,34 @@ type LeasedDelivery struct {
 	// first attempt. The completing worker records it as deliveries.first_attempt_at
 	// so the timestamp is stable across the re-claims a crash produces.
 	FirstAttemptAt *time.Time
+
+	// --- S5: the retry window and the endpoint's policy ---------------------
+	//
+	// NextAttemptAt is when the platform intends to attempt this delivery next,
+	// and RetryDeadline is the end of its retry window (FR-1208). Both are
+	// stamped on the row, so a restart resumes the same window rather than
+	// starting a new one, and a pause extends the deadline without touching the
+	// rest (FR-1207).
+	NextAttemptAt time.Time
+	RetryDeadline time.Time
+	// Endpoint carries the per-endpoint half of §9 and FR-1302/FR-1306: the
+	// retry policy, the per-attempt timeout, and the two limits. They come back
+	// with the claim so an attempt needs no second read to know its own limits.
+	Endpoint EndpointPolicy
+}
+
+// EndpointPolicy is one endpoint's retry policy and limits, as stored on its row
+// (0009). Every field has a documented default and a documented bound, so an
+// endpoint that has never been configured behaves exactly as §9, FR-1302 and
+// FR-1306 describe.
+type EndpointPolicy struct {
+	MaxRetries     int
+	BackoffBase    time.Duration
+	BackoffMax     time.Duration
+	RetryWindow    time.Duration
+	Timeout        time.Duration
+	MaxConcurrency int
+	MaxRPS         int
 }
 
 // NextAttemptNumber is the 1-based number for this attempt (AC-07, FR-902).
@@ -78,22 +106,45 @@ func (d LeasedDelivery) NextAttemptNumber() int {
 // lease is extended here, exactly as pigeon_lease_outbox does for the relay; the
 // FR-813 lease that distinguishes this from a lifecycle write is the one set at
 // fan-out, which the worker never rewrites except to schedule a retry.
-func (s *Store) ClaimDelivery(ctx context.Context, lease time.Duration) (LeasedDelivery, bool, error) {
+func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow time.Duration) (LeasedDelivery, bool, error) {
+	if defaultRetryWindow <= 0 {
+		defaultRetryWindow = 72 * time.Hour
+	}
 	var d LeasedDelivery
+	var backoffBaseS, backoffMaxS, retryWindowS float64
+	var timeoutMS int
 	err := s.pool.QueryRow(ctx, `select delivery_id, event_id, producer_id, env, endpoint_id,
 		endpoint_url, signing_secret, event_type, payload_version, coalesce(consumer_ref, ''),
-		occurred_at, payload, prior_attempts, row_attempts, first_attempt_at
-		from pigeon_claim_delivery($1)`, lease,
+		occurred_at, payload, prior_attempts, row_attempts, first_attempt_at,
+		next_attempt_at, retry_deadline,
+		max_retries, retry_backoff_base_s, retry_backoff_max_s, retry_window_s,
+		delivery_timeout_ms, max_concurrency, max_rps
+		from pigeon_claim_delivery($1, $2)`, lease, defaultRetryWindow,
 	).Scan(&d.DeliveryID, &d.EventID, &d.ProducerID, &d.Env, &d.EndpointID,
 		&d.EndpointURL, &d.SigningSecret, &d.EventType, &d.PayloadVersion,
-		&d.ConsumerRef, &d.OccurredAt, &d.Payload, &d.PriorAttempts, &d.RowAttempts, &d.FirstAttemptAt)
+		&d.ConsumerRef, &d.OccurredAt, &d.Payload, &d.PriorAttempts, &d.RowAttempts, &d.FirstAttemptAt,
+		&d.NextAttemptAt, &d.RetryDeadline,
+		&d.Endpoint.MaxRetries, &backoffBaseS, &backoffMaxS, &retryWindowS,
+		&timeoutMS, &d.Endpoint.MaxConcurrency, &d.Endpoint.MaxRPS)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return d, false, nil
 	}
 	if err != nil {
 		return d, false, fmt.Errorf("claim delivery: %w", err)
 	}
+	// The policy's durations arrive as epoch seconds (0009 casts them), so the
+	// whole per-endpoint policy is a value the worker can use directly.
+	d.Endpoint.BackoffBase = seconds(backoffBaseS)
+	d.Endpoint.BackoffMax = seconds(backoffMaxS)
+	d.Endpoint.RetryWindow = seconds(retryWindowS)
+	d.Endpoint.Timeout = time.Duration(timeoutMS) * time.Millisecond
 	return d, true, nil
+}
+
+// seconds converts the epoch-seconds form the claim function returns into a
+// duration, without the float→int truncation surprises of a direct cast.
+func seconds(v float64) time.Duration {
+	return time.Duration(v * float64(time.Second))
 }
 
 // NextAttempt is the 1-based number for the next attempt on a delivery (AC-07):
@@ -226,21 +277,26 @@ func (s *Store) FinalizeDelivery(ctx context.Context, deliveryID int64, attempts
 	return done, nil
 }
 
-// RequeueDelivery schedules the next attempt after a retryable failure by pushing
-// the lease into the future (the backoff), and advances the delivery row's attempt
-// counter to this attempt's number (D-2). The row is not claimable until the
-// backoff elapses, so the retry cadence lives in the lease, not in a worker sleep.
+// RequeueDelivery schedules the next attempt after a retryable failure: the next
+// attempt's instant, the (possibly extended) retry deadline and the delivery's
+// attempt counter all move together, so the row is not claimable until the
+// backoff elapses, FR-1208's pair stays truthful, and FR-1201's window is the
+// deadline's job (a caller that has run out of window does not requeue at all, it
+// finalizes).
 //
-// It runs with synchronous_commit=on: it is control state. The counter matters
-// because it is what makes the next attempt number correct while this attempt's
-// evidence row may still be sitting in the Redis buffer — the attempt number MUST
-// NOT depend on the attempt buffer, and this is the write that keeps it
-// independent of it. A lost requeue just leaves the lease at the claim value and
-// the sweeper covers it (D-6), and a re-delivered requeue cannot walk the counter
-// backwards (the function takes greatest()).
-func (s *Store) RequeueDelivery(ctx context.Context, deliveryID int64, backoff time.Duration, attempt int) error {
+// The counter is advanced with greatest(), never assigned, so a re-delivered
+// requeue (a retried control write) cannot walk it backwards. It matters because
+// it is what makes the next attempt number correct while this attempt's evidence
+// row may still be sitting in the Redis buffer (D-2): the attempt number MUST NOT
+// depend on the attempt buffer, and this is the write that keeps it independent
+// of it.
+//
+// It runs with synchronous_commit=on: it is control state. A lost requeue just
+// leaves the lease at the claim value and the sweeper covers it (D-6).
+func (s *Store) RequeueDelivery(ctx context.Context, deliveryID int64, next, retryDeadline time.Time, attempt int) error {
 	return db.ControlTx(ctx, s.pool, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `select pigeon_requeue_delivery($1,$2,$3)`, deliveryID, backoff, attempt)
+		_, err := tx.Exec(ctx, `select pigeon_requeue_delivery($1,$2,$3,$4)`,
+			deliveryID, next, retryDeadline, attempt)
 		return err
 	})
 }
