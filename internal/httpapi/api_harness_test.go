@@ -197,7 +197,7 @@ func resetDatabase(ctx context.Context, admin *pgxpool.Pool, dsn string) error {
 	_, err = admin.Exec(ctx, `truncate table
 		admin_audit_log, sessions, invites, consumer_users, producer_members,
 		api_keys, consumers, event_types, events, outbox, idempotency_keys,
-		producers, users restart identity cascade`)
+		replay_requests, producers, users restart identity cascade`)
 	if err != nil {
 		return fmt.Errorf("truncate: %w", err)
 	}

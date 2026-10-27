@@ -47,6 +47,14 @@ type tenant struct {
 	// and event-type routes have a real, scoped contract to publish against and a
 	// name the other tenant must not see.
 	EventTypeName string
+
+	// DeliveryID and DeliveryEventID are a delivered delivery and the event it
+	// came from, registered on a consumer-routed type and fanned out, so S7's
+	// id-addressed routes (FR-1101..FR-1111) have real identifiers in each tenant
+	// to aim at cross-producer.
+	DeliveryID            int64
+	DeliveryEventID       string
+	DeliveryEventTypeName string
 }
 
 type createdProducer struct {
