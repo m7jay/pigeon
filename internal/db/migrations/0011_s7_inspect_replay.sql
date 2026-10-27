@@ -1,5 +1,11 @@
--- 0009_s7_inspect_replay.sql — S7: the inspect surface (FR-1101..FR-1111),
+-- 0011_s7_inspect_replay.sql - S7: the inspect surface (FR-1101..FR-1111),
 -- replay (FR-1106..FR-1108) and the dedupe answer (FR-903).
+--
+-- The number is 0011, not 0009: this slice was cut when 0008 was the last
+-- migration, and while it was open the consumer portal took 0009 (renumbered
+-- from its own 0009 claim) and S5 claimed 0010. Migration versions must be
+-- unique and ordered (internal/db/migrate_test.go enforces both), and this file
+-- depends on nothing between 0009 and itself, so it takes the next free number.
 --
 -- Three things land here, and each one is a decision recorded in SPEC.md's S7
 -- section rather than an accident:
@@ -125,7 +131,7 @@ create policy replay_requests_tenant on replay_requests
 -- 0008 turned RLS on for `attempts` and added no policy, because the only path
 -- to the table was the delivery worker's definer functions and an unreadable
 -- table is the safest possible default. The inspect API is the read path that
--- did not exist then, so 0009 adds exactly one policy - select - whose predicate
+-- did not exist then, so 0011 adds exactly one policy - select - whose predicate
 -- is the owning delivery's own scope. The write path is unchanged: the worker
 -- still reaches `attempts` only through `pigeon_record_attempt`, and a tenant
 -- cannot write or delete an attempt row through the API at all.
