@@ -22,6 +22,26 @@ import (
 // than imported so the config package stays a leaf.
 const maxSweeperInterval = 10 * time.Second
 
+// maxFlushInterval is §6's evidence window seen from the flusher's side: the
+// attempt tail may be up to 1 s behind, so the flush cadence is a ceiling in the
+// same sense as FR-802's timeout and D-6's sweep interval.
+const maxFlushInterval = time.Second
+
+// MinFlushBatch is FR-815's floor: at least 2,000 rows per transaction at the
+// reference load, so the commit rate stays in the tens per second rather than
+// the thousands. It is exported because the flusher and its tests assert the
+// same number; a configured value below it is raised rather than refused, so one
+// careless env var cannot turn the evidence path back into single-row commits.
+const MinFlushBatch = 2000
+
+// The two D-2 attempt-log modes. `buffered` is the design D-1 mandates (the
+// buffer lives in Redis, the flusher drains it); `sync` writes every attempt
+// inline, for operators who value evidence over throughput.
+const (
+	AttemptLogBuffered = "buffered"
+	AttemptLogSync     = "sync"
+)
+
 // Config is the whole runtime configuration. There are no flags and no config
 // files: environment only, per OPS-3.
 type Config struct {
@@ -75,6 +95,25 @@ type Config struct {
 	SweeperLockURL          string        // PIGEON_SWEEPER_LOCK_URL (defaults to DatabaseURL)
 	SweeperLockWait         time.Duration // PIGEON_SWEEPER_LOCK_WAIT
 
+	// Attempt evidence buffering (S6). D-1: attempts are buffered in Redis and
+	// never in worker process memory; D-2: the mode is configurable; FR-812/815:
+	// the flusher writes them in batches of at least 2,000 rows per transaction
+	// under synchronous_commit=off.
+	AttemptLogMode       string        // PIGEON_ATTEMPT_LOG_MODE (buffered | sync)
+	AttemptFlushBatch    int           // PIGEON_ATTEMPT_FLUSH_BATCH (>= 2000, FR-815; clamped up)
+	AttemptFlushInterval time.Duration // PIGEON_ATTEMPT_FLUSH_INTERVAL (<= 1 s, §6 evidence window)
+	AttemptFlushStale    time.Duration // PIGEON_ATTEMPT_FLUSH_STALE (when a peer flusher's batch is reclaimed)
+	SuccessLogRPS        int           // PIGEON_SUCCESS_LOG_RPS (LOG-2's bound; counters carry the rest)
+
+	// Retention windows (SB-5): configuration, never migration constants, so an
+	// operator sizes history for their own disk. The partition dropper (S8) is
+	// the consumer; the defaults are the conservative ones SB-5 names. Sustained
+	// throughput shortens the effective window automatically (§8.1.1), which the
+	// docs state rather than leaving to be discovered.
+	RetentionDeliveries time.Duration // PIGEON_RETENTION_DELIVERIES (14 d)
+	RetentionAttempts   time.Duration // PIGEON_RETENTION_ATTEMPTS (7 d)
+	RetentionEvents     time.Duration // PIGEON_RETENTION_EVENTS (14 d)
+
 	// Observability
 	LogLevel slog.Level // PIGEON_LOG_LEVEL
 	LogJSON  bool       // PIGEON_LOG_JSON
@@ -111,6 +150,17 @@ func defaults() Config {
 		DeliveryPollInterval:      time.Second,
 		SweeperInterval:           5 * time.Second,
 		SweeperLockWait:           60 * time.Second,
+		// S6's defaults: buffered evidence (D-1), 2,000-row transactions
+		// (FR-815), a 1 s flush cadence (the §6 window), and the SB-5 retention
+		// windows. SuccessLogRPS is LOG-2's bound.
+		AttemptLogMode:       AttemptLogBuffered,
+		AttemptFlushBatch:    MinFlushBatch,
+		AttemptFlushInterval: time.Second,
+		AttemptFlushStale:    30 * time.Second,
+		SuccessLogRPS:        100,
+		RetentionDeliveries:  14 * 24 * time.Hour,
+		RetentionAttempts:    7 * 24 * time.Hour,
+		RetentionEvents:      14 * 24 * time.Hour,
 	}
 }
 
@@ -193,6 +243,46 @@ func Load() (Config, error) {
 	if c.SweeperLockWait, err = envDuration("PIGEON_SWEEPER_LOCK_WAIT", c.SweeperLockWait); err != nil {
 		return Config{}, err
 	}
+	c.AttemptLogMode = strings.ToLower(strings.TrimSpace(env("PIGEON_ATTEMPT_LOG_MODE", c.AttemptLogMode)))
+	if c.AttemptFlushBatch, err = envInt("PIGEON_ATTEMPT_FLUSH_BATCH", c.AttemptFlushBatch); err != nil {
+		return Config{}, err
+	}
+	if c.AttemptFlushInterval, err = envDuration("PIGEON_ATTEMPT_FLUSH_INTERVAL", c.AttemptFlushInterval); err != nil {
+		return Config{}, err
+	}
+	if c.AttemptFlushStale, err = envDuration("PIGEON_ATTEMPT_FLUSH_STALE", c.AttemptFlushStale); err != nil {
+		return Config{}, err
+	}
+	if c.SuccessLogRPS, err = envInt("PIGEON_SUCCESS_LOG_RPS", c.SuccessLogRPS); err != nil {
+		return Config{}, err
+	}
+	if c.RetentionDeliveries, err = envDuration("PIGEON_RETENTION_DELIVERIES", c.RetentionDeliveries); err != nil {
+		return Config{}, err
+	}
+	if c.RetentionAttempts, err = envDuration("PIGEON_RETENTION_ATTEMPTS", c.RetentionAttempts); err != nil {
+		return Config{}, err
+	}
+	if c.RetentionEvents, err = envDuration("PIGEON_RETENTION_EVENTS", c.RetentionEvents); err != nil {
+		return Config{}, err
+	}
+	// FR-815 is a floor, not a target: a batch below 2,000 rows is raised rather
+	// than refused, the same way FR-802's timeout and D-6's cadence are clamped.
+	// One careless env var must not turn the evidence path back into single-row
+	// commits, because that is a throughput property of the whole delivery path.
+	if c.AttemptFlushBatch < MinFlushBatch {
+		c.AttemptFlushBatch = MinFlushBatch
+	}
+	// §6 bounds the evidence tail at 1 s. A slower cadence would widen the window
+	// the durability contract already states, so it is clamped like the others.
+	if c.AttemptFlushInterval > maxFlushInterval {
+		c.AttemptFlushInterval = maxFlushInterval
+	}
+	// LOG-2 bounds per-success lines above 100/s. The floor is one line per
+	// second, not zero: an operator still needs a liveness signal, and the
+	// counters carry the volume either way.
+	if c.SuccessLogRPS < 1 {
+		c.SuccessLogRPS = 1
+	}
 	// FR-802: 5 s is a hard ceiling on the per-attempt timeout, not a default; a
 	// receiver that cannot acknowledge inside it is treated as unavailable.
 	if c.DeliveryTimeout > 5*time.Second {
@@ -272,6 +362,39 @@ func (c Config) Validate() error {
 	}
 	if c.DeliveryMaxConnsPerHost < 1 {
 		problems = append(problems, "PIGEON_DELIVERY_MAX_CONNS_PER_HOST must be >= 1 (FR-817)")
+	}
+	// D-2: the two attempt-log modes, and D-1's Redis requirement for the one
+	// that buffers. Buffered evidence with no Redis would mean the worker holding
+	// attempts in its own memory, which is the failure mode D-1 exists to
+	// prevent - so it is a refusal at boot, not a runtime surprise.
+	switch c.AttemptLogMode {
+	case AttemptLogBuffered:
+		if c.RedisURL == "" {
+			problems = append(problems, "PIGEON_ATTEMPT_LOG_MODE=buffered requires PIGEON_REDIS_URL: D-1 keeps the attempt buffer in Redis, never in worker process memory (set PIGEON_ATTEMPT_LOG_MODE=sync to write evidence inline instead)")
+		}
+	case AttemptLogSync:
+	default:
+		problems = append(problems, fmt.Sprintf("PIGEON_ATTEMPT_LOG_MODE=%q must be %s or %s (D-2)",
+			c.AttemptLogMode, AttemptLogBuffered, AttemptLogSync))
+	}
+	if c.AttemptFlushBatch < 0 {
+		problems = append(problems, fmt.Sprintf("PIGEON_ATTEMPT_FLUSH_BATCH must be >= 0 (a value under %d is raised to it, FR-815)", MinFlushBatch))
+	}
+	if c.AttemptFlushInterval < 0 {
+		problems = append(problems, "PIGEON_ATTEMPT_FLUSH_INTERVAL must be >= 0")
+	}
+	if c.AttemptFlushStale < 0 {
+		problems = append(problems, "PIGEON_ATTEMPT_FLUSH_STALE must be >= 0")
+	}
+	if c.SuccessLogRPS < 0 {
+		problems = append(problems, "PIGEON_SUCCESS_LOG_RPS must be >= 0 (LOG-2)")
+	}
+	// SB-5: retention is configuration. A zero window is not "keep everything",
+	// it is "drop everything", so it is refused rather than defaulted silently.
+	if c.RetentionDeliveries <= 0 || c.RetentionAttempts <= 0 || c.RetentionEvents <= 0 {
+		problems = append(problems, fmt.Sprintf(
+			"retention windows must be positive (SB-5 defaults: deliveries %s, attempts %s, events %s)",
+			14*24*time.Hour, 7*24*time.Hour, 14*24*time.Hour))
 	}
 	if c.RateLimitPerKeyRPS < 0 || c.RateLimitPerProducerRPS < 0 {
 		problems = append(problems, "rate limits must be >= 0 (0 disables the limit)")
