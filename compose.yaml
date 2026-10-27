@@ -84,8 +84,42 @@ services:
       timeout: 3s
       retries: 5
 
-  # producer-portal:   # M2a — UI-1…UI-11
-  # consumer-portal:   # M2b — UI-12…UI-19
+  # producer-portal:   # M2a — UI-1…UI-11 (a later slice; not built yet)
+
+  # The consumer portal (M2b, UI-12…UI-19). A separate, independently themeable
+  # deployable that is a thin client of the core API. It may be removed entirely:
+  # the core keeps serving the consumer self-service API with the same scoping,
+  # and consumer users simply have no UI (UI-19, AC-40).
+  consumer-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # The base URL of the core API on the compose network. The portal never
+      # touches Postgres or Redis: it is a stateless proxy of the core.
+      PIGEON_CORE_API_URL: http://core:8080
+      # Encrypts the consumer session cookie (AES-256-GCM, internal/portal). Must
+      # be set and kept stable across restarts; changing it logs every user out.
+      PORTAL_SESSION_SECRET: ${PORTAL_SESSION_SECRET:?PORTAL_SESSION_SECRET must be set}
+      # Producer branding the consumer portal carries (UI-17). All optional: an
+      # unset value falls back to a neutral wordmark with no Pigeon branding.
+      PORTAL_BRAND_NAME: ${PORTAL_BRAND_NAME:-}
+      PORTAL_BRAND_ACCENT: ${PORTAL_BRAND_ACCENT:-}
+      PORTAL_BRAND_LOGO_URL: ${PORTAL_BRAND_LOGO_URL:-}
+      PORTAL_BRAND_COMPANY: ${PORTAL_BRAND_COMPANY:-}
+    ports:
+      - "8082:8082"
+    depends_on:
+      core:
+        condition: service_healthy
+    healthcheck:
+      # The image is scratch: no shell, curl or wget, so the binary answers its
+      # own liveness rather than running a shell script (cmd/consumer-portal).
+      test: ["CMD", "/consumer-portal", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
   pgdata:
