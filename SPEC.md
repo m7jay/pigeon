@@ -235,6 +235,79 @@ kind of split dangerous when done with `ALTER ROLE`.
 - Forward-only. A bad migration is fixed by a new migration; rollback is
   documented per release, not automated.
 
+## S8 decisions — partitioning, retention and the sweeper lease
+
+These are the places S8 (SB-1…SB-8, D-7) had to choose. They are recorded because
+each one changes observable behaviour or closes a destructive failure mode.
+
+**Partitioning is a swap migration, not an in-place `ALTER`.** PostgreSQL cannot
+convert a plain table into a partitioned one. `0009_partitioning.sql` therefore
+renames `deliveries`/`attempts` to `*_legacy`, creates partitioned replacements
+with identical columns and daily range bounds on the UTC day of
+`deliveries.created_at` / `attempts.occurred_at`, copies the rows into per-day
+partitions, and drops the legacy tables — all inside `db.Migrate`'s single
+transaction, so a failure leaves the plain tables untouched. Day boundaries are
+UTC so a partition's contents do not depend on the server's `TimeZone`.
+
+**The dedupe key now includes the partition key.** Uniqueness on `deliveries`
+changes from `(event_id, endpoint_id)` to `(event_id, endpoint_id, created_at)`;
+`attempts` keeps per-partition uniqueness on `(delivery_id, attempt)`. This is a
+behavioural change: FR-704's idempotency now holds *within a day*. It is safe
+because fan-out stamps `deliveries.created_at` from the **event's** `created_at`
+(not `now()`), so re-fanning the same event lands in the same partition and still
+conflicts. A defaulted `now()` key would have defeated the conflict check — this
+was verified against real Postgres before the migration was written.
+
+**Retention removes whole partitions, never rows.** `DROP TABLE` on a leaf
+partition is the only removal path (SB-2); there is no `DELETE` on either table in
+the retention code. The drop primitives are `SECURITY DEFINER` functions because
+the runtime role owns nothing and must not hold `CREATE` on the schema; they
+validate the table against a closed set, the name against
+`^<table>_[0-9]{8}$`, that the relation really is a leaf of that parent, and that
+the day has fully elapsed. Grants on the partitioned parent are sufficient for the
+runtime role in deployments (default privileges cover partitions created later);
+the test harness's blanket grant does the same for existing partitions.
+
+**Disk pressure is checked before age, and the oldest partition goes first.** When
+the volume is at or above `PIGEON_RETENTION_MAX_DISK_PCT` (default 80), `RunOnce`
+drops exactly one droppable partition per tick — the oldest across both tables —
+and logs at warning level (SB-3). Age windows (`deliveries` 14 d, `attempts` 7 d)
+are enforced only when the volume is under budget. Today's and future partitions
+are never candidates. If the budget is exceeded and nothing is droppable, the
+report sets `KeptOverBudget` and the ingest path sheds; the next tick retries.
+
+**The gauge prefers the filesystem, falls back to database size.** `PIGEON_DISK_DIR`
+(set when core and Postgres share a volume) is read with `statfs`; otherwise usage
+is pigeon's own `pg_database_size` against `PIGEON_DISK_BYTES`. With neither, the
+reading source is `none`, `GET /v1/meta/usage` answers 503, and the ingest gate
+never sheds — a documented degraded mode rather than a fabricated 0%. A failed
+read keeps the last good reading and surfaces `read_error` in the payload, so an
+operator is never shown a calm figure that stopped updating.
+
+**Over budget means shed ingest, not queue it.** While over budget the publish
+path refuses with `429`, `Retry-After: 30`, error code `over_budget`, and increments
+`pigeon_publishes_shed_total` (SB-7); nothing is written for a shed publish. The
+usage payload and the drop/shed counters are admin-only infrastructure telemetry
+(SB-6) — `/v1/meta/usage` and `/metrics` are `kindAdmin`, not tenant routes.
+
+**One sweeper per deployment, and it is also the dropper.** Leadership is the
+session-level advisory lock on a dedicated connection (`sweeperLockID`), taken with
+`pg_try_advisory_lock`; the lock dies with the session, and low TCP keepalives
+bound Postgres' detection of a dead holder to ~12 s, under D-7's 30 s ceiling. A
+replica that does not win stays a **standby that keeps competing** (it does not
+give up after a lock wait — AC-42 needs it alive to take over). The leader
+re-verifies each tick, via `pg_locks` on its own locked connection, that it still
+holds the lock and stands down if it does not, so a dead lease cannot keep
+sweeping. Retention runs on the same lease, so exactly one replica drops
+partitions. As defence in depth the SQL drop primitive takes its own
+transaction-scoped advisory lock with `lock_timeout = 5s`, so no partition drop can
+run concurrently with itself even across processes; a contended drop returns false
+and is retried on the next tick.
+
+**Events retention is reported, not enforced.** `events` is not partitioned yet, so
+the configured `PIGEON_RETENTION_EVENTS_DAYS` window appears in the usage payload
+but no partitions are dropped for it. This is a known gap, not a silent promise.
+
 ## Local toolchain
 
 Go 1.23+ is required. On this build host it is installed at
