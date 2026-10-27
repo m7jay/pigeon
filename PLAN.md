@@ -26,12 +26,22 @@ disagree, the requirements win and this file is wrong.
 | S6 | Attempt buffer + flusher, `synchronous_commit` split, evidence retention | AC-29, AC-33 | S4 | — |
 | S7 | Replay (bounded, idempotent), inspect API, event-level rollup | AC-12, AC-13, AC-32 | S4 | — |
 | S8 | Partitioning, retention-by-disk, partition drop under the sweeper lease | AC-10, AC-18, AC-42 | S4 | — |
-| S9 | Portals — producer (M2a) and consumer (M2b), scoped tokens, branding; **FR-106 optional OIDC login** and FR-111's password-reset flow (both deferred here — a second login method is a portal-visible feature, and neither exists in S1) | AC-01, AC-38, AC-39, AC-40 | S3 | — |
-| S10 | Hardening: SSRF at three points, secret rotation, `doctor`, load test, fault-injection matrix in CI | AC-19, AC-22, AC-30, AC-31, AC-34, AC-43 | S5…S9 | — |
+| S9 | Portals — consumer portal (M2b) landed as `t_0eea0b84`; producer portal (M2a) is S9a `t_c0144baa` — scoped tokens, branding; **FR-106 optional OIDC login** and FR-111's password-reset flow (both deferred here — a second login method is a portal-visible feature, and neither exists in S1) | AC-38, AC-39, AC-40 (AC-01 → S9a) | S3 | — |
+| S10 | Hardening: SSRF at three points, secret rotation, `doctor`, load test, fault-injection matrix in CI; **portal session security (FR-1009)** — `HttpOnly`/`Secure`/`SameSite=Lax` on every portal cookie, a CSRF token on every state-changing POST, cookie lifetime read from the core's `expires_at` | AC-19, AC-22, AC-30, AC-31, AC-34, AC-43, AC-44, AC-45, AC-46 | S5…S9 | — |
 
 Two items are in S2/S3 rather than later, for the reason §17 gives: the outbox
 changes the ingest transaction, and per-endpoint throttling changes the queue
 topology. Retrofitting either is a rewrite of the paths around it.
+
+**S9 is split.** `t_0eea0b84` landed the consumer portal (M2b); the producer portal
+(M2a) is S9a, card `t_c0144baa`, and AC-01 moved with it. The S9 row above still
+reads as the pre-split definition of record (`t_a11b8140`).
+
+**FR-1009 (P0) had no owner and no dashboard implemented it in full.** The consumer
+portal shipped with a 12 h hardcoded cookie lifetime (`handler.go:195`), a flash
+cookie with no `SameSite` (`handler.go:218`), and `SameSite=Lax` as its only CSRF
+control. S10 owns it now (AC-44…AC-46). S9a/M2a inherits the fix by building on
+`internal/portal` and MUST NOT reintroduce a hardcoded `MaxAge` or a tokenless form.
 
 ## Current state (S0) — closed
 

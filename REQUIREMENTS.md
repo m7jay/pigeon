@@ -896,6 +896,15 @@ Splitting them is the whole point. They have different audiences (a producer's e
 
 **Authorization is server-side.** Every consumer-portal request is scoped by `consumer_id` on a scoped token; the UI hiding a control is not the control. A consumer user calling the API directly MUST receive exactly the same filtered result set as through the portal (AC-20, AC-39).
 
+**Session security is a portal contract, not a dashboard preference (FR-1009).**
+Every cookie a portal sets carries `HttpOnly`, `Secure` and `SameSite=Lax` - a flash
+or one-shot cookie is no exception. Every state-changing route is a `POST` carrying a
+CSRF token bound to the caller's session and verified in constant time; `SameSite=Lax`
+is defense in depth, not the control. The session cookie's lifetime is the core
+session's own expiry, read from the login response's `expires_at`: a portal MUST NOT
+hold a session longer than the token it carries, and MUST NOT keep a second TTL
+constant of its own (AC-44, AC-45, AC-46).
+
 ---
 
 ## 15. Isolation, deployment, operations
@@ -976,6 +985,9 @@ Splitting them is the whole point. They have different audiences (a producer's e
 | AC-41 | Two core replicas, one endpoint capped at 10 concurrent, 100 deliveries enqueued at once | The endpoint never observes more than 10 in-flight requests; observed count is identical with 1 and 2 replicas |
 | AC-42 | Start two sweepers; kill the lock holder | The standby takes leadership within 30 s; exactly one partition is dropped; no delivery is re-queued twice |
 | AC-43 | Scale 1 → 2 → 4 replicas at fixed load below the DB ceiling | Throughput scales ≥ 80% per doubling; above the ceiling, throughput does not improve and p99 worsens, matching §8.4 |
+| AC-44 | Every `Set-Cookie` a portal emits (session, flash, CSRF) | Carries `HttpOnly`, `Secure` and `SameSite=Lax`; no portal cookie lacks any of the three |
+| AC-45 | A state-changing `POST` to a portal route with the CSRF token absent or not matching the session — a cross-origin form, or a same-origin request with the hidden field stripped | `403` and no state change; the same `POST` carrying the token the page rendered succeeds |
+| AC-46 | Core `PIGEON_SESSION_TTL=24h`, then log in to the consumer portal; repeat at `15m` | The session cookie's `Max-Age` is the 24 h / 15 m the core issued (from the login response's `expires_at`), not the 12 h constant the portal used to hardcode |
 
 ### 16.5 Fault injection matrix
 
@@ -995,7 +1007,7 @@ The durability claims in §6 are only credible if each failure mode is exercised
 | M2b | Consumer portal: invitation, self-service endpoints and subscriptions, scoped log, replay (parallel) | AC-38, AC-39 |
 | M4 | Replay with bounds, inspect API, dedupe visibility | AC-12, AC-13 |
 | M5 | Partitioning, retention-by-disk, metrics, absence alarm | AC-10, AC-11, AC-18 |
-| M6 | Hardening: SSRF, rotation, doctor, load test, docs | AC-19, AC-22, NFR-4 |
+| M6 | Hardening: SSRF, rotation, doctor, load test, docs, portal session security (FR-1009) | AC-19, AC-22, AC-44, AC-45, AC-46, NFR-4 |
 
 **Two things are M1, not later:** the outbox (it changes the ingest transaction) and per-endpoint throttling (it changes the queue topology). Both are expensive to retrofit; everything else fits behind an interface.
 
@@ -1060,6 +1072,7 @@ Recorded so they are not relitigated in review.
 | Retry policy | 15 retries, exponential, 72 h window, 12 h cap | Matches the market default shape (Hook0 8 d / 24 attempts, Svix days); 10 min lost a receiver's whole afternoon to the DLQ. Priority-class endpoints override to 1-6 h so stale events are not replayed |
 | Deployables | Three: core, producer portal, consumer portal | Different audiences, auth, branding and release cadence. Svix ships no portal in OSS and Hook0's themes stop at a logo, so this is the differentiator, and fusing them is what made the production portal internal-only. Portals are thin API consumers, so the core can run without either |
 | Transport, compute | Kafka and serverless both rejected | Argued once in §0.1; not restated here |
+| Portal session security (FR-1009) | `HttpOnly` + `Secure` + `SameSite=Lax` on every portal cookie; CSRF via a stateless HMAC double-submit token bound to the session cookie; the session cookie's lifetime is the core session's `expires_at`, with no portal-side TTL constant | `SameSite=Lax` alone loses to Chrome's Lax+POST 2-minute window on a freshly set cookie and to any same-site sibling origin — and UI-19 puts the consumer portal on the producer's own domain, where such siblings exist. A `PORTAL_SESSION_TTL` knob would drift from `PIGEON_SESSION_TTL` and re-create the cookie-outlives-token mismatch this decision removes. The token costs no server storage because the portal renders its own form server-side and can HMAC the nonce under the cookie secret it already holds |
 
 ---
 
