@@ -147,6 +147,21 @@ func (s *Server) routes() []route {
 
 		// The consumer portal's own scope (FR-110).
 		{http.MethodGet, "/v1/consumer/me", kindConsumer, s.handleConsumerMe},
+
+		// M2b, UI-13/UI-14: the consumer portal's self-service surface. Every route
+		// is scoped by the consumer id on the session claim; the consumer id is the
+		// session's, never a request field, and the store filters by it so a guessed
+		// foreign id is a 404 (AC-39). The portal is a thin client: these are also
+		// directly callable with the same scoped session, with the same answer.
+		{http.MethodGet, "/v1/consumer/endpoints", kindConsumer, s.handleConsumerListEndpoints},
+		{http.MethodPost, "/v1/consumer/endpoints", kindConsumer, s.handleConsumerCreateEndpoint},
+		{http.MethodGet, "/v1/consumer/endpoints/{endpointID}", kindConsumer, s.handleConsumerGetEndpoint},
+		{http.MethodPatch, "/v1/consumer/endpoints/{endpointID}", kindConsumer, s.handleConsumerPatchEndpoint},
+		{http.MethodDelete, "/v1/consumer/endpoints/{endpointID}", kindConsumer, s.handleConsumerDeleteEndpoint},
+		{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/verify", kindConsumer, s.handleConsumerVerifyEndpoint},
+		{http.MethodGet, "/v1/consumer/endpoints/{endpointID}/subscriptions", kindConsumer, s.handleConsumerListSubscriptions},
+		{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/subscriptions", kindConsumer, s.handleConsumerCreateSubscription},
+		{http.MethodDelete, "/v1/consumer/endpoints/{endpointID}/subscriptions/{eventType}", kindConsumer, s.handleConsumerDeleteSubscription},
 	}
 
 	if s.deps.SelfRegistration {

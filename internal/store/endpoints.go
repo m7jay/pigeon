@@ -31,7 +31,7 @@ type Endpoint struct {
 	Internal   bool
 	Status     string // active | paused | deleted
 	Verified   bool
-	VerifiedAt time.Time
+	VerifiedAt *time.Time // null until the ownership challenge is answered
 	PausedAt   time.Time
 	DeletedAt  time.Time
 	CreatedAt  time.Time
