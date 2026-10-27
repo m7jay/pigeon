@@ -100,6 +100,14 @@ Rules: one branch per card, branched from the repo's current default branch
 Never push to `master` or the default branch directly. Never force-push a branch
 under review, and never rewrite one that another person has looked at.
 
+**Every slice branches from the default branch - never from another slice's PR
+branch.** Stacking looks convenient (the slice needs the previous slice's code) and
+it is a trap: a rebase merge rewrites the parent's commits onto a new base, so the
+child is instantly `CONFLICTING` against a base that no longer exists, and merging
+the parent usually deletes the branch the child is based on. When a slice genuinely
+needs unlanded code, wait for that PR to merge, or merge it into your own branch
+(§7 `DIRTY`), but do not make a sibling PR branch your base.
+
 One exception: a worker's **own, unreviewed** branch may be rewritten to purge a
 credential — or the bare token prefix, which is enough to trip the leak scan —
 from its history. Do it by deleting and re-pushing the branch (the command guard
@@ -331,8 +339,16 @@ remote ref directly instead, which needs no checkout:
 
 ```bash
 GH=/opt/data/toolchain/gh
+$GH pr list --repo m7jay/pigeon --state open --json number,baseRefName   --jq '.[] | select(.baseRefName=="wt/<card-id>-<slug>") | .number'   # must print nothing
 $GH api -X DELETE repos/m7jay/pigeon/git/refs/heads/wt/<card-id>-<slug>
 ```
+
+**Check that list before deleting.** GitHub auto-closes any PR still based on a
+deleted branch, and refuses to reopen it (`Cannot change the base branch of a closed
+pull request`, `Could not open the pull request`), so the merge that just landed
+takes a child PR down with it and the only recovery is a fresh PR from the same head
+(§9). If that list is not empty, leave the ref alone; it can be deleted later, once
+the children have landed.
 
 Then complete, using the same key names section 5 uses for the PR:
 
@@ -416,6 +432,8 @@ branch directly, and it still does not merge a PR whose review or CI it has not 
 | helper prints nothing | `gh` unresolvable inside the git helper | keep the helper path absolute in `.gitconfig` |
 | commits show `Jayachandra` | repo-local `user.name` wins over `~/.gitconfig` | set `GIT_AUTHOR_*`/`GIT_COMMITTER_*` for the command (§6) |
 | `403` on `check-runs` | token has no `checks:read` | expected — verify CI by hand (§5) |
+| an open PR turns `CLOSED` by itself, right after a merge, and cannot be reopened | its `baseRefName` was the branch that merge deleted — GitHub closes children of a deleted base | open a replacement PR from the same head SHA (`gh pr create --base feat/m0-skeleton --head <branch>`); the old PR is dead. Give the child a real base next time (§3), and never delete a branch that is someone's base (§7 step 7) |
+| a card sits in `review` for hours and no reviewer process appears | the dispatcher refuses the spawn: `task_events` shows `respawn_guarded` with `reason: blocker_auth` about once a minute | the guard matches `tasks.last_failure_error`, and a run's rate-limit text (`exited rate-limited (quota wall)`) is never cleared by the requeue that follows it, so the stale string blocks every later spawn — clear it: `sqlite3 kanban.db "UPDATE tasks SET last_failure_error=NULL, consecutive_failures=0 WHERE id='<card-id>'"`; the dispatcher picks the card up on its next tick |
 | `GraphQL: Head branch was modified` on `pr merge` | `--match-head-commit` found the head was not the SHA you supplied — usually a push landed between your read and the merge, occasionally a stale cached head right after a fast push | Read the head without a checkout: `GH=/opt/data/toolchain/gh; $GH api repos/m7jay/pigeon/git/ref/heads/<branch> --jq .object.sha`. **If it equals the SHA you supplied**, retry the merge once. **If it does not**, stop — the head moved: go back to §7 step 1 and review the new head. Never retry against a SHA that is no longer the head, and never drop `--match-head-commit` to get past the error |
 
 ## 10. Rollback and revocation
