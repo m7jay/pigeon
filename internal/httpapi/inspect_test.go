@@ -48,44 +48,109 @@ func (e *env) seedInspectTenant(t *testing.T, slug string) *tenant {
 	return tn
 }
 
-// addEndpoint registers a second endpoint for the same consumer, verifies it and
-// subscribes it to the tenant's type, so one event fans out to two deliveries
-// (which is how the rollup's "partially failed" case is built).
-func (e *env) addEndpoint(t *testing.T, tn *tenant, name string) string {
+// s7Fixture is one test's slice of S7's shared tenant: its own consumer, its own
+// endpoint subscribed to the tenant's consumer-routed type, and its own events.
+//
+// The tenant is shared because seedTenant sets five passwords and hashing them
+// costs ~16 s per tenant under -race on a CI runner: nine S7 tests each seeding
+// their own tenant added ~150 s to a package whose pre-S7 run already used 419 s
+// of the default 10-minute test timeout. A consumer, an endpoint and a
+// subscription cost no hashing, so isolation comes from those instead - every
+// assertion below is scoped to this test's own consumer or endpoint rather than
+// to "everything the tenant has".
+type s7Fixture struct {
+	Tenant     *tenant
+	Ref        string
+	ConsumerID string
+	EndpointID string
+}
+
+// s7TenantSlug names the one tenant the S7 tests share.
+const s7TenantSlug = "s7-inspect"
+
+// s7Tenant returns the shared tenant, seeding it on first use in this binary.
+func s7Tenant(t *testing.T, e *env) *tenant {
 	t.Helper()
-	code, raw := e.do(http.MethodPost, "/v1/producer/consumers/"+tn.ConsumerID+"/endpoints?env=live",
+	if tn, ok := e.tenants[s7TenantSlug]; ok {
+		return tn
+	}
+	return e.seedInspectTenant(t, s7TenantSlug)
+}
+
+// setupS7 returns the shared tenant plus a fresh consumer and endpoint for this
+// test.
+func setupS7(t *testing.T) (*env, *s7Fixture) {
+	t.Helper()
+	e := setup(t)
+	tn := s7Tenant(t, e)
+	slug := refSlug(t.Name())
+	fx := &s7Fixture{Tenant: tn, Ref: "ref-" + slug}
+	code, raw := e.do(http.MethodPost, "/v1/producer/consumers?env=live", tn.OwnerToken,
+		map[string]string{"ref": fx.Ref, "name": "S7 fixture " + slug})
+	mustStatus(t, code, raw, http.StatusCreated)
+	fx.ConsumerID = decode[consumerJSON](t, raw).ID
+	fx.EndpointID = e.newEndpoint(t, tn, fx.ConsumerID, slug, tn.EventTypeName)
+	return e, fx
+}
+
+// refSlug turns a test name into the alphanumeric part a consumer ref takes.
+func refSlug(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// newEndpoint registers an endpoint under a consumer, verifies it and subscribes
+// it to a type, returning its id.
+func (e *env) newEndpoint(t *testing.T, tn *tenant, consumerID, name, eventType string) string {
+	t.Helper()
+	code, raw := e.do(http.MethodPost, "/v1/producer/consumers/"+consumerID+"/endpoints?env=live",
 		tn.OwnerToken, map[string]string{"name": name, "url": "https://8.8.4.4/hook"})
 	mustStatus(t, code, raw, http.StatusCreated)
 	created := decode[endpointCreatedJSON](t, raw)
-	e.verifyEndpoint(t, tn, created.ID, created.VerificationToken)
+	e.verifyEndpointFor(t, tn, consumerID, created.ID, created.VerificationToken, eventType)
 	return created.ID
+}
+
+// deliverFor publishes one event for this fixture's own consumer and fans it out,
+// returning the delivery ids it produced.
+func (e *env) deliverFor(t *testing.T, fx *s7Fixture) []int64 {
+	t.Helper()
+	return e.fanOut(t, fx.Tenant, e.publishFor(t, fx, fx.Ref))
+}
+
+// publishFor publishes one event for the fixture's tenant against a named
+// consumer ref, so a test can aim at a consumer that is not its own (the
+// unroutable case, or a sibling consumer in the FR-1105 test).
+func (e *env) publishFor(t *testing.T, fx *s7Fixture, ref string) string {
+	t.Helper()
+	return e.publishTypedEvent(t, fx.Tenant, fx.Tenant.EventTypeName, ref)
 }
 
 // verifyEndpoint answers the ownership challenge (FR-403) and subscribes the
 // endpoint to the tenant's event type (FR-501), over the API.
 func (e *env) verifyEndpoint(t *testing.T, tn *tenant, endpointID, token string) {
 	t.Helper()
-	e.verifyEndpointFor(t, tn, endpointID, token, tn.EventTypeName)
+	e.verifyEndpointFor(t, tn, tn.ConsumerID, endpointID, token, tn.EventTypeName)
 }
 
-// verifyEndpointFor is verifyEndpoint for a named type, so a fixture can hold
-// two types at once (the cross-producer tenant keeps a broadcast type for the
-// ingest cases and a consumer-routed one for the delivery cases).
-func (e *env) verifyEndpointFor(t *testing.T, tn *tenant, endpointID, token, eventType string) {
+// verifyEndpointFor is verifyEndpoint for a named consumer and type, so a fixture
+// can hold several consumers at once (the S7 tests each own one, and the
+// cross-producer tenant keeps a broadcast type for the ingest cases and a
+// consumer-routed one for the delivery cases).
+func (e *env) verifyEndpointFor(t *testing.T, tn *tenant, consumerID, endpointID, token, eventType string) {
 	t.Helper()
 	code, raw := e.do(http.MethodPost,
-		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+endpointID+"/verify?env=live",
+		"/v1/producer/consumers/"+consumerID+"/endpoints/"+endpointID+"/verify?env=live",
 		tn.OwnerToken, map[string]string{"token": token})
 	mustStatus(t, code, raw, http.StatusNoContent)
 	code, raw = e.do(http.MethodPost, "/v1/producer/endpoints/"+endpointID+"/subscriptions?env=live",
 		tn.OwnerToken, map[string]string{"event_type": eventType})
 	mustStatus(t, code, raw, http.StatusCreated)
-}
-
-// publishEvent publishes one consumer-routed event for the tenant (FR-601).
-func (e *env) publishEvent(t *testing.T, tn *tenant, consumerRef string) string {
-	t.Helper()
-	return e.publishTypedEvent(t, tn, tn.EventTypeName, consumerRef)
 }
 
 // publishTypedEvent publishes against a named type.
@@ -141,11 +206,11 @@ func (e *env) fanOut(t *testing.T, tn *tenant, eventID string) []int64 {
 	return ids
 }
 
-// deliver is one event fanning out to one delivery, in whatever state the caller
-// asks for next.
-func (e *env) deliver(t *testing.T, tn *tenant) int64 {
+// deliver is one event fanning out to one delivery for a given consumer, in
+// whatever state the caller asks for next.
+func (e *env) deliver(t *testing.T, fx *s7Fixture) int64 {
 	t.Helper()
-	return e.fanOut(t, tn, e.publishEvent(t, tn, tn.ConsumerRef))[0]
+	return e.deliverFor(t, fx)[0]
 }
 
 // completeDelivery runs S4's successful path (FR-811): the four columns on the
@@ -205,7 +270,7 @@ func (e *env) countRows(t *testing.T, query string, args ...any) int {
 // path's bound, and building 5,000 pairs through publish + fan-out would measure
 // the ingest path instead. The rows are still real rows in the real tables, so
 // the selection the API bounds is the selection a support engineer would see.
-func (e *env) bulkDeliveries(t *testing.T, tn *tenant, endpointID, tag string, n int, createdAt time.Time) {
+func (e *env) bulkDeliveries(t *testing.T, tn *tenant, consumerID, endpointID, tag string, n int, createdAt time.Time) {
 	t.Helper()
 	ctx := context.Background()
 	_, err := e.admin.Exec(ctx, `
@@ -221,7 +286,7 @@ func (e *env) bulkDeliveries(t *testing.T, tn *tenant, endpointID, tag string, n
 		insert into deliveries (event_id, endpoint_id, producer_id, env, consumer_id, status, created_at)
 		select $5 || i::text, $1, $2, 'live', $3, 'delivered', $4
 		from generate_series(1, $6::int) i`,
-		endpointID, tn.ID, tn.ConsumerID, createdAt, tag, n)
+		endpointID, tn.ID, consumerID, createdAt, tag, n)
 	if err != nil {
 		t.Fatalf("bulk deliveries (%s): %v", tag, err)
 	}
@@ -277,16 +342,19 @@ func (e *env) eventView(t *testing.T, token, eventID string) eventViewJSONBody {
 // TestDeliveryListFiltersAndCursorPagination is FR-1101: filters by endpoint,
 // event type, status and time range, paginated by cursor.
 func TestDeliveryListFiltersAndCursorPagination(t *testing.T) {
-	e := setup(t)
-	tn := e.seedInspectTenant(t, "s7-list")
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+	// Every read below is scoped to this test's own endpoint: the tenant is
+	// shared with its sibling tests, and this endpoint is this test's alone.
+	mine := "&endpoint_id=" + fx.EndpointID
 
-	delivered := e.deliver(t, tn)
+	delivered := e.deliver(t, fx)
 	e.completeDelivery(t, delivered, 1, time.Now().Add(-2*time.Second), time.Now().Add(-time.Second))
-	failed := e.deliver(t, tn)
+	failed := e.deliver(t, fx)
 	e.failDelivery(t, failed, 500, 1, time.Now().Add(-time.Second))
-	pending := e.deliver(t, tn)
+	pending := e.deliver(t, fx)
 
-	all := e.listDeliveries(t, tn.OwnerToken, "")
+	all := e.listDeliveries(t, tn.OwnerToken, mine)
 	if len(all.Deliveries) != 3 {
 		t.Fatalf("listed %d deliveries, want 3", len(all.Deliveries))
 	}
@@ -302,7 +370,7 @@ func TestDeliveryListFiltersAndCursorPagination(t *testing.T) {
 	seen := map[int64]bool{}
 	cursor := ""
 	for page := 0; page < 5; page++ {
-		got := e.listDeliveries(t, tn.OwnerToken, "&limit=1"+cursor)
+		got := e.listDeliveries(t, tn.OwnerToken, "&limit=1"+mine+cursor)
 		if len(got.Deliveries) != 1 {
 			t.Fatalf("page %d returned %d rows, want 1", page, len(got.Deliveries))
 		}
@@ -320,7 +388,7 @@ func TestDeliveryListFiltersAndCursorPagination(t *testing.T) {
 	}
 
 	// Status filter.
-	only := e.listDeliveries(t, tn.OwnerToken, "&status=delivered")
+	only := e.listDeliveries(t, tn.OwnerToken, "&status=delivered"+mine)
 	if len(only.Deliveries) != 1 || only.Deliveries[0].ID != delivered {
 		t.Fatalf("status=delivered returned %+v, want just delivery %d", only.Deliveries, delivered)
 	}
@@ -329,17 +397,22 @@ func TestDeliveryListFiltersAndCursorPagination(t *testing.T) {
 	}
 
 	// Event type and endpoint filters.
-	if got := e.listDeliveries(t, tn.OwnerToken, "&event_type="+tn.EventTypeName); len(got.Deliveries) != 3 {
+	if got := e.listDeliveries(t, tn.OwnerToken, "&event_type="+tn.EventTypeName+mine); len(got.Deliveries) != 3 {
 		t.Fatalf("event_type filter returned %d rows, want 3", len(got.Deliveries))
 	}
-	if got := e.listDeliveries(t, tn.OwnerToken, "&event_type=nothing.here"); len(got.Deliveries) != 0 {
+	if got := e.listDeliveries(t, tn.OwnerToken, "&event_type=nothing.here"+mine); len(got.Deliveries) != 0 {
 		t.Fatalf("an unrelated event type returned %d rows, want 0", len(got.Deliveries))
-	}
-	if got := e.listDeliveries(t, tn.OwnerToken, "&endpoint_id="+tn.EndpointID); len(got.Deliveries) != 3 {
-		t.Fatalf("endpoint filter returned %d rows, want 3", len(got.Deliveries))
 	}
 	if got := e.listDeliveries(t, tn.OwnerToken, "&endpoint_id=ep_does_not_exist"); len(got.Deliveries) != 0 {
 		t.Fatalf("an unknown endpoint returned %d rows, want 0", len(got.Deliveries))
+	}
+	// The list is tenant-wide, so an unfiltered page contains this test's three
+	// among whatever its siblings and the cross-producer fixtures left behind:
+	// tenant isolation itself is the cross-producer suite's assertion, not this
+	// one's.
+	unfiltered := e.listDeliveries(t, tn.OwnerToken, "")
+	if len(unfiltered.Deliveries) < 3 {
+		t.Fatalf("the unfiltered list returned %d rows, want at least this test's 3", len(unfiltered.Deliveries))
 	}
 
 	// Time range. One delivery is aged out of the window by hand, so the filter
@@ -349,11 +422,11 @@ func TestDeliveryListFiltersAndCursorPagination(t *testing.T) {
 		t.Fatal(err)
 	}
 	since := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
-	if got := e.listDeliveries(t, tn.OwnerToken, "&from="+since); len(got.Deliveries) != 2 {
+	if got := e.listDeliveries(t, tn.OwnerToken, "&from="+since+mine); len(got.Deliveries) != 2 {
 		t.Fatalf("from=1h returned %d rows, want the two recent deliveries", len(got.Deliveries))
 	}
 	until := time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339)
-	if got := e.listDeliveries(t, tn.OwnerToken, "&to="+until); len(got.Deliveries) != 1 || got.Deliveries[0].ID != delivered {
+	if got := e.listDeliveries(t, tn.OwnerToken, "&to="+until+mine); len(got.Deliveries) != 1 || got.Deliveries[0].ID != delivered {
 		t.Fatalf("to=24h ago returned %+v, want just the aged delivery %d", got.Deliveries, delivered)
 	}
 
@@ -370,18 +443,12 @@ func TestDeliveryListFiltersAndCursorPagination(t *testing.T) {
 	if got := errorCode(t, raw); got != "invalid_time" {
 		t.Fatalf("error code = %q, want invalid_time", got)
 	}
-
-	// The consumer portal's log (UI-15) is the same list, scoped by the claim.
-	mine := e.doListAsConsumer(t, tn)
-	if len(mine) != 3 {
-		t.Fatalf("the consumer's own log returned %d deliveries, want 3", len(mine))
-	}
 }
 
-// doListAsConsumer reads the consumer-scoped list.
-func (e *env) doListAsConsumer(t *testing.T, tn *tenant) []deliveryJSON {
+// doListAsConsumer reads the consumer-scoped list (FR-1105, UI-15).
+func (e *env) doListAsConsumer(t *testing.T, consumerToken string) []deliveryJSON {
 	t.Helper()
-	code, raw := e.do(http.MethodGet, "/v1/consumer/deliveries", tn.ConsumerToken, nil)
+	code, raw := e.do(http.MethodGet, "/v1/consumer/deliveries", consumerToken, nil)
 	mustStatus(t, code, raw, http.StatusOK)
 	return decode[deliveryListJSON](t, raw).Deliveries
 }
@@ -392,10 +459,10 @@ func (e *env) doListAsConsumer(t *testing.T, tn *tenant) []deliveryJSON {
 // with its attempts in order, each carrying number, timestamp, duration, status,
 // truncated body, error class and next retry time.
 func TestDeliveryDetailExposesOrderedAttempts(t *testing.T) {
-	e := setup(t)
-	tn := e.seedInspectTenant(t, "s7-detail")
+	e, fx := setupS7(t)
+	tn := fx.Tenant
 
-	id := e.deliver(t, tn)
+	id := e.deliver(t, fx)
 	started := time.Now().Add(-90 * time.Second).UTC().Truncate(time.Millisecond)
 	e.failDelivery(t, id, 503, 2, started)
 
@@ -468,19 +535,21 @@ func ptr[T any](v T) *T { return &v }
 // TestEventRollupStatuses is FR-1109: one event, its fan-out outcome and the
 // rollup, for every one of the five values.
 func TestEventRollupStatuses(t *testing.T) {
-	e := setup(t)
-	tn := e.seedInspectTenant(t, "s7-rollup")
-	second := e.addEndpoint(t, tn, "second endpoint")
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+	// A second endpoint on this test's own consumer, so one event fans out to two
+	// deliveries and the rollup has something to be partially failed about.
+	second := e.newEndpoint(t, tn, fx.ConsumerID, refSlug(t.Name())+"-second", tn.EventTypeName)
 
 	// pending: accepted, fanned out, nothing attempted yet.
-	pendingEvent := e.publishEvent(t, tn, tn.ConsumerRef)
+	pendingEvent := e.publishFor(t, fx, fx.Ref)
 	e.fanOut(t, tn, pendingEvent)
 	if got := e.eventView(t, tn.OwnerToken, pendingEvent).Rollup; got != store.RollupPending {
 		t.Fatalf("a fanned-out event rolled up as %q, want %q", got, store.RollupPending)
 	}
 
 	// all_delivered: the state AC-32 opens.
-	okEvent := e.publishEvent(t, tn, tn.ConsumerRef)
+	okEvent := e.publishFor(t, fx, fx.Ref)
 	affected := e.fanOut(t, tn, okEvent)
 	for _, id := range affected {
 		e.completeDelivery(t, id, 1, time.Now().Add(-time.Second), time.Now())
@@ -494,7 +563,7 @@ func TestEventRollupStatuses(t *testing.T) {
 	}
 
 	// failed: fanned out, attempted, terminally failed.
-	failedEvent := e.publishEvent(t, tn, tn.ConsumerRef)
+	failedEvent := e.publishFor(t, fx, fx.Ref)
 	for _, id := range e.fanOut(t, tn, failedEvent) {
 		e.failDelivery(t, id, 500, 1, time.Now().Add(-time.Second))
 	}
@@ -503,10 +572,10 @@ func TestEventRollupStatuses(t *testing.T) {
 	}
 
 	// partially_failed: two endpoint deliveries, one delivered and one failed.
-	mixedEvent := e.publishEvent(t, tn, tn.ConsumerRef)
+	mixedEvent := e.publishFor(t, fx, fx.Ref)
 	mixed := e.fanOut(t, tn, mixedEvent)
 	if len(mixed) != 2 {
-		t.Fatalf("the mixed fixture fanned out to %d deliveries, want 2 (endpoints %s, %s)", len(mixed), tn.EndpointID, second)
+		t.Fatalf("the mixed fixture fanned out to %d deliveries, want 2 (endpoints %s, %s)", len(mixed), fx.EndpointID, second)
 	}
 	e.completeDelivery(t, mixed[0], 1, time.Now().Add(-time.Second), time.Now())
 	e.failDelivery(t, mixed[1], 502, 1, time.Now().Add(-time.Second))
@@ -515,7 +584,7 @@ func TestEventRollupStatuses(t *testing.T) {
 	}
 
 	// unroutable: the consumer_ref matched no consumer (§7.5a, AC-23).
-	unroutableEvent := e.publishEvent(t, tn, "ref-nobody-onboarded-this")
+	unroutableEvent := e.publishFor(t, fx, "ref-nobody-onboarded-this")
 	if reason := e.fanOutRaw(t, tn, unroutableEvent).EventReason; reason != store.ReasonUnroutableNotRegistered {
 		t.Fatalf("fan-out of an unregistered ref recorded %q, want %s", reason, store.ReasonUnroutableNotRegistered)
 	}
@@ -543,10 +612,10 @@ func TestEventRollupStatuses(t *testing.T) {
 // never hands the UI a delivery whose trail is empty and unaccounted for
 // (FR-1110).
 func TestDeliveredFirstAttemptHasNoEmptyTrail(t *testing.T) {
-	e := setup(t)
-	tn := e.seedInspectTenant(t, "s7-trail")
+	e, fx := setupS7(t)
+	tn := fx.Tenant
 
-	eventID := e.publishEvent(t, tn, tn.ConsumerRef)
+	eventID := e.publishFor(t, fx, fx.Ref)
 	ids := e.fanOut(t, tn, eventID)
 	started := time.Now().Add(-1500 * time.Millisecond).UTC().Truncate(time.Microsecond)
 	done := time.Now().UTC().Truncate(time.Microsecond)
@@ -611,8 +680,8 @@ func TestDeliveredFirstAttemptHasNoEmptyTrail(t *testing.T) {
 	// A skipped delivery is the other shape that has no attempt rows: a matched
 	// endpoint that could not take the event. Its trail is the reason, not an
 	// empty list.
-	pausedEvent := e.publishEvent(t, tn, tn.ConsumerRef)
-	code, raw = e.do(http.MethodPatch, "/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+tn.EndpointID+"?env=live",
+	pausedEvent := e.publishFor(t, fx, fx.Ref)
+	code, raw = e.do(http.MethodPatch, "/v1/producer/consumers/"+fx.ConsumerID+"/endpoints/"+fx.EndpointID+"?env=live",
 		tn.OwnerToken, map[string]bool{"paused": true})
 	mustStatus(t, code, raw, http.StatusOK)
 	if skipped := e.fanOutRaw(t, tn, pausedEvent).Skipped; len(skipped) != 1 {
@@ -638,20 +707,24 @@ func TestDeliveredFirstAttemptHasNoEmptyTrail(t *testing.T) {
 // deliveries being repaired are never touched, and the trail says which
 // deliveries came from the replay.
 func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
-	e := setup(t)
-	tn := e.seedInspectTenant(t, "s7-replay")
+	e, fx := setupS7(t)
+	tn := fx.Tenant
 
-	brokenA := e.deliver(t, tn)
+	brokenA := e.deliver(t, fx)
 	e.failDelivery(t, brokenA, 500, 1, time.Now().Add(-time.Minute))
-	brokenB := e.deliver(t, tn)
+	brokenB := e.deliver(t, fx)
 	e.failDelivery(t, brokenB, 503, 1, time.Now().Add(-time.Minute))
-	healthy := e.deliver(t, tn)
+	healthy := e.deliver(t, fx)
 	e.completeDelivery(t, healthy, 1, time.Now().Add(-time.Minute), time.Now().Add(-59*time.Second))
 
 	before := e.deliverySnapshot(t, brokenA, brokenB, healthy)
 	attemptsBefore := e.countRows(t, `select count(*) from attempts`)
+	requestsBefore := e.countRows(t, `select count(*) from replay_requests where producer_id = $1`, tn.ID)
 
-	body := map[string]any{"status": "failed", "idempotency_key": "ac12-request-key"}
+	// The filter is this test's own endpoint: the tenant is shared with its
+	// siblings, and a replay that selected their deliveries would be a bug this
+	// test could not see.
+	body := map[string]any{"status": "failed", "endpoint_id": fx.EndpointID, "idempotency_key": "ac12-request-key"}
 	code, raw := e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken, body)
 	mustStatus(t, code, raw, http.StatusOK)
 	first := decode[replayJSONBody](t, raw)
@@ -695,8 +768,8 @@ func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
 		if replayOf == nil || (*replayOf != brokenA && *replayOf != brokenB) {
 			t.Fatalf("replayed delivery %d links to %v, want one of the two failed deliveries", id, replayOf)
 		}
-		if endpointID != tn.EndpointID {
-			t.Fatalf("replayed delivery %d went to endpoint %s, want %s", id, endpointID, tn.EndpointID)
+		if endpointID != fx.EndpointID {
+			t.Fatalf("replayed delivery %d went to endpoint %s, want %s", id, endpointID, fx.EndpointID)
 		}
 		if _, ok := e.eventFor(t, eventID); !ok {
 			t.Fatalf("replayed delivery %d lost its event %s", id, eventID)
@@ -739,7 +812,7 @@ func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
 	if !sameIDs(first.DeliveryIDs, second.DeliveryIDs) {
 		t.Fatalf("the repeat returned %v, want the first call's %v", second.DeliveryIDs, first.DeliveryIDs)
 	}
-	total := e.countRows(t, `select count(*) from deliveries where producer_id = $1 and replay_of_delivery_id is not null`, tn.ID)
+	total := e.countRows(t, `select count(*) from deliveries where endpoint_id = $1 and replay_of_delivery_id is not null`, fx.EndpointID)
 	if total != 2 {
 		t.Fatalf("two replays with one request key created %d deliveries, want one set (AC-12)", total)
 	}
@@ -768,14 +841,14 @@ func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
 
 	// A dry run answers the count and the bound without writing.
 	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
-		map[string]any{"status": "failed", "idempotency_key": "ac12-dry-run", "dry_run": true})
+		map[string]any{"status": "failed", "endpoint_id": fx.EndpointID, "idempotency_key": "ac12-dry-run", "dry_run": true})
 	mustStatus(t, code, raw, http.StatusOK)
 	dry := decode[replayJSONBody](t, raw)
 	if dry.Matched != 2 || dry.Created != 0 || !dry.DryRun {
 		t.Fatalf("dry run = %+v, want matched 2 and nothing created", dry)
 	}
-	if n := e.countRows(t, `select count(*) from replay_requests where producer_id = $1`, tn.ID); n != 2 {
-		t.Fatalf("recorded %d replay requests, want exactly the two real replays (a dry run must not burn a key)", n)
+	if n := e.countRows(t, `select count(*) from replay_requests where producer_id = $1`, tn.ID); n != requestsBefore+2 {
+		t.Fatalf("recorded %d replay requests, want exactly the two real replays (a dry run must not burn a key)", n-requestsBefore)
 	}
 }
 
@@ -783,18 +856,20 @@ func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
 // FR-1107's 1,000 is refused, the refusal names the bound, and nothing is
 // written - including the request record, so the key is not burned.
 func TestReplayBoundIsRejectedNamingTheBound(t *testing.T) {
-	e := setup(t)
-	tn := e.seedInspectTenant(t, "s7-bound")
+	e, fx := setupS7(t)
+	tn := fx.Tenant
 
 	recent := time.Now().Add(-3 * time.Hour)
 	old := time.Now().Add(-10 * 24 * time.Hour)
-	e.bulkDeliveries(t, tn, tn.EndpointID, "evtbulkrecent", 1000, recent)
-	e.bulkDeliveries(t, tn, tn.EndpointID, "evtbulkold", 4000, old)
-	before := e.countRows(t, `select count(*) from deliveries where producer_id = $1`, tn.ID)
+	e.bulkDeliveries(t, tn, fx.ConsumerID, fx.EndpointID, "evtbulkrecent", 1000, recent)
+	e.bulkDeliveries(t, tn, fx.ConsumerID, fx.EndpointID, "evtbulkold", 4000, old)
+	bound := `select count(*) from deliveries where endpoint_id = $1`
+	before := e.countRows(t, bound, fx.EndpointID)
+	requestsBefore := e.countRows(t, `select count(*) from replay_requests where producer_id = $1`, tn.ID)
 
 	// AC-13: 5,000 selected, refused, and the refusal says why.
 	code, raw := e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
-		map[string]any{"idempotency_key": "ac13-over"})
+		map[string]any{"endpoint_id": fx.EndpointID, "idempotency_key": "ac13-over"})
 	mustStatus(t, code, raw, http.StatusUnprocessableEntity)
 	if got := errorCode(t, raw); got != "replay_bound_exceeded" {
 		t.Fatalf("error code = %q, want replay_bound_exceeded", got)
@@ -802,23 +877,24 @@ func TestReplayBoundIsRejectedNamingTheBound(t *testing.T) {
 	if !strings.Contains(string(raw), "1000") {
 		t.Fatalf("the refusal does not name the bound (AC-13): %s", raw)
 	}
-	if n := e.countRows(t, `select count(*) from deliveries where producer_id = $1`, tn.ID); n != before {
+	if n := e.countRows(t, bound, fx.EndpointID); n != before {
 		t.Fatalf("a refused replay wrote %d deliveries", n-before)
 	}
-	if n := e.countRows(t, `select count(*) from replay_requests where producer_id = $1`, tn.ID); n != 0 {
-		t.Fatalf("a refused replay recorded %d request keys, want 0", n)
+	if n := e.countRows(t, `select count(*) from replay_requests where producer_id = $1`, tn.ID); n != requestsBefore {
+		t.Fatalf("a refused replay recorded %d request keys, want 0", n-requestsBefore)
 	}
 
 	// The bound is inclusive: exactly 1,000 is one request's worth.
 	cutoff := time.Now().Add(-6 * time.Hour).UTC().Format(time.RFC3339)
 	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
-		map[string]any{"from": cutoff, "idempotency_key": "ac13-at-the-bound"})
+		map[string]any{"endpoint_id": fx.EndpointID, "from": cutoff, "idempotency_key": "ac13-at-the-bound"})
 	mustStatus(t, code, raw, http.StatusOK)
 	atBound := decode[replayJSONBody](t, raw)
 	if atBound.Matched != 1000 || atBound.Created != 1000 {
 		t.Fatalf("a 1000-delivery replay = %+v, want 1000 matched and created", atBound)
 	}
-	if n := e.countRows(t, `select count(*) from deliveries where producer_id = $1 and replay_of_delivery_id is not null`, tn.ID); n != 1000 {
+	replayed := `select count(*) from deliveries where endpoint_id = $1 and replay_of_delivery_id is not null`
+	if n := e.countRows(t, replayed, fx.EndpointID); n != 1000 {
 		t.Fatalf("the at-bound replay created %d replayed deliveries, want 1000", n)
 	}
 
@@ -826,13 +902,13 @@ func TestReplayBoundIsRejectedNamingTheBound(t *testing.T) {
 	if _, err := e.admin.Exec(context.Background(), `
 		update deliveries set created_at = $2
 		where id = (select id from deliveries
-		            where producer_id = $1 and created_at < $2 and status = 'delivered'
+		            where endpoint_id = $1 and created_at < $2 and status = 'delivered'
 		              and replay_of_delivery_id is null
-		            order by id limit 1)`, tn.ID, recent); err != nil {
+		            order by id limit 1)`, fx.EndpointID, recent); err != nil {
 		t.Fatal(err)
 	}
 	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
-		map[string]any{"from": cutoff, "idempotency_key": "ac13-over-by-one"})
+		map[string]any{"endpoint_id": fx.EndpointID, "from": cutoff, "idempotency_key": "ac13-over-by-one"})
 	mustStatus(t, code, raw, http.StatusUnprocessableEntity)
 	if !strings.Contains(string(raw), "1000") {
 		t.Fatalf("the refusal does not name the bound: %s", raw)
@@ -841,7 +917,7 @@ func TestReplayBoundIsRejectedNamingTheBound(t *testing.T) {
 	// A dry run applies the same bound, so a confirmation step cannot report a
 	// count it would then refuse.
 	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
-		map[string]any{"idempotency_key": "ac13-dry-over", "dry_run": true})
+		map[string]any{"endpoint_id": fx.EndpointID, "idempotency_key": "ac13-dry-over", "dry_run": true})
 	mustStatus(t, code, raw, http.StatusUnprocessableEntity)
 }
 
@@ -1016,7 +1092,7 @@ func seedCrossProducerDelivery(t *testing.T, e *env, tn *tenant) {
 		"payload_schema": map[string]any{"type": "object"},
 	})
 	mustStatus(t, code, raw, http.StatusCreated)
-	e.verifyEndpointFor(t, tn, tn.EndpointID, tn.EndpointVerifyToken, tn.DeliveryEventTypeName)
+	e.verifyEndpointFor(t, tn, tn.ConsumerID, tn.EndpointID, tn.EndpointVerifyToken, tn.DeliveryEventTypeName)
 	eventID := e.publishTypedEvent(t, tn, tn.DeliveryEventTypeName, tn.ConsumerRef)
 	ids := e.fanOut(t, tn, eventID)
 	if len(ids) != 1 {
@@ -1030,33 +1106,30 @@ func seedCrossProducerDelivery(t *testing.T, e *env, tn *tenant) {
 // TestConsumerSeesOnlyItsOwnDeliveries is FR-1105 (and AC-39's shape): the
 // consumer-scoped list, detail and replay are forced to the session's consumer,
 // and another consumer's delivery is a 404, never a 403.
+//
+// The session here belongs to the shared tenant's own seeded consumer - the only
+// consumer in this file with a password behind it - and the sibling is this
+// test's cheap fixture consumer. That is the isolation worth proving: same
+// producer, same environment, two consumers.
 func TestConsumerSeesOnlyItsOwnDeliveries(t *testing.T) {
-	e := setup(t)
-	mine := e.seedInspectTenant(t, "s7-consumer-mine")
+	e, fx := setupS7(t)
+	mine := fx.Tenant
+	siblingConsumer, siblingRef := fx.ConsumerID, fx.Ref
 
-	mineEvent := e.publishEvent(t, mine, mine.ConsumerRef)
-	mineDelivery := e.fanOut(t, mine, mineEvent)
+	// The session's consumer gets exactly one delivery, fanned out to its own
+	// endpoint.
+	mineDelivery := e.fanOut(t, mine, e.publishTypedEvent(t, mine, mine.EventTypeName, mine.ConsumerRef))
+	if len(mineDelivery) != 1 {
+		t.Fatalf("the session consumer's event fanned out to %d deliveries, want 1", len(mineDelivery))
+	}
 
-	// Same producer, different consumers: build the sibling in the same tenant,
-	// so the isolation under test is the consumer's, not the tenant's.
-	code, raw := e.do(http.MethodPost, "/v1/producer/consumers?env=live", mine.OwnerToken,
-		map[string]string{"ref": "ref-second-consumer", "name": "Second consumer"})
-	mustStatus(t, code, raw, http.StatusCreated)
-	siblingConsumer := decode[consumerJSON](t, raw).ID
-	code, raw = e.do(http.MethodPost, "/v1/producer/consumers/"+siblingConsumer+"/endpoints?env=live",
-		mine.OwnerToken, map[string]string{"name": "sibling endpoint", "url": "https://1.1.1.1/hook"})
-	mustStatus(t, code, raw, http.StatusCreated)
-	sibling := decode[endpointCreatedJSON](t, raw)
-	e.verifyEndpoint(t, mine, sibling.ID, sibling.VerificationToken)
-	siblingEvent := e.publishEvent(t, mine, "ref-second-consumer")
-	code, raw = e.do(http.MethodGet, "/v1/producer/events/"+siblingEvent+"?env=live", mine.OwnerToken, nil)
-	mustStatus(t, code, raw, http.StatusOK)
-	siblingIDs := e.fanOut(t, mine, siblingEvent)
+	// The sibling consumer's delivery is the thing the session must not see.
+	siblingIDs := e.deliverFor(t, fx)
 	if len(siblingIDs) != 1 {
 		t.Fatalf("the sibling consumer's event fanned out to %d deliveries, want 1", len(siblingIDs))
 	}
 
-	log := e.doListAsConsumer(t, mine)
+	log := e.doListAsConsumer(t, mine.ConsumerToken)
 	if len(log) != 1 || log[0].ID != mineDelivery[0] {
 		t.Fatalf("the consumer's log returned %+v, want just its own delivery %d", log, mineDelivery[0])
 	}
@@ -1067,7 +1140,7 @@ func TestConsumerSeesOnlyItsOwnDeliveries(t *testing.T) {
 	}
 
 	// A sibling consumer's delivery is a 404 through the detail route.
-	code, raw = e.do(http.MethodGet, fmt.Sprintf("/v1/consumer/deliveries/%d", siblingIDs[0]), mine.ConsumerToken, nil)
+	code, raw := e.do(http.MethodGet, fmt.Sprintf("/v1/consumer/deliveries/%d", siblingIDs[0]), mine.ConsumerToken, nil)
 	mustStatus(t, code, raw, http.StatusNotFound)
 	if got := errorCode(t, raw); got != "not_found" {
 		t.Fatalf("error code = %q, want not_found (never forbidden)", got)
@@ -1088,6 +1161,9 @@ func TestConsumerSeesOnlyItsOwnDeliveries(t *testing.T) {
 	if n := e.countRows(t,
 		`select count(*) from deliveries where replay_of_delivery_id = any($1)`, []int64{siblingIDs[0], mineDelivery[0]}); n != 0 {
 		t.Fatalf("the refused consumer replay created %d deliveries", n)
+	}
+	if siblingRef == mine.ConsumerRef {
+		t.Fatal("the sibling fixture reused the session consumer's ref")
 	}
 
 	// Its own consumer's deliveries are replayable from the portal (UI-16),
@@ -1118,11 +1194,10 @@ func TestConsumerSeesOnlyItsOwnDeliveries(t *testing.T) {
 // answerable for the last 30 days from Postgres, and it counts a replay as a
 // duplicate delivery of the same pair.
 func TestDedupeAnswerWasThisADuplicate(t *testing.T) {
-	e := setup(t)
-	tn := e.seedInspectTenant(t, "s7-dedupe")
-	other := e.seedInspectTenant(t, "s7-dedupe-other")
+	e, fx := setupS7(t)
+	tn := fx.Tenant
 
-	eventID := e.publishEvent(t, tn, tn.ConsumerRef)
+	eventID := e.publishFor(t, fx, fx.Ref)
 	deliveryID := e.fanOut(t, tn, eventID)[0]
 	e.completeDelivery(t, deliveryID, 1, time.Now().Add(-time.Second), time.Now())
 
@@ -1131,7 +1206,7 @@ func TestDedupeAnswerWasThisADuplicate(t *testing.T) {
 			"/v1/producer/deliveries/dedupe?env=live&endpoint_id="+endpointID+"&event_id="+event, token, nil)
 	}
 
-	code, raw := ask(tn.OwnerToken, tn.EndpointID, eventID)
+	code, raw := ask(tn.OwnerToken, fx.EndpointID, eventID)
 	mustStatus(t, code, raw, http.StatusOK)
 	answer := decode[dedupeJSONBody](t, raw)
 	if !answer.Duplicate || answer.FirstDeliveryID != deliveryID || answer.FirstSeenAt == nil || answer.Deliveries != 1 {
@@ -1141,9 +1216,9 @@ func TestDedupeAnswerWasThisADuplicate(t *testing.T) {
 	// A replay of the same pair is a second delivery of the same pair, and the
 	// answer says so rather than counting the pair once.
 	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
-		map[string]any{"endpoint_id": tn.EndpointID, "idempotency_key": "s7-dedupe-replay"})
+		map[string]any{"endpoint_id": fx.EndpointID, "idempotency_key": "s7-dedupe-replay"})
 	mustStatus(t, code, raw, http.StatusOK)
-	code, raw = ask(tn.OwnerToken, tn.EndpointID, eventID)
+	code, raw = ask(tn.OwnerToken, fx.EndpointID, eventID)
 	mustStatus(t, code, raw, http.StatusOK)
 	after := decode[dedupeJSONBody](t, raw)
 	if after.Deliveries != 2 || after.FirstDeliveryID != deliveryID {
@@ -1152,18 +1227,21 @@ func TestDedupeAnswerWasThisADuplicate(t *testing.T) {
 
 	// An event this endpoint never received is not a duplicate - and is not an
 	// error, because "no" is a support answer.
-	code, raw = ask(tn.OwnerToken, tn.EndpointID, "evt_never_delivered")
+	code, raw = ask(tn.OwnerToken, fx.EndpointID, "evt_never_delivered")
 	mustStatus(t, code, raw, http.StatusOK)
 	if never := decode[dedupeJSONBody](t, raw); never.Duplicate || never.Deliveries != 0 {
 		t.Fatalf("an undelivered event answered %+v, want duplicate false", never)
 	}
 
-	// Another tenant's endpoint does not exist in this scope (FR-108).
-	code, raw = ask(tn.OwnerToken, other.EndpointID, eventID)
+	// An endpoint outside this tenant's scope does not exist here (FR-108); the
+	// fully cross-tenant case - tenant A's owner asking about tenant B's endpoint,
+	// which the suite's shared DB makes reachable - is covered by the
+	// cross-producer table (TestCrossProducerRequestsAreNotFound).
+	code, raw = ask(tn.OwnerToken, "ep_another_tenants_endpoint", eventID)
 	mustStatus(t, code, raw, http.StatusNotFound)
 
 	// The key is a pair: without it the question is not answerable.
-	code, raw = e.do(http.MethodGet, "/v1/producer/deliveries/dedupe?env=live&endpoint_id="+tn.EndpointID, tn.OwnerToken, nil)
+	code, raw = e.do(http.MethodGet, "/v1/producer/deliveries/dedupe?env=live&endpoint_id="+fx.EndpointID, tn.OwnerToken, nil)
 	mustStatus(t, code, raw, http.StatusBadRequest)
 	if got := errorCode(t, raw); got != "dedupe_key_required" {
 		t.Fatalf("error code = %q, want dedupe_key_required", got)
