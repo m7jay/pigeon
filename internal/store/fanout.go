@@ -210,7 +210,7 @@ func insertDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, consume
 			(event_id, endpoint_id, producer_id, env, consumer_id, status, lease_expires_at)
 		select $1, ep, $2, $3, $4, 'pending', now()
 		from unnest($5::text[]) as ep
-		on conflict (event_id, endpoint_id) do nothing`,
+		on conflict (event_id, endpoint_id) where replay_of_delivery_id is null do nothing`,
 		eventID, sc.ProducerID, sc.Env, consumerID, endpoints)
 	if err != nil {
 		return 0, fmt.Errorf("insert deliveries: %w", err)
@@ -241,7 +241,7 @@ func insertSkippedDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, 
 			(event_id, endpoint_id, producer_id, env, consumer_id, status, non_delivery_reason, lease_expires_at)
 		select $1, x.endpoint_id, $2, $3, $4, 'skipped', x.reason, null
 		from unnest($5::text[], $6::text[]) as x(endpoint_id, reason)
-		on conflict (event_id, endpoint_id) do nothing`,
+		on conflict (event_id, endpoint_id) where replay_of_delivery_id is null do nothing`,
 		eventID, sc.ProducerID, sc.Env, consumerID, endpoints, reasons)
 	if err != nil {
 		return 0, fmt.Errorf("insert skipped deliveries: %w", err)
