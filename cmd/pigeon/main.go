@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/m7jay/pigeon/internal/attemptbuf"
 	"github.com/m7jay/pigeon/internal/broker"
 	"github.com/m7jay/pigeon/internal/config"
 	"github.com/m7jay/pigeon/internal/db"
@@ -81,7 +82,7 @@ func run() error {
 	if err := cfg.ValidateBudget(serverMaxConns); err != nil {
 		return err
 	}
-	st := store.New(pool)
+	st := store.New(pool, store.WithAttemptBodyCap(cfg.DeliveryMaxBodyBytes))
 
 	if cfg.MigrationsOn {
 		// Migrations run as the role that owns the schema, because CREATE TABLE
@@ -110,9 +111,10 @@ func run() error {
 		log.Warn("instance admin created from PIGEON_INSTANCE_ADMIN_PASSWORD; rotate it after first login (FR-101)")
 	}
 
-	// nonDeliveryMetrics is FR-508's counter set, shared by the relay (which
-	// advances it as events fan out) and the /metrics scrape that reads it.
-	nonDeliveryMetrics := metrics.New()
+	// coreMetrics is the process's counter set: FR-508's non-delivery counters
+	// (advanced by the relay as events fan out) plus the S6 delivery, attempt and
+	// log-gate counters, all exposed at GET /metrics.
+	coreMetrics := metrics.New()
 	api := httpapi.New(httpapi.Deps{
 		Lookup: func(ctx context.Context, plaintext string) (store.Principal, error) {
 			return store.LookupAPIKey(ctx, pool, plaintext)
@@ -122,7 +124,7 @@ func run() error {
 		},
 		Data: st,
 		// FR-508: the fan-out non-delivery counters, exposed at GET /metrics.
-		Metrics: nonDeliveryMetrics,
+		Metrics: coreMetrics,
 		// FR-206: last_used_at is an evidence write and runs off the request path,
 		// inside the middleware that authenticated the key.
 		TouchKey:         st.TouchKey,
@@ -152,7 +154,7 @@ func run() error {
 			return fmt.Errorf("connect broker: %w", err)
 		}
 		defer br.Close()
-		w := relay.New(st, br, relay.Options{Logger: log, Metrics: nonDeliveryMetrics})
+		w := relay.New(st, br, relay.Options{Logger: log, Metrics: coreMetrics})
 		w.SetNotifier(relay.Notifier(ctx, cfg.DatabaseURL))
 		go func() {
 			log.Info("relay started", "broker", "redis-streams")
@@ -163,6 +165,66 @@ func run() error {
 	}
 
 	errCh := make(chan error, 1)
+
+	// S6: the attempt-evidence buffer and its flusher (D-1, D-2, D-3, FR-812/815).
+	//
+	// D-1 puts the buffer in Redis, never in the worker's own memory, and this is
+	// the only place it is created. In `buffered` mode the worker appends each
+	// failed attempt to the stream and this process's single flusher drains it
+	// into Postgres in batches of at least FR-815's 2,000 rows, under
+	// synchronous_commit=off (db.EvidenceTx, FR-812). In `sync` mode there is no
+	// buffer at all and the worker writes evidence inline.
+	//
+	// The flusher gets its OWN context, cancelled only after the workers have
+	// stopped pushing, so D-3's "flush before exit" is not raced by an in-flight
+	// attempt landing in the stream after the final drain has already run.
+	flusherWG := &sync.WaitGroup{}
+	var stopFlusher context.CancelFunc
+	// attemptBuffer is the process's buffer, shared by the workers that push and
+	// the single flusher that drains (D-1). It is nil in sync mode.
+	var attemptBuffer *attemptbuf.Buffer
+	if cfg.AttemptLogMode == config.AttemptLogBuffered {
+		buf, err := attemptbuf.Dial(ctx, cfg.RedisURL, attemptbuf.Options{Logger: log, Metrics: coreMetrics})
+		if err != nil {
+			return fmt.Errorf("connect attempt buffer: %w", err)
+		}
+		defer buf.Close()
+		attemptBuffer = buf
+
+		fl, err := attemptbuf.NewFlusher(buf, st, attemptbuf.FlusherOptions{
+			Batch:      cfg.AttemptFlushBatch,
+			Interval:   cfg.AttemptFlushInterval,
+			StaleAfter: cfg.AttemptFlushStale,
+			DrainGrace: cfg.ShutdownGrace,
+			Logger:     log,
+			Metrics:    coreMetrics,
+		})
+		if err != nil {
+			return fmt.Errorf("attempt flusher: %w", err)
+		}
+		flusherCtx, cancelFlusher := context.WithCancel(context.WithoutCancel(ctx))
+		stopFlusher = cancelFlusher
+		flusherWG.Add(1)
+		go func() {
+			defer flusherWG.Done()
+			log.Info("attempt flusher started",
+				"stream", buf.Key(), "batch", cfg.AttemptFlushBatch,
+				"interval_ms", cfg.AttemptFlushInterval.Milliseconds())
+			if err := fl.Run(flusherCtx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("attempt flusher stopped unexpectedly", "error", err)
+			}
+		}()
+	}
+	// Whatever happens, do not leak the flusher goroutine on an early return.
+	defer func() {
+		if stopFlusher != nil {
+			stopFlusher()
+		}
+	}()
+
+	// The worker is handed the buffer only in buffered mode. Handing it over in
+	// sync mode would leave the attempt number and the evidence stream disagreeing
+	// about which mode is in force (D-2).
 
 	// S4: the delivery worker and its sweeper. The worker drains the deliveries
 	// table directly, the way the relay drains the outbox: it leases a due
@@ -187,6 +249,13 @@ func run() error {
 			PollInterval:    cfg.DeliveryPollInterval,
 			UserAgent:       "pigeon/" + version,
 			Logger:          log,
+			// S6: evidence goes to the Redis buffer in buffered mode (D-1) or is
+			// written inline in sync mode (D-2). The counters and the log gate
+			// carry the volume LOG-2 forbids in the log stream.
+			AttemptLog:    cfg.AttemptLogMode,
+			AttemptBuffer: attemptBuffer,
+			Metrics:       coreMetrics,
+			SuccessLogRPS: cfg.SuccessLogRPS,
 		})
 		workersWG.Add(1)
 		go func() {
@@ -246,6 +315,22 @@ func run() error {
 		case <-done:
 		case <-shutdownCtx.Done():
 			log.Warn("shutdown grace elapsed before workers drained")
+		}
+	}
+
+	// D-3: the flusher drains the buffer before exit, and it runs LAST — after
+	// the workers have stopped and unwound their in-flight attempts. Cancelling
+	// it first would let it find an empty stream and exit while a worker was
+	// still about to push, leaving that row in Redis until the next boot. Its
+	// Run() flushes what remains on its own bounded drain context.
+	if stopFlusher != nil {
+		stopFlusher()
+		done := make(chan struct{})
+		go func() { flusherWG.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-shutdownCtx.Done():
+			log.Warn("shutdown grace elapsed before the attempt buffer drained")
 		}
 	}
 
