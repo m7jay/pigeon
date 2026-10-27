@@ -23,7 +23,9 @@ import (
 	"github.com/m7jay/pigeon/internal/store"
 )
 
-// Options configures a Worker. Zero values take their documented defaults.
+// Options configures a Worker. Zero values take their documented defaults, with
+// one exception: MaxBodyBytes's 0 is a meaningful setting ("capture nothing",
+// SB-4), so a negative value is how a caller asks for its default.
 type Options struct {
 	// Workers is the size of the fixed claim/attempt pool (FR-816): a bounded
 	// pool, never a goroutine per event. Defaults to 1.
@@ -36,7 +38,9 @@ type Options struct {
 	// this default is already 5 s. Defaults to 5 s.
 	Timeout time.Duration
 	// MaxBodyBytes caps the response body captured per attempt (FR-804, SB-4).
-	// Defaults to 2048; 0 disables capture.
+	// Defaults to 2048; 0 disables capture entirely, because SB-4 requires the cap
+	// to be configurable down to zero. A negative value selects the 2048 default,
+	// so 0 here is always the caller's explicit "capture nothing".
 	MaxBodyBytes int
 	// BackoffBase is the first retry's delay; the schedule doubles each attempt,
 	// capped at BackoffMax (AC-04's 30 s, 1 m at the default base). Defaults to 30 s.
@@ -80,7 +84,7 @@ func New(st *store.Store, opts Options) *Worker {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 5 * time.Second
 	}
-	if opts.MaxBodyBytes == 0 {
+	if opts.MaxBodyBytes < 0 {
 		opts.MaxBodyBytes = 2048
 	}
 	if opts.BackoffBase <= 0 {
@@ -185,7 +189,15 @@ func (w *Worker) handle(ctx context.Context, d store.LeasedDelivery) {
 	attemptStart := time.Now()
 	first := firstAttemptOf(d, attemptStart)
 
-	req := buildSignedRequest(d, attemptNum, w.opts.UserAgent)
+	req, signErr := buildSignedRequest(d, attemptNum, w.opts.UserAgent, attemptStart)
+	if signErr != nil {
+		// Not fatal here: the request is signed with the stored value as it stands
+		// and takes the normal path. The log names the real cause, because no
+		// conforming consumer can verify a signature made with an undecodable
+		// secret (FR-1001) — the peer's rejection is what ends the delivery.
+		w.log.Error("delivery: signing secret is not a decodable whsec_ value (FR-1001)",
+			"delivery_id", d.DeliveryID, "error", signErr)
+	}
 	// Per-attempt timeout (FR-819), derived from ctx so it is also cancelled on
 	// shutdown, bounding the attempt in both time and goroutine lifetime.
 	attemptCtx, cancel := context.WithTimeout(ctx, w.opts.Timeout)

@@ -13,18 +13,62 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
+
+// secretPrefix is the Standard Webhooks secret namespace (FR-1001): secrets are
+// issued as "whsec_" + base64, and the base64 half — not the whole string — is
+// the HMAC key.
+const secretPrefix = "whsec_"
 
 // hmac256 is the Standard Webhooks primitive: base64(HMAC-SHA256) over the signed
 // content. Kept local so the verifier (in the consumer portal, S2b) and this
 // signer use the identical construction. The Standard Webhooks spec renders the
 // digest as base64, not hex — hex would not verify against a real consumer.
-func hmac256(secret, content []byte) string {
-	mac := hmac.New(sha256.New, secret)
+func hmac256(key, content []byte) string {
+	mac := hmac.New(sha256.New, key)
 	mac.Write(content)
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// SecretBytes decodes a stored signing secret into the key the spec actually
+// signs with (FR-1001): the "<base64>" half of a "whsec_<base64>" value, in the
+// STANDARD alphabet. A verifier must derive the key exactly this way — using the
+// wrapper as the key, or a URL-safe decoding of it, computes a different HMAC.
+// Missing padding is tolerated, because a secret that has been through a shell, an
+// env file or a URL often loses it; the URL alphabet is not, because a standard
+// decoder does not fail on "-"/"_", it silently drops those bytes and derives a
+// short key. The errors never carry the secret (FR-1008).
+func SecretBytes(secret string) ([]byte, error) {
+	enc := strings.TrimPrefix(strings.TrimSpace(secret), secretPrefix)
+	if enc == "" {
+		return nil, errors.New("envelope: empty signing secret")
+	}
+	if pad := len(enc) % 4; pad != 0 {
+		enc += strings.Repeat("=", 4-pad)
+	}
+	raw, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil {
+		return nil, errors.New("envelope: signing secret is not standard base64")
+	}
+	if len(raw) == 0 {
+		return nil, errors.New("envelope: signing secret decodes to zero bytes")
+	}
+	return raw, nil
+}
+
+// WebhookTimestamp renders a time as the `webhook-timestamp` header value
+// (FR-1001): integer Unix seconds, the form FR-1003 has a consumer compare
+// against its own clock. The header carries the ATTEMPT time, not the event time:
+// §9's schedule (30 s, 60 s, 120 s, 240 s, …) crosses FR-1003's 300 s tolerance at
+// attempt 4, so a retry stamped with the event time would be rejected by every
+// conforming consumer.
+func WebhookTimestamp(t time.Time) string {
+	return strconv.FormatInt(t.Unix(), 10)
 }
 
 // Envelope is §10 exactly. Fields map one-to-one to the documented shape; the
@@ -47,26 +91,23 @@ type Envelope struct {
 	Class       string          `json:"-"`
 }
 
-// CreatedAtMillis is the §10 stability note: ISO-8601 UTC to the millisecond, so
-// a timestamp is stable across time zones and never carries sub-ms noise.
-func (e Envelope) CreatedAtMillis() string {
-	return e.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z07:00")
-}
-
 // SignedContent is the exact string the signature covers (FR-1001, §10):
-// "<webhook-id>.<webhook-timestamp>.<raw body>". The webhook-id is the event id
-// and the timestamp is the envelope's, so a captured request cannot be replayed
-// against a different resource or after the tolerance window (FR-1002).
-func (e Envelope) SignedContent(rawBody string) string {
-	return e.ID + "." + e.CreatedAtMillis() + "." + rawBody
+// "<webhook-id>.<webhook-timestamp>.<raw body>". timestamp is the value that goes
+// in the `webhook-timestamp` header verbatim (integer Unix seconds of the attempt,
+// WebhookTimestamp); the signer and the verifier must cover the identical string,
+// so it is passed in rather than re-derived from the envelope here. The webhook-id
+// is the event id, so a captured request cannot be replayed against a different
+// resource (FR-1002).
+func (e Envelope) SignedContent(timestamp, rawBody string) string {
+	return e.ID + "." + timestamp + "." + rawBody
 }
 
-// Signature is base64(HMAC-SHA256(secret, signed content)), rendered as the
-// Standard Webhooks value "v1,<b64>". secret is the raw whsec_ bytes. It is a
-// method so the signer and the verifier agree on the exact input.
-func (e Envelope) Signature(secret []byte, rawBody string) string {
-	mac := hmac256(secret, []byte(e.SignedContent(rawBody)))
-	return "v1," + mac
+// Signature is base64(HMAC-SHA256(key, signed content)), rendered as the Standard
+// Webhooks header value "v1,<b64>". key is the DECODED secret (SecretBytes), not
+// the "whsec_..." wrapper string (FR-1001). It is a method so the signer and the
+// verifier agree on the exact signed content.
+func (e Envelope) Signature(key []byte, timestamp, rawBody string) string {
+	return "v1," + hmac256(key, []byte(e.SignedContent(timestamp, rawBody)))
 }
 
 // Stream is the events stream this envelope publishes to. Priority and normal
