@@ -198,18 +198,13 @@ func TestConsumerPortalForeignResourcesAreNotFound(t *testing.T) {
 		{http.MethodPost, "/v1/consumer/endpoints/" + a.EndpointID + "/rotate", nil},
 		{http.MethodPost, "/v1/consumer/endpoints/" + a.EndpointID + "/subscriptions", map[string]string{"event_type": name}},
 		{http.MethodDelete, "/v1/consumer/endpoints/" + a.EndpointID + "/subscriptions/" + name, nil},
+		// The list is a 404 too: AC-39 wants 404 for every resource outside the
+		// caller's consumer_id, and a filtered 200 here would disagree with the
+		// sibling single-endpoint reads right above it.
+		{http.MethodGet, "/v1/consumer/endpoints/" + a.EndpointID + "/subscriptions", nil},
 	} {
 		code, raw := e.do(tc.method, tc.path, tok, tc.body)
 		mustStatus(t, code, raw, http.StatusNotFound)
-	}
-	// Listing subscriptions of a foreign endpoint yields an empty set, never a
-	// 404-with-data and never another consumer's pairs.
-	code, raw := e.do(http.MethodGet, "/v1/consumer/endpoints/"+a.EndpointID+"/subscriptions", tok, nil)
-	mustStatus(t, code, raw, http.StatusOK)
-	if subs := decode[struct {
-		Subscriptions []subscriptionJSON `json:"subscriptions"`
-	}](t, raw); len(subs.Subscriptions) != 0 {
-		t.Fatalf("a consumer saw %d subscriptions on a foreign endpoint, want 0", len(subs.Subscriptions))
 	}
 
 	// The list is exactly B's own set: A's endpoint and consumer are absent.
