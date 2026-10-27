@@ -44,8 +44,12 @@ type EventType struct {
 	PayloadSchema  json.RawMessage
 	PayloadVersion int
 	Enabled        bool
-	Examples       []json.RawMessage
-	CreatedAt      time.Time
+	// PubliclySubscribable is UI-14's gate: whether a consumer user may subscribe
+	// to this type from the consumer portal. Defaults true at creation (the
+	// migration argues why) and is opted out by the producer with a PATCH.
+	PubliclySubscribable bool
+	Examples             []json.RawMessage
+	CreatedAt            time.Time
 }
 
 // NewEventType is a create request. Zero values take their documented defaults:
@@ -145,11 +149,11 @@ func (s *Store) CreateEventType(ctx context.Context, sc Scope, in NewEventType) 
 				(id, producer_id, env, name, routing_mode, event_class, payload_schema, payload_version, examples)
 			values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			returning name, producer_id, env, routing_mode, event_class, payload_schema,
-				payload_version, enabled, examples, created_at`,
+				payload_version, enabled, examples, created_at, publicly_subscribable`,
 			id.New("et"), sc.ProducerID, sc.Env, in.Name, routing, class,
 			in.PayloadSchema, version, examples,
 		).Scan(&et.Name, &et.ProducerID, &et.Env, &et.RoutingMode, &et.EventClass,
-			&et.PayloadSchema, &et.PayloadVersion, &et.Enabled, &et.Examples, &et.CreatedAt)
+			&et.PayloadSchema, &et.PayloadVersion, &et.Enabled, &et.Examples, &et.CreatedAt, &et.PubliclySubscribable)
 		return mapPgError(err, ErrConflict, ErrNotFound)
 	})
 	if err != nil {
@@ -166,12 +170,12 @@ func (s *Store) GetEventType(ctx context.Context, sc Scope, name string) (EventT
 	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `
 			select name, producer_id, env, routing_mode, event_class, payload_schema,
-				payload_version, enabled, examples, created_at
+				payload_version, enabled, examples, created_at, publicly_subscribable
 			from event_types
 			where producer_id = $1 and env = $2 and name = $3`,
 			sc.ProducerID, sc.Env, name,
 		).Scan(&et.Name, &et.ProducerID, &et.Env, &et.RoutingMode, &et.EventClass,
-			&et.PayloadSchema, &et.PayloadVersion, &et.Enabled, &et.Examples, &et.CreatedAt)
+			&et.PayloadSchema, &et.PayloadVersion, &et.Enabled, &et.Examples, &et.CreatedAt, &et.PubliclySubscribable)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -189,7 +193,7 @@ func (s *Store) ListEventTypes(ctx context.Context, sc Scope) ([]EventType, erro
 	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			select name, producer_id, env, routing_mode, event_class, payload_schema,
-				payload_version, enabled, examples, created_at
+				payload_version, enabled, examples, created_at, publicly_subscribable
 			from event_types
 			where producer_id = $1 and env = $2
 			order by created_at desc, name`, sc.ProducerID, sc.Env)
@@ -200,7 +204,7 @@ func (s *Store) ListEventTypes(ctx context.Context, sc Scope) ([]EventType, erro
 		for rows.Next() {
 			var et EventType
 			if err := rows.Scan(&et.Name, &et.ProducerID, &et.Env, &et.RoutingMode, &et.EventClass,
-				&et.PayloadSchema, &et.PayloadVersion, &et.Enabled, &et.Examples, &et.CreatedAt); err != nil {
+				&et.PayloadSchema, &et.PayloadVersion, &et.Enabled, &et.Examples, &et.CreatedAt, &et.PubliclySubscribable); err != nil {
 				return err
 			}
 			out = append(out, et)
@@ -219,10 +223,15 @@ func (s *Store) ListEventTypes(ctx context.Context, sc Scope) ([]EventType, erro
 // against it stay, only the enabled flag flips. A disabled type is refused at
 // publish (the ingest query checks it, and TestPublishDisabledTypeIsInvalid
 // pins that), so toggling enabled is the whole disable/enable contract; FR-304
-// is the independent version bump on the same row.
+// is the independent version bump on the same row. UI-14's
+// publicly_subscribable is the third toggle: the producer's gate on consumer
+// self-service subscription.
 type EventTypePatch struct {
 	Enabled        *bool
 	PayloadVersion *int
+	// PubliclySubscribable is UI-14's gate: the producer allows or refuses public
+	// subscription to this type. A nil field is unchanged.
+	PubliclySubscribable *bool
 }
 
 // PatchEventType applies an EventTypePatch to one type in the caller's scope and
@@ -231,12 +240,12 @@ type EventTypePatch struct {
 // env, routing_mode or event_class - those are immutable at creation.
 func (s *Store) PatchEventType(ctx context.Context, sc Scope, name string, p EventTypePatch) (EventType, error) {
 	const selectCols = `name, producer_id, env, routing_mode, event_class, payload_schema,
-		payload_version, enabled, examples, created_at`
+		payload_version, enabled, examples, created_at, publicly_subscribable`
 	var et EventType
 	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
 		scan := func(row pgx.Row) error {
 			return row.Scan(&et.Name, &et.ProducerID, &et.Env, &et.RoutingMode, &et.EventClass,
-				&et.PayloadSchema, &et.PayloadVersion, &et.Enabled, &et.Examples, &et.CreatedAt)
+				&et.PayloadSchema, &et.PayloadVersion, &et.Enabled, &et.Examples, &et.CreatedAt, &et.PubliclySubscribable)
 		}
 		if err := scan(tx.QueryRow(ctx,
 			`select `+selectCols+` from event_types where producer_id = $1 and env = $2 and name = $3`,
@@ -256,6 +265,13 @@ func (s *Store) PatchEventType(ctx context.Context, sc Scope, name string, p Eve
 		if p.PayloadVersion != nil {
 			sets = append(sets, fmt.Sprintf("payload_version = $%d", len(sets)+1))
 			args = append(args, *p.PayloadVersion)
+		}
+		if p.PubliclySubscribable != nil {
+			// UI-14: the producer allows or refuses public subscription (the
+			// consumer portal's gate). It is a PATCH, not a create-time field, so a
+			// producer can close a type that consumers already see.
+			sets = append(sets, fmt.Sprintf("publicly_subscribable = $%d", len(sets)+1))
+			args = append(args, *p.PubliclySubscribable)
 		}
 		if len(sets) > 0 {
 			args = append(args, sc.ProducerID, sc.Env, name)
