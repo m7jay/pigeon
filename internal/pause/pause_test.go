@@ -111,6 +111,14 @@ func TestBreadthCountsSubscriptionsNotAttempts(t *testing.T) {
 				i+1, v.FailingSubscriptions, wantFailing)
 		}
 	}
+	// FR-1203's count includes a PAUSED subscription: a pause writes the durable
+	// flag and never touches these windows, and a membership only goes on resume,
+	// so the subscription that just tripped its own depth of ten still counts
+	// toward the endpoint's breadth.
+	if v, _ := tr.FailingSubscriptions(ctx, "ep_1", at); v != 1 {
+		t.Errorf("after ten failures on one subscription: %d failing, want 1 - the count includes paused subscriptions (FR-1203)",
+			v)
+	}
 	// Two more subscriptions reach the 3-attempt floor: three fail in total.
 	for _, et := range []string{"c.d", "e.f"} {
 		for i := 0; i < 3; i++ {
