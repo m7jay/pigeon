@@ -932,12 +932,14 @@ behaviour: `Flusher.insert` acknowledged on the pass's own context - the one `Ru
   on honours the request context it is handed: the command whose reply is lost mid-flight fails
   instead of holding a worker for the client's 3 s. `internal/delivery` already answers for that
   error class, by branch. A `Push` that fails on a live context falls back to writing the row inline
-  (`delivery.go:423-430`), where the unique `(delivery_id, attempt)` key makes the duplicate a
-  no-op. A `Push` that fails on a revoked context returns before the fallback on purpose
-  (`delivery.go:415-421` - the attempt was aborted, so there is nothing to record), and an `XADD`
-  applied before the revoke is an unread entry the next read flushes. So the delta the flag buys is
-  the mid-flight reply, not the cancelled-before-send case: a context already cancelled at call time
-  fails `Push` today as well, flag off and on (`buffer attempt 1/1: context canceled`, `XLEN 0`).
+  (`internal/delivery`'s `recordAttempt`, the `default` arm that does not return -
+  `delivery.go:423-430` at `15faf6c`), where the unique `(delivery_id, attempt)` key makes the
+  duplicate a no-op. A `Push` that fails on a revoked context returns before the fallback on purpose
+  (`delivery.go:415-421` at `15faf6c` - the attempt was aborted, so there is nothing to record), and
+  an `XADD` applied before the revoke is an unread entry the next read flushes. So the delta the flag
+  buys is the mid-flight reply, not the cancelled-before-send case: a context already cancelled at
+  call time fails `Push` today as well, flag off and on (`buffer attempt 1/1: context canceled`,
+  `XLEN 0`).
 - `Buffer.SweepStranded` runs once at `Run`'s startup, after the startup `reclaim(0)`. It compares
   `XLEN` with the group's pending count (`XINFO GROUPS`) and, only when the former is larger, issues
   `XTRIM <key> MINID <bound>`, where the bound is the smallest pending id (`XPENDING`'s summary
