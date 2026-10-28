@@ -875,14 +875,118 @@ only.
 per-process scope), AC-33 (rewritten to point at that bound); `internal/delivery/successlog.go`,
 `PIGEON_SUCCESS_LOG_RPS` in `internal/config`; S10's AC-33 load test.
 
-## Gap list — eight decided, one open
+### A-9 — The attempt buffer's acknowledgement is one transaction, and it outlives the pass that made it
+
+**Decision.** `Buffer.Ack` is one atomic operation - the `XACK` and the entry's removal in a single
+`MULTI`/`EXEC` - and `Flusher.insert` runs it on a deadline of its own that the flush pass's
+cancellation cannot revoke. A start additionally sweeps entries a peer acknowledged but never
+removed. The batch still leaves the retry slot before the retirement is attempted, `StaleAfter`'s
+reclaim stays the only recovery path for a batch whose insert failed, and OBS-9's depth gauge stays
+`XLEN`.
+
+**The two windows.** Both were found while root-causing `TestRunRetriesAStuckBatch` (`t_8ba5309b`,
+fixed as a test defect in `t_07bc844a`), and both are production behaviour rather than test
+behaviour: `Flusher.insert` acknowledged on the pass's own context - the one `Run` was given, which
+`cmd/pigeon`'s shutdown cancels through `stopFlusher()` - after clearing the retry slot, and
+`Buffer.Ack` issued `XACK` then `XDEL` as two commands on that context.
+
+- **Half an acknowledgement, one way.** A cancellation landing before the `XACK` leaves the entries
+  pending, and nothing in `Run` hands the batch back: `readBatch` finds the retry slot empty,
+  `Reclaim` is filtered by `StaleAfter` (30 s by default), and `Read(">")` returns only new entries.
+  Measured in an in-package copy at `f3af323`, with a sink that fails the first insert and cancels
+  before returning from the retry's `RecordAttempts`: after `Run` returns, `depth = 1`,
+  `pending = 1`, `sink calls = 2`, `rows = 1`; the next start's `reclaim(0)` then recovers it
+  (`reclaimed 1` row, the same delivery re-inserted, `depth = 0`). Nothing is lost - the row was
+  committed before the ack - so this is a delay, not a defect in the insert path. It is not free
+  either: the re-insert meets `pigeon_record_attempts`'s `on conflict (delivery_id, attempt) do
+  nothing`, returns 0 inserted rows, and lands as an `AttemptsConflicted` bump and a warn line at the
+  *next boot*.
+- **Half an acknowledgement, the other way.** A cancellation, or a dropped connection, between the
+  two commands leaves the entry out of the pending list and in the stream, where nothing can reach
+  it: measured `Reclaim(min-idle 0) = 0`, `Read(">") = 0`, `Depth() = 2` for two acked-but-untrimmed
+  entries, and the package has no `XTRIM` at all. That one is permanent. `XLEN` counts those entries
+  for the life of the stream, so `AttemptBufferPending` - the gauge OBS-9's `queue_depth` is read
+  from - over-counts the backlog forever, and NFR-6 ("queue depth MUST return to baseline within 10
+  minutes") cannot hold again without an operator running `XTRIM` by hand.
+
+**Mechanism.**
+
+- `Buffer.Ack` issues `XAck` and `XDel` inside one `TxPipelined` (go-redis's `MULTI`/`EXEC`), in that
+  order. The ordering rule is untouched - the row is committed before either command is sent - and
+  the transaction makes the two halves indivisible in both directions: a context cancelled before
+  the flush applies neither (measured: the entry stays pending *and* in the stream), and a rejected
+  transaction leaves nothing behind. One round trip, one `EXEC`.
+- `Flusher.insert` retires on `context.WithTimeout(context.WithoutCancel(ctx), AckTimeout)`, 2 s by
+  default. By the time `Ack` runs the transaction has committed, so the pass's cancellation can only
+  revoke the retirement; `Run`'s own D-3 drain already uses `context.WithoutCancel` on the same
+  reasoning (`flusher.go:142`), and the retirement was the last write on that path a SIGTERM could
+  still cancel. `AckTimeout` is a `FlusherOptions` field and deliberately not a `PIGEON_` knob, the
+  same status as `FailBackoff`: a Redis that has stopped answering must not hold a pass open, and the
+  value is not an operator's to tune. The gauge read that follows the retirement uses the same
+  bounded context, so a shutdown still records the depth it retired.
+- `clientFromURL` enables `ContextTimeoutEnabled` on the buffer's client, because without it
+  `AckTimeout` is not the bound it reads as. Measured against a listener that accepts and never
+  answers: `XACK` with a 200 ms deadline returns in **3 s** with the options the package builds today
+  (the client's `ReadTimeout`; context deadlines are off by default) and in **200 ms** with
+  `ContextTimeoutEnabled`. The same flag is what makes the delivery path's `Push` honour the request
+  context it is handed: a write applied but not confirmed returns an error, which `internal/delivery`
+  already handles by writing the row inline, and the unique `(delivery_id, attempt)` key makes the
+  duplicate a no-op.
+- `Buffer.SweepStranded` runs once at `Run`'s startup, after the startup `reclaim(0)`. It compares
+  `XLEN` with the group's pending count (`XINFO GROUPS`) and, only when the former is larger, issues
+  `XTRIM <key> MINID <bound>`, where the bound is the smallest pending id (`XPENDING`'s summary
+  `Lower`) if anything is pending, else the group's `LastDeliveredID` incremented by one. The bound
+  is the entire safety argument, because `XTRIM` does not consult the pending list - a pending entry
+  is trimmed like any other if the bound sits above it (measured). Every entry below the bound has
+  been delivered (`last-delivered-id` only moves forward, and only a read or a claim moves it) and is
+  not pending, so it has already been acknowledged; entries at or above it are pending or not yet
+  read, and are kept. A strand is an anomaly - it means a retirement was torn - so what the sweep
+  removes is logged at warn, with the count.
+- The three failure shapes are each closed: a graceful SIGTERM can no longer revoke a retirement (the
+  bounded context); a hard kill or a dropped connection mid-retirement cannot leave half of one (the
+  transaction); and a Redis-side tear that splits the transaction anyway - a SIGKILL between the two
+  commands inside `EXEC`, or a crash whose AOF replay stops after the `XACK` - is repaired at the
+  next start (the sweep), which is also when the gauge it skewed is corrected. `cmd/pigeon`'s
+  shutdown grace can still cut the drain short, which is the same class and the same answer.
+
+**Trade-off.** The atomic retire was chosen over a compensation path - a Redis-side list of ids
+awaiting removal, or a scan that deletes entries that are neither pending nor newer than the group's
+last delivery. Both add a second piece of state, or a destructive command whose inputs are inferred;
+a transaction is what `MULTI`/`EXEC` exists for, and it closes both halves of the window with one
+round trip rather than two. It does not close a tear inside the transaction itself, which is why the
+sweep exists rather than being folded into the retire: the sweep derives its bound from the group's
+own bookkeeping, so it needs no record of what a dead process was doing. Leaving the retirement on
+the pass's context was the other candidate, with `StaleAfter`'s reclaim as the repair at the next
+start: measured to work, and still costs up to 30 s in which the depth gauge is wrong, plus a
+duplicate insert, a conflict bump and a warn line at the next boot for a batch whose rows are already
+durable.
+A two-round-trip cleanup of a committed row is cheaper than explaining that gauge. Two alternatives
+are rejected outright. Retaining the batch in `f.stuck` after a failed acknowledgement would let one
+unackable batch stall the whole evidence path: `readBatch` returns the retry slot first, so nothing
+new is read while Redis is unhappy, every retry re-inserts a committed batch and bumps the conflict
+counter, and the stream grows behind it. `XTRIM`/`MAXLEN` on `Push` as a bound on the stream is
+worse: trimming does not consult the pending list, so it drops entries nobody has read - the evidence
+loss that `XADD` → read → commit exists to prevent. What the sweep accepts is the one shape left: a
+strand created after startup waits for the next start, where the operator sees it as a warn line
+rather than never.
+
+**Encoded by.** D-9 (added), §6's attempt-evidence row (the acknowledgement after the commit is one
+transaction and is not revocable by the cancellation that ends a pass), §19's decision row;
+`internal/attemptbuf`'s `Buffer.Ack`, `Buffer.SweepStranded`, `Flusher.insert`/`Run`,
+`FlusherOptions.AckTimeout`, `clientFromURL`.
+
+## Gap list — nine decided, one open
 
 Six gaps, each now a decision with a mechanism and a named trade-off. Row 4b is a
 seventh contradiction found while resolving the fourth, recorded here instead of being
 left for S3 to guess at. The seventh numbered item below was found after the
 amendment and is not one of them; it stays open. Rows 8 and 9 came after S6 landed:
 both are places where the shipped mechanism, not a silence, changed the answer, which
-is the case PLAN.md's rule 5 sends to this list rather than into a code comment.
+is the case PLAN.md's rule 5 sends to this list rather than into a code comment. Row 10
+is a decision taken *before* its mechanism: §6's attempt-evidence row promised an
+acknowledgement after the commit and said nothing about a cancellation revoking it, and
+the two windows in `Flusher.insert` (A-9) show what that silence cost - a retirement
+delayed by `StaleAfter`, and an entry the stream can never retire.
 
 | # | Gap | Decision | Contract changed | Unblocks |
 |---|---|---|---|---|
@@ -895,6 +999,7 @@ is the case PLAN.md's rule 5 sends to this list rather than into a code comment.
 | 6 | `pigeon doctor` unspecified | A-6 | OPS-4 and OPS-10 amended; OPS-11 added; AC-48 | S10 |
 | 8 | D-2 named the Redis Streams pending-entry count as the attempt counter | A-7 | D-2 rewritten to name `deliveries.attempts`; §6's attempt-evidence row names the Redis Stream and its consumer group | S6 (landed), S7's inspect API |
 | 9 | LOG-2's "above 100/s" fixed neither a burst allowance nor a replica count | A-8 | LOG-2, §13.1 and AC-33 state `PIGEON_SUCCESS_LOG_RPS` sustained per process and at most 2 × that in any one-second window | S6 (landed), S10's AC-33 load test |
+| 10 | The acknowledgement could be revoked midway (a batch the flusher cannot hand back), and nothing retired an entry that lost its removal | A-9 | D-9 added; §6's attempt-evidence row states an acknowledgement after the commit that is one transaction and is not revocable by the cancellation ending a pass | S6's flusher (implementation routed separately) |
 
 **They do not contradict each other**, checked pairwise where they touch: A-1's pause
 flags and A-4's archive both ride the control/evidence split in §6 (D-8, FR-812); A-2's
@@ -909,7 +1014,11 @@ write-class split §6 and FR-812 define; A-8 quantifies the bound LOG-2 already 
 of adding a mechanism, and takes FR-207's per-process scope so a deployment's ceiling is
 `replicas × PIGEON_SUCCESS_LOG_RPS`, stated rather than left to be discovered by a load
 test. Neither reaches the other: A-7 touches the delivery row's counter, A-8 touches log
-emission, and no requirement names both.
+emission, and no requirement names both. A-9 is D-1's buffer again: it moves no counter and
+no write class, it makes one retirement indivisible and bounded, so A-7's counter, A-8's gate
+and A-2's numbers stay where they were; the one requirement it touches is NFR-6, and it
+touches it by making the gauge that requirement is read from honest rather than by moving its
+bound.
 
 One thing this list no longer leaves open: whether the endpoint pause threshold scales
 with subscription count. It does - `N = min(active, max(3, ceil(active/4)))` in FR-1203
