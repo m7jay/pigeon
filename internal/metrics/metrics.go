@@ -15,7 +15,18 @@ import "sync"
 type Metrics struct {
 	mu            sync.Mutex
 	nonDeliveries map[string]int64
-	counters      map[string]int64
+	// counters is the S6 delivery/attempt/log-gate set, name -> value, exposed
+	// verbatim at GET /metrics (LOG-2, AC-33).
+	counters map[string]int64
+	// Storage budget telemetry (SB-6): how many partitions retention has
+	// dropped, and how many publishes were shed because the volume was over
+	// budget. Both are operator-facing — /metrics is the scrape an alert rule
+	// reads, and AC-18 turns on both being non-zero. They are typed fields
+	// rather than map entries because their readers are typed (the sweeper and
+	// the ingest gate read them without a string key) and because the series
+	// must read zero before the first drop, not be absent.
+	partitionDrops int64
+	sheds          int64
 }
 
 // The counter names the delivery and flusher paths advance. They exist because
@@ -146,4 +157,42 @@ func (m *Metrics) NonDeliverySnapshot() map[string]int64 {
 		out[k] = v
 	}
 	return out
+}
+
+// RecordPartitionDrop counts partitions retention removed (SB-3). It is the
+// counter an operator alerts on: a non-zero rate means history is leaving
+// because of disk pressure rather than by age.
+func (m *Metrics) RecordPartitionDrop(n int) {
+	if n <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.partitionDrops += int64(n)
+}
+
+// PartitionDropCount is the read side of RecordPartitionDrop.
+func (m *Metrics) PartitionDropCount() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.partitionDrops
+}
+
+// RecordShed counts publishes refused with 429 because the volume was over the
+// disk budget (SB-7). It is what tells "we shed deliberately" apart from "we
+// were down".
+func (m *Metrics) RecordShed(n int) {
+	if n <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sheds += int64(n)
+}
+
+// ShedCount is the read side of RecordShed.
+func (m *Metrics) ShedCount() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sheds
 }
