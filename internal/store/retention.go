@@ -20,8 +20,10 @@ import (
 
 // retentionTables is the closed set the manager may touch. The SQL primitives
 // enforce the same set, so a bug here fails loudly rather than dropping an
-// unrelated relation.
-var retentionTables = map[string]bool{"deliveries": true, "attempts": true}
+// unrelated relation. `delivery_dedupe` is FR-905's archive: it is dropped by
+// partition like the rest (SB-2), and it is what an ordinary `deliveries` drop is
+// copied into before it is dropped.
+var retentionTables = map[string]bool{"deliveries": true, "attempts": true, "delivery_dedupe": true}
 
 func checkRetentionTable(table string) error {
 	if !retentionTables[table] {
@@ -152,17 +154,64 @@ func (s *Store) ListPartitions(ctx context.Context, table string) ([]retention.P
 // advisory lock (so no drop can run concurrently with itself, D-7), refuses a
 // day that has not ended, and returns false when a writer held the partition past
 // its lock_timeout so the sweeper can try again next tick.
-func (s *Store) DropPartition(ctx context.Context, table, name string) (bool, error) {
+//
+// reason is FR-905's: an ordinary (age) drop of a `deliveries` partition copies
+// the day's dedupe keys into the archive and drops it - both commit or neither
+// does - while an SB-3 pressure drop may skip the copy and warns with the day it
+// covered (FR-903).
+//
+// The transaction is explicit rather than left to the driver's implicit one: the
+// copy and the drop live in one statement, and committing only after the primitive
+// reports the drop is what keeps "neither" from meaning "the copy without the
+// drop". A false return - already gone, or a writer held it - rolls back, so a
+// copy the primitive could have made cannot outlive the partition it came from.
+func (s *Store) DropPartition(ctx context.Context, table, name string, reason retention.DropReason) (bool, error) {
 	if err := checkRetentionTable(table); err != nil {
 		return false, err
 	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("drop %s partition %s: begin: %w", table, name, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	var dropped bool
-	if err := s.pool.QueryRow(ctx,
-		`select pigeon_drop_partition($1, $2)`, table, name,
+	if err := tx.QueryRow(ctx,
+		`select pigeon_drop_partition($1, $2, $3)`, table, name, string(reason),
 	).Scan(&dropped); err != nil {
 		return false, fmt.Errorf("drop %s partition %s: %w", table, name, err)
 	}
-	return dropped, nil
+	if !dropped {
+		return false, nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("drop %s partition %s: commit: %w", table, name, err)
+	}
+	return true, nil
+}
+
+// DedupeArchiveSize is FR-905's gauge: the archive's on-disk size, measured from
+// the catalogue with pg_total_relation_size rather than assumed from a row count.
+//
+// The sum is over the archive's PARTITIONS, and that is not a detail: a
+// partitioned table has no storage of its own, so pg_total_relation_size on the
+// parent answers 0 (measured on 16.2 - and the same is true of pg_relation_size),
+// which would publish a calm zero for a multi-gigabyte archive. Each partition is
+// measured with pg_total_relation_size, so its heap and its primary-key index are
+// both counted, and a partition another session dropped mid-read contributes 0
+// rather than a NULL the caller has to handle.
+func (s *Store) DedupeArchiveSize(ctx context.Context) (int64, error) {
+	var n int64
+	if err := s.pool.QueryRow(ctx, `
+		select coalesce(sum(pg_total_relation_size(c.oid)), 0)
+		  from pg_inherits i
+		  join pg_class c on c.oid = i.inhrelid
+		 where i.inhparent = to_regclass('delivery_dedupe')
+		   and c.relkind = 'r'`,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("dedupe archive size: %w", err)
+	}
+	return n, nil
 }
 
 // DatabaseSize is how many bytes pigeon's own data occupies in this database. It
