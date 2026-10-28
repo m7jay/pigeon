@@ -61,6 +61,9 @@ type createConsumerEndpointRequest struct {
 	Name              string `json:"name"`
 	URL               string `json:"url"`
 	NotificationEmail string `json:"notification_email"`
+	// FR-405 applies here too: a consumer configures the same headers on the same
+	// endpoint type, and the same names are refused (see customHeaderRequest).
+	CustomHeaders []customHeaderRequest `json:"custom_headers"`
 }
 
 // handleConsumerListEventTypes is GET /v1/consumer/event-types: the event types
@@ -126,6 +129,7 @@ func (s *Server) handleConsumerCreateEndpoint(w http.ResponseWriter, r *http.Req
 	}
 	created, err := s.deps.Data.CreateConsumerEndpoint(r.Context(), sc, cid, store.NewConsumerEndpoint{
 		Name: req.Name, URL: req.URL, NotificationEmail: req.NotificationEmail,
+		CustomHeaders: customHeadersToStore(req.CustomHeaders),
 	})
 	if err != nil {
 		// A blocked URL is invalid input, not a 500 (FR-402, AC-19): the reason is
