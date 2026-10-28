@@ -103,6 +103,18 @@ jobs:
           # D-1..D-3, FR-815/SB-4), registered theirs only after their PRs
           # merged; their names are the tail of the list. Keep the list in the
           # order the criteria were registered.
+          #
+          # S5 (AC-14, AC-35..AC-37, AC-41 plus FR-1207) and S8 (AC-10, AC-18,
+          # AC-42 plus MT-1 and D-7's second half) registered theirs the same
+          # way, after their PRs merged. AC-16/AC-17 stay S10's: they are
+          # load-level criteria and no harness for them exists in the tree.
+          # Where one criterion's own sentence names two outcomes and two
+          # different tests pin them - AC-18's drop and its 429, AC-35's durable
+          # row and its 72 h arithmetic, AC-36's terminal row and its <= 16
+          # attempt bound, AC-37's governing window and the terminal it causes,
+          # AC-42's leadership handover and its single drop - both names are
+          # here: either half can be deleted with the job still green, which is
+          # the failure this list exists to stop.
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -162,7 +174,23 @@ jobs:
             TestSuccessLogGateHoldsTheBoundAtLoad \
             TestBufferedAttemptsFlowFromWorkerThroughRedisToPostgres \
             TestBatchedEvidenceInsertIsOneIdempotentStatement \
-            TestRunDrainsOnCancellation
+            TestRunDrainsOnCancellation \
+            TestAC14SubscriptionPauseAndResume \
+            TestAC35RecoversInsideTheWindow \
+            TestAC35DeliveryRecoversInsideTheWindow \
+            TestAC36RetryWindowEndsTheDelivery \
+            TestAC36WindowBoundaryTerminalWithinSixteenAttempts \
+            TestAC37ClaimUsesTheEndpointWindow \
+            TestAC37PerEndpointWindowGoverns \
+            TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas \
+            TestFR1207ResumeExtendsThePromisedWindow \
+            TestRelayFlushWhilePendingRepublishesAll \
+            TestRunOnceOverBudgetDropsOldestPartitionFirst \
+            TestPublishShedsWith429OverDiskBudget \
+            TestDropPartitionSerialisesWithAConcurrentDrop \
+            TestSweeperStandbyTakesOverWhenTheHolderIsKilled \
+            TestTwoSweepersDropExactlyOnePartition \
+            TestPartitionLeavesEnforceTenantIsolation
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
