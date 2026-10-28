@@ -857,3 +857,142 @@ func (c *inFlightCounter) reset() {
 	c.cur, c.peak, c.started = 0, 0, 0
 }
 
+// ---------------------------------------------------------------------------
+// AC-35 / FR-1207: the durable half of the retry window - an outage ridden out
+// on scheduled retries, and a pause that EXTENDS the window instead of consuming
+// ---------------------------------------------------------------------------
+
+// TestAC35RecoversInsideTheWindow is AC-35's durable half. retry_test.go proves
+// the arithmetic at §9's real numbers (a 20 h outage is ridden out inside 72 h);
+// this proves the platform actually does it on the delivery row: a receiver that
+// is down and then comes back is delivered on a scheduled retry, with no
+// operator action, and the window is not what ended anything.
+//
+// The clock is compressed - base 50 ms, cap 100 ms, window 4 s - because the
+// SHAPE is the claim: the outage outlasts the first several attempts, so only a
+// retry can carry the delivery.
+func TestAC35RecoversInsideTheWindow(t *testing.T) {
+	var down atomic.Bool
+	down.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if down.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	f := newS5Fixture(t, srv.URL, "order.created")
+	_, deliveryID := f.publish(t, "order.created", `{"id":"o1"}`)
+
+	const window = 4 * time.Second
+	w := New(f.st, f.options(func(o *Options) {
+		o.RetryWindow = window
+		o.BackoffBase = 50 * time.Millisecond
+		o.BackoffMax = 100 * time.Millisecond
+	}))
+
+	// The receiver recovers well inside the window, and well after the first few
+	// scheduled attempts have failed through.
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		down.Store(false)
+	}()
+
+	if !drive(t, w, 5000, func() bool { return f.deliveryStatus(t, deliveryID) == "delivered" }) {
+		t.Fatalf("delivery = %q after the receiver recovered, want delivered (AC-35): the retry schedule has to carry it",
+			f.deliveryStatus(t, deliveryID))
+	}
+	failed := f.attemptCount(t, deliveryID)
+	if failed < 2 {
+		t.Errorf("%d failed attempts before the recovery, want >= 2: the delivery has to have ridden out the outage on retries", failed)
+	}
+	used := f.retryWindowUsed(t, deliveryID)
+	if used < window-time.Second || used > window+time.Second {
+		t.Errorf("the delivery ran on a %s window, want the configured %s: the window is the deployment's, not a fallback", used, window)
+	}
+	t.Logf("AC-35: %d failed attempts, then delivered inside the %s window", failed, window)
+}
+
+// TestFR1207ResumeExtendsThePromisedWindow: a delivery that was fanned out but
+// never attempted has no retry_deadline yet - the first failure's requeue stamps
+// it - and those are exactly the rows a pause holds. FR-1207 says a pause
+// extends the delivery's window, so the deadline a resume produces must be
+// created_at + the window the delivery was PROMISED + the paused period.
+//
+// The shape it must not have is resume_time + paused_for: that hands a held
+// delivery a window of one pause, so an endpoint paused for ten minutes would
+// terminal everything it held after about two attempts - a pause consuming the
+// window it exists to preserve.
+//
+// The endpoint's own 1 h window is in place (the smallest the column allows)
+// while the resumer is given the deployment default, so this also pins that the
+// ENDPOINT's window governs the pause arithmetic, as it does the claim (AC-37).
+func TestFR1207ResumeExtendsThePromisedWindow(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	f := newS5Fixture(t, srv.URL, "order.created")
+	f.setEndpoint(t, `retry_window = interval '1 hour'`)
+	_, deliveryID := f.publish(t, "order.created", `{"id":"p1"}`)
+	created := f.createdAt(t, deliveryID)
+
+	// The case under test is the NULL one, so assert it is the one we have.
+	var before sql.NullTime
+	if err := f.admin.QueryRow(ctx, `select retry_deadline from deliveries where id=$1`, deliveryID).Scan(&before); err != nil {
+		t.Fatalf("read retry_deadline: %v", err)
+	}
+	if before.Valid {
+		t.Fatalf("the delivery already has retry_deadline %s; this test is about a delivery held by a pause that was never attempted",
+			before.Time)
+	}
+
+	if _, err := f.st.PauseSubscriptionForFailures(ctx, f.endpointID, "order.created"); err != nil {
+		t.Fatalf("PauseSubscriptionForFailures: %v", err)
+	}
+	const paused = 300 * time.Millisecond
+	time.Sleep(paused)
+
+	resumer := pause.NewResumer(f.st, f.counters, 0) // 0 = the documented deployment default (72 h)
+	out, err := resumer.ResumeSubscription(ctx, f.endpointID, "order.created")
+	if err != nil {
+		t.Fatalf("ResumeSubscription: %v", err)
+	}
+	if !out.Resumed {
+		t.Fatal("resume reported no transition on a paused subscription (FR-1205)")
+	}
+	resumedAt := time.Now()
+
+	used := f.retryDeadline(t, deliveryID).Sub(created)
+	if used < time.Hour+paused/2 {
+		t.Errorf("the resume granted a %s window, want the promised 1 h plus the %s pause: extending from the resume instead of from the promise is what consumes a held delivery's window (FR-1207)",
+			used, paused)
+	}
+	if used > time.Hour+paused+5*time.Second {
+		t.Errorf("the resume granted a %s window, want the promised 1 h plus the %s pause: the paused period must be added once, not twice",
+			used, paused)
+	}
+	// The schedule a never-scheduled row does not have is not invented: the row is
+	// claimable at the resume rather than one pause later.
+	if next := f.nextAttemptAt(t, deliveryID); !next.Valid || next.Time.After(resumedAt.Add(time.Second)) {
+		t.Errorf("next_attempt_at = %v, want an instant at or before the resume: a hold must not push a delivery into the future", next)
+	}
+
+	// And the claim hands the worker that deadline: a stamped deadline is what the
+	// worker schedules against from here on.
+	d, got, err := f.st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour)
+	if err != nil || !got {
+		t.Fatalf("ClaimDelivery after the resume: (got=%v, err=%v)", got, err)
+	}
+	if d.DeliveryID != deliveryID {
+		t.Fatalf("claimed delivery %d, want %d", d.DeliveryID, deliveryID)
+	}
+	if got := d.RetryDeadline.Sub(created); got < used-time.Second || got > used+time.Second {
+		t.Errorf("the claim reports a %s deadline, want the stored %s: the worker has to schedule against the window the pause preserved",
+			got, used)
+	}
+}
