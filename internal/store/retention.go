@@ -149,6 +149,12 @@ func (s *Store) ListPartitions(ctx context.Context, table string) ([]retention.P
 	return out, rows.Err()
 }
 
+// dropOutcomeTimeout bounds the detached context a drop runs on. The statement's
+// own lock waits are already bounded by the primitive's lock_timeout (5 s), so this
+// ceiling only guards a wedged connection: long enough that a healthy drop never
+// reaches it, short enough that a stuck socket cannot hold a shutdown open.
+const dropOutcomeTimeout = 30 * time.Second
+
 // DropPartition drops one leaf partition by name and reports whether this call
 // removed it. The SQL primitive serialises drops with a transaction-scoped
 // advisory lock (so no drop can run concurrently with itself, D-7), refuses a
@@ -165,18 +171,46 @@ func (s *Store) ListPartitions(ctx context.Context, table string) ([]retention.P
 // reports the drop is what keeps "neither" from meaning "the copy without the
 // drop". A false return - already gone, or a writer held it - rolls back, so a
 // copy the primitive could have made cannot outlive the partition it came from.
+//
+// The caller's cancellation cannot revoke that outcome, because the outcome IS the
+// report: pgx answers a cancelled round trip with context.Canceled - it sets a
+// deadline on the socket and closes the connection - and that client-side abort does
+// not stop the server, so a COMMIT the server has already recorded stands while the
+// caller holds an error. The caller would then be holding a partition that left the
+// catalogue - together with any archive row copied from it - with no record of the
+// drop that produced it, which is the accounting AC-42's catalogue-vs-books leg
+// asserts and what retention_dropped_partitions_total reports (SB-3/SB-6). Measured
+// on CI and reproduced locally: the sweeper's tick was cancelled by the shutdown of
+// a two-replica AC-42 run just as the second DROP committed, the partition vanished
+// unaccounted for, and the replica's book held one attempt too few.
+//
+// So the transaction runs on a detached copy of the caller's context, while the
+// connection is still acquired with the caller's: a context that is already
+// cancelled when the call starts never sends the DROP - the caller gets its error
+// and the partition is left for the next tick - and a cancellation that lands
+// later, including one between the acquire and the BEGIN, can no longer discard
+// the record of a commit that happened.
 func (s *Store) DropPartition(ctx context.Context, table, name string, reason retention.DropReason) (bool, error) {
 	if err := checkRetentionTable(table); err != nil {
 		return false, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return false, fmt.Errorf("drop %s partition %s: acquire: %w", table, name, err)
+	}
+	defer conn.Release()
+
+	qctx, qcancel := context.WithTimeout(context.WithoutCancel(ctx), dropOutcomeTimeout)
+	defer qcancel()
+
+	tx, err := conn.Begin(qctx)
 	if err != nil {
 		return false, fmt.Errorf("drop %s partition %s: begin: %w", table, name, err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer func() { _ = tx.Rollback(qctx) }()
 
 	var dropped bool
-	if err := tx.QueryRow(ctx,
+	if err := tx.QueryRow(qctx,
 		`select pigeon_drop_partition($1, $2, $3)`, table, name, string(reason),
 	).Scan(&dropped); err != nil {
 		return false, fmt.Errorf("drop %s partition %s: %w", table, name, err)
@@ -184,7 +218,7 @@ func (s *Store) DropPartition(ctx context.Context, table, name string, reason re
 	if !dropped {
 		return false, nil
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(qctx); err != nil {
 		return false, fmt.Errorf("drop %s partition %s: commit: %w", table, name, err)
 	}
 	return true, nil
