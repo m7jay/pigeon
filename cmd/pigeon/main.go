@@ -40,6 +40,15 @@ var version = "dev"
 
 func main() {
 	if err := run(); err != nil {
+		var exit exitError
+		if errors.As(err, &exit) {
+			// The report has already spoken; echo the message only when there is
+			// one, then leave with the status OPS-11 assigns.
+			if msg := exit.Error(); msg != "" {
+				fmt.Fprintf(os.Stderr, "pigeon: %v\n", msg)
+			}
+			os.Exit(exit.code)
+		}
 		// Configuration refusals are the operator's fix, not a crash to debug;
 		// they get one actionable line rather than a stack trace.
 		fmt.Fprintf(os.Stderr, "pigeon: %v\n", err)
@@ -48,6 +57,11 @@ func main() {
 }
 
 func run() error {
+	// The subcommand is dispatched before flag.Parse: doctor has its own flag set,
+	// and the default one would refuse its argv.
+	if len(os.Args) > 1 && os.Args[1] == "doctor" {
+		return runDoctor(os.Args[2:])
+	}
 	printVersion := flag.Bool("version", false, "print version and exit")
 	healthcheck := flag.Bool("healthcheck", false, "probe the local instance and exit 0/1 (container healthcheck)")
 	flag.Parse()
