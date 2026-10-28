@@ -216,7 +216,16 @@ jobs:
             TestClockSkewFailsPastTheLimit \
             TestNothingToObserveIsExitThree \
             TestNoSecretAppearsInAnyRendering \
-            TestObservedValuesAreSingleLine
+            TestObservedValuesAreSingleLine \
+            TestRebindingIsCaughtAtEveryCallSite \
+            TestDialControlIsTheOnlyCheckWithoutAWindow \
+            TestRequestTimeRefusalIsTerminal \
+            TestTransportRefusesToDialABlockedAddress \
+            TestRotationCarriesBothSignaturesFor24h \
+            TestNoRotationMeansOneSignature \
+            TestRotateKeepsThePreviousSecretForTheOverlap \
+            TestClaimScansAnEndpointThatHasNeverRotated \
+            TestExpiredPreviousSecretsAreCleared
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"

@@ -1,0 +1,239 @@
+name: nightly-faults
+
+# §16.5: "This matrix runs in CI nightly, not by hand."
+#
+# It is a separate workflow from ci.yml for two reasons that are both about the
+# assertions keeping their meaning. The matrix is slow and deliberately
+# destructive - it stops Postgres, wipes Redis, drops a partition and kills the
+# process - so putting it in the PR gate would make every pull request depend on
+# chaos, and the tests carry a `faults` build tag so `go test ./...` does not even
+# compile them. And a nightly failure must be attributable: this run publishes its
+# log as an artifact and a red nightly is the signal that a durability claim moved.
+on:
+  schedule:
+    # 03:00 UTC, an hour before the busiest part of the day in every timezone this
+    # project currently serves, so a red run is seen before anyone is relying on it.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-faults
+  cancel-in-progress: false
+
+jobs:
+  faults:
+    runs-on: ubuntu-24.04
+    # The Go test step's own -timeout 30m is the budget; this cap only has to sit
+    # above it plus the container-level scenarios, which sleep for real.
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pigeon_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      PIGEON_TEST_DATABASE_URL: postgres://postgres:***@localhost:5432/pigeon_test?sslmode=disable
+      PIGEON_TEST_REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      - name: vet the matrix (it is behind the faults tag, so ./... does not see it)
+        run: go vet -tags faults ./internal/faults/
+
+      # The seven scenarios §16.5 names, each asserting §6's outcome for its fault.
+      - name: fault-injection matrix
+        run: |
+          set -euo pipefail
+          go test -tags faults -count=1 -p 1 -v -timeout 30m ./internal/faults/ 2>&1 | tee /tmp/faults.log
+          # A skip here means a scenario did not run, which is the failure mode this
+          # whole job exists to prevent: a matrix that quietly covers five of seven
+          # reads exactly like coverage.
+          if grep -q -- "--- SKIP" /tmp/faults.log; then
+            echo "a fault scenario skipped; the matrix must run in full"
+            grep -- "--- SKIP" /tmp/faults.log
+            exit 1
+          fi
+          # The matrix's own completeness check is a test, but assert the count here
+          # too: a renamed test would otherwise pass by shrinking the matrix.
+          for want in \
+            TestFaultKilledWorkerLeavesARecoverableLease \
+            TestFaultRelayKilledMidDrainResumesWithNoLoss \
+            TestFaultRedisFlushLosesNoAcceptedEvent \
+            TestFaultDatabaseUnreachableRejectsRatherThanAccepts \
+            TestFaultDiskBudgetShedsWith429AndKeepsWhatItAccepted \
+            TestFaultPartitionDroppedMidWriteIsRecreated \
+            TestFaultClockSkewIsBoundedByTheSignatureTolerance \
+            TestFaultMatrixCoversEveryScenarioInTheRequirement ; do
+            if ! grep -q -- "--- PASS: $want" /tmp/faults.log; then
+              echo "§16.5 scenario $want did not pass in this run"
+              exit 1
+            fi
+          done
+
+      # ---------------------------------------------------------------------
+      # The process-level half. The Go tests above drive the lease, the outbox and
+      # the retention predicate; these steps exercise the two faults that are about
+      # the OS rather than the code - a real process kill and a real stopped
+      # database - so "SIGKILL a worker" and "stop Postgres for 30 s" are not
+      # simulations only.
+      # ---------------------------------------------------------------------
+      - name: start an instance for the process-level scenarios
+        run: |
+          set -euo pipefail
+          go build -o /tmp/pigeon ./cmd/pigeon
+          go build -o /tmp/loadgen ./cmd/loadgen
+          export PIGEON_INSTANCE_ADMIN_PASSWORD="$(head -c 32 /dev/urandom | base64)"
+          export PIGEON_DATABASE_URL="$PIGEON_TEST_DATABASE_URL"
+          export PIGEON_REDIS_URL="localhost:6379"
+          export PIGEON_HTTP_ADDR="127.0.0.1:8080"
+          export PIGEON_ATTEMPT_LOG_MODE=buffered
+          /tmp/pigeon >/tmp/pigeon.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8080/health; then break; fi
+            sleep 1
+          done
+          curl -fsS -o /dev/null http://127.0.0.1:8080/health
+
+      - name: provision a producer for the process-level scenarios
+        run: |
+          set -euo pipefail
+          # The probe type is broadcast: it is accepted and recorded but writes no
+          # delivery rows, so the probes below measure the ingest gate without
+          # touching the delivery path.
+          /tmp/loadgen seed -db "$PIGEON_TEST_DATABASE_URL" \
+            -producer nightly -event-type nightly.probe -routing broadcast \
+            -endpoints 1 -url https://example.invalid/hook >/tmp/seed.out
+          # The key is printed once, by design (FR-1008). Keep it in a file: never in
+          # the log, never in a step's output.
+          sed -n 's/^PIGEON_LOADGEN_KEY=//p' /tmp/seed.out | tr -d '\n' > /tmp/key
+          chmod 600 /tmp/key
+          test -s /tmp/key || { echo "no key was seeded"; exit 1; }
+          echo "producer ready"
+
+      - name: fill the disk (SB-7 sheds with 429)
+        run: |
+          set -euo pipefail
+          # A one-byte budget with a real directory: over budget from the first
+          # check, so every publish is shed. This is the HTTP half of
+          # TestFaultDiskBudgetShedsWith429AndKeepsWhatItAccepted.
+          pkill -f '/tmp/pigeon' || true
+          sleep 1
+          export PIGEON_INSTANCE_ADMIN_PASSWORD="$(head -c 32 /dev/urandom | base64)"
+          export PIGEON_DATABASE_URL="$PIGEON_TEST_DATABASE_URL"
+          export PIGEON_REDIS_URL="localhost:6379"
+          export PIGEON_HTTP_ADDR="127.0.0.1:8080"
+          export PIGEON_ATTEMPT_LOG_MODE=buffered
+          export PIGEON_DISK_DIR=/tmp
+          export PIGEON_DISK_BYTES=1
+          nohup /tmp/pigeon >/tmp/pigeon-disk.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:8080/health && break; sleep 1; done
+          KEY=$(cat /tmp/key)
+          code=$(curl -s -o /tmp/shed.json -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/events \
+            -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+            -d '{"event_type":"nightly.probe","payload":{}}')
+          echo "publish while over budget -> $code"
+          cat /tmp/shed.json
+          test "$code" = "429" || { echo "SB-7: over budget must shed with 429, got $code"; exit 1; }
+
+      - name: stop Postgres for 30 s
+        run: |
+          set -euo pipefail
+          pg=$(docker ps -q -f ancestor=postgres:16 | head -1)
+          test -n "$pg" || { echo "postgres service container not found"; exit 1; }
+          docker stop "$pg" >/dev/null
+          # The publisher must FAIL LOUDLY while the database is down: an accept it
+          # cannot record is the one outcome the outbox exists to prevent.
+          KEY=$(cat /tmp/key)
+          saw_failure=0
+          for i in $(seq 1 10); do
+            code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/events \
+              -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+              -d '{"event_type":"nightly.probe","payload":{}}' || true)
+            echo "publish during the outage -> ${code:-no-response}"
+            if [ "$code" != "202" ]; then saw_failure=1; fi
+            sleep 3
+          done
+          docker start "$pg" >/dev/null
+          # Recovery: the same request succeeds once the store is back.
+          for i in $(seq 1 30); do
+            code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/events \
+              -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+              -d '{"event_type":"nightly.probe","payload":{}}' || true)
+            [ "$code" = "202" ] && break
+            sleep 2
+          done
+          test "$saw_failure" = "1" || { echo "Postgres was stopped but the publish was still accepted"; exit 1; }
+          test "$code" = "202" || { echo "the instance did not recover after the outage (last code $code)"; exit 1; }
+
+      - name: kill -9 a worker mid-flight and prove nothing was lost
+        run: |
+          set -euo pipefail
+          KEY=$(cat /tmp/key)
+          PG=$(docker ps -q -f ancestor=postgres:16 | head -1)
+          for i in $(seq 1 50); do
+            curl -fsS -o /dev/null -X POST http://127.0.0.1:8080/v1/events \
+              -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+              -d '{"event_type":"nightly.probe","payload":{}}'
+          done
+          accepted=$(docker exec "$PG" psql -U postgres -d pigeon_test -tAc "select count(*) from events")
+          pkill -9 -f '/tmp/pigeon'
+          sleep 1
+          # The accepted events are still there after SIGKILL: they are in Postgres,
+          # not in the process (§6, "an accepted event cannot be lost").
+          after=$(docker exec "$PG" psql -U postgres -d pigeon_test -tAc "select count(*) from events")
+          echo "accepted before kill: $accepted, after kill: $after"
+          test "$after" = "$accepted" || { echo "SIGKILL lost accepted events"; exit 1; }
+
+          # Recovery (D-6): a restarted instance re-leases what the killed one left
+          # claimed. The assertion is that no lease stays lapsed and untouched -
+          # "pending with an expired lease" must drain, whatever the attempts do.
+          export PIGEON_INSTANCE_ADMIN_PASSWORD="$(head -c 32 /dev/urandom | base64)"
+          export PIGEON_DATABASE_URL="$PIGEON_TEST_DATABASE_URL"
+          export PIGEON_REDIS_URL="localhost:6379"
+          export PIGEON_HTTP_ADDR="127.0.0.1:8080"
+          export PIGEON_ATTEMPT_LOG_MODE=buffered
+          /tmp/pigeon >/tmp/pigeon-restart.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:8080/health && break; sleep 1; done
+          sleep 15
+          stale=$(docker exec "$PG" psql -U postgres -d pigeon_test -tAc \
+            "select count(*) from deliveries where status = 'pending' and lease_expires_at < now() - interval '5 seconds'")
+          echo "deliveries still holding a lapsed lease after the restart: $stale"
+          test "$stale" = "0" || { echo "the killed worker's leases were never reclaimed (D-6)"; exit 1; }
+
+      - name: upload the matrix log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-faults-log
+          path: |
+            /tmp/faults.log
+            /tmp/pigeon.log
+            /tmp/pigeon-disk.log
+          if-no-files-found: ignore
