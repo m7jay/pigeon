@@ -58,6 +58,21 @@ type fakeCore struct {
 	seen     []string
 	bodies   map[string]string
 	handlers map[string]http.HandlerFunc
+	reqs     []captured
+}
+
+// captured is one request the portal made to the core stand-in, in full: the URI
+// with its query, the headers and the body. Two of UI-15/UI-16's claims are about
+// what the portal *sends* rather than what it renders - the caller's scoped
+// bearer, replay's Idempotency-Key header, and the absence of any consumer id -
+// and none of those are visible in the portal's own response.
+type captured struct {
+	Method string
+	Path   string
+	URI    string // path plus query string
+	Auth   string // the Authorization header the portal attached
+	Idem   string // the Idempotency-Key header (FR-1107)
+	Body   string
 }
 
 func newFakeCore(t *testing.T) *fakeCore {
@@ -69,6 +84,11 @@ func newFakeCore(t *testing.T) *fakeCore {
 		f.mu.Lock()
 		f.seen = append(f.seen, key)
 		f.bodies[key] = string(body)
+		f.reqs = append(f.reqs, captured{
+			Method: r.Method, Path: r.URL.Path, URI: r.URL.RequestURI(),
+			Auth: r.Header.Get("Authorization"), Idem: r.Header.Get("Idempotency-Key"),
+			Body: string(body),
+		})
 		h := f.handlers[key]
 		f.mu.Unlock()
 		if h == nil {
@@ -102,6 +122,21 @@ func (f *fakeCore) calls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.seen...)
+}
+
+// lastRequest is the most recent request the portal made to the core stand-in for
+// one route, with its query, headers and body. Assertions about scoping and about
+// FR-1107's request key read this rather than the rendered page: the portal's
+// answer cannot show what it did *not* send.
+func (f *fakeCore) lastRequest(method, path string) captured {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.reqs) - 1; i >= 0; i-- {
+		if f.reqs[i].Method == method && f.reqs[i].Path == path {
+			return f.reqs[i]
+		}
+	}
+	return captured{}
 }
 
 // signedIn drives the portal's own handler with a valid session cookie.
