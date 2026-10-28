@@ -27,7 +27,7 @@ func valid() Config {
 		DeliveryRetryWindow:       72 * time.Hour,
 		DeliveryJitter:            0.2,
 		DeliveryConcurrency:       64,
-		DeliveryMaxConnsPerHost:   1,
+		DeliveryMaxConnsPerHost:   10,
 		// The reference deployment buffers attempt evidence in Redis (D-1) and
 		// keeps SB-5's default retention windows. The buffered mode is only valid
 		// with a Redis URL, so a "valid config" must carry both; S8's storage

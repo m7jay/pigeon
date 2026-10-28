@@ -31,11 +31,18 @@ import (
 type Resumer struct {
 	store    *store.Store
 	counters *Tracker
+	// window is the deployment's §9 retry window, which FR-1207 extends the
+	// paused period onto for a delivery whose deadline was never stamped (it was
+	// fanned out but never attempted - exactly the rows a pause holds). Zero
+	// selects the documented 72 h default, the same one the claim uses.
+	window time.Duration
 }
 
 // NewResumer wires the durable half (Postgres) to the decision half (Redis).
-func NewResumer(st *store.Store, counters *Tracker) *Resumer {
-	return &Resumer{store: st, counters: counters}
+// defaultRetryWindow is the deployment's retry window (FR-1207); zero means the
+// documented 72 h default.
+func NewResumer(st *store.Store, counters *Tracker, defaultRetryWindow time.Duration) *Resumer {
+	return &Resumer{store: st, counters: counters, window: defaultRetryWindow}
 }
 
 // ResumeOutcome reports what a resume did, in the terms an operator sees.
@@ -63,7 +70,7 @@ func (r *Resumer) ResumeSubscription(ctx context.Context, endpointID, eventType 
 			return out, fmt.Errorf("resume subscription: clear counters: %w", err)
 		}
 	}
-	res, err := r.store.ResumeSubscription(ctx, endpointID, eventType)
+	res, err := r.store.ResumeSubscription(ctx, endpointID, eventType, r.window)
 	if err != nil {
 		return out, err
 	}
@@ -85,7 +92,7 @@ func (r *Resumer) ResumeEndpoint(ctx context.Context, endpointID string) (Resume
 		}
 		out.Forgiven = forgiven
 	}
-	res, err := r.store.ResumeEndpoint(ctx, endpointID)
+	res, err := r.store.ResumeEndpoint(ctx, endpointID, r.window)
 	if err != nil {
 		return out, err
 	}

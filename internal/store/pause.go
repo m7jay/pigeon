@@ -130,13 +130,23 @@ func (s *Store) PauseEndpointForFailures(ctx context.Context, endpointID string,
 // extend every held delivery's window by the paused period (FR-1207). It does NOT
 // replay anything (FR-1205) - the caller clears the Redis counters that decide a
 // pause, which is FR-1211's other half.
-func (s *Store) ResumeEndpoint(ctx context.Context, endpointID string) (ResumeResult, error) {
+//
+// defaultRetryWindow is the deployment's §9 retry window (the same value the
+// claim schedules with). FR-1207 has to extend the window a held delivery was
+// PROMISED, and for a delivery that was fanned out but never attempted the
+// promise is created_at + the endpoint's own window, else this one: without it
+// the SQL side would have to guess a default that could disagree with the
+// deployment's. Zero selects the documented 72 h.
+func (s *Store) ResumeEndpoint(ctx context.Context, endpointID string, defaultRetryWindow time.Duration) (ResumeResult, error) {
 	var out ResumeResult
+	if defaultRetryWindow <= 0 {
+		defaultRetryWindow = 72 * time.Hour
+	}
 	err := db.ControlTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var pausedFor *float64
 		if err := tx.QueryRow(ctx, `select resumed, producer_id, env,
 			(extract(epoch from paused_for))::double precision
-			from pigeon_resume_endpoint($1)`, endpointID,
+			from pigeon_resume_endpoint($1,$2)`, endpointID, defaultRetryWindow,
 		).Scan(&out.Resumed, &out.ProducerID, &out.Env, &pausedFor); err != nil {
 			return err
 		}
@@ -151,14 +161,18 @@ func (s *Store) ResumeEndpoint(ctx context.Context, endpointID string) (ResumeRe
 	return out, nil
 }
 
-// ResumeSubscription is FR-1205's one action for a subscription.
-func (s *Store) ResumeSubscription(ctx context.Context, endpointID, eventType string) (ResumeResult, error) {
+// ResumeSubscription is FR-1205's one action for a subscription. It takes the
+// same deployment window as ResumeEndpoint, for the same FR-1207 reason.
+func (s *Store) ResumeSubscription(ctx context.Context, endpointID, eventType string, defaultRetryWindow time.Duration) (ResumeResult, error) {
 	var out ResumeResult
+	if defaultRetryWindow <= 0 {
+		defaultRetryWindow = 72 * time.Hour
+	}
 	err := db.ControlTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var pausedFor *float64
 		if err := tx.QueryRow(ctx, `select resumed, producer_id, env,
 			(extract(epoch from paused_for))::double precision
-			from pigeon_resume_subscription($1,$2)`, endpointID, eventType,
+			from pigeon_resume_subscription($1,$2,$3)`, endpointID, eventType, defaultRetryWindow,
 		).Scan(&out.Resumed, &out.ProducerID, &out.Env, &pausedFor); err != nil {
 			return err
 		}
