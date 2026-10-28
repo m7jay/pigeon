@@ -293,6 +293,21 @@ not reached. Renumbering rather than editing an applied migration is deliberate:
 `db.Migrate` records a checksum per file, so editing 0010/0011 in place would break
 every database that had already applied them.
 
+**Every partition carries its parent's row level security.** PostgreSQL does not
+propagate RLS to partitions: the flag and the policies belong to each relation
+(measured on 16.2, `deliveries.relrowsecurity` true and `deliveries_YYYYMMDD`
+false). A swap that turns one protected relation into a parent plus children would
+therefore have handed the runtime role every tenant's rows to any query that names
+the day — the parent filters, a leaf would not. `pigeon_ensure_partition` enables
+RLS on every leaf it creates and copies the parent's policy onto it (the same policy
+name; the `attempts` leaf's subquery names the leaf, since `attempts` is not in scope
+there), because it is the single place a partition is created — the cutover loop,
+fan-out, the sweeper and `pigeon_record_attempts` all go through it. It re-checks
+both on an existing leaf, so a leaf that predates this file is repaired rather than
+trusted. Reads through the parent, reads that name a leaf, and writes against either
+are all filtered, and a cross-tenant write is refused with SQLSTATE 42501
+(`TestPartitionLeavesEnforceTenantIsolation`).
+
 **Retention windows are configuration, once.** The merged base carried a second,
 day-granularity set of retention knobs (`PIGEON_RETENTION_DELIVERIES_DAYS`,
 `…_ATTEMPTS_DAYS`, `…_EVENTS_DAYS`) with no consumer,
