@@ -17,14 +17,33 @@ import (
 // fakeSink records each batch it is asked to insert, so the tests can assert the
 // transaction shape (FR-815) rather than only the row count. failNext makes one
 // call fail, which is how the retry path is driven without a real database.
+//
+// entered and hold let a test cancel the flusher's context at a point where the
+// flusher is provably inside the sink — and therefore is not acknowledging a batch
+// on a context the cancellation is about to revoke. entered is closed on the first
+// call, hold blocks every call until release. Both are set before Run starts and
+// never written afterwards; see TestRunDrainsOnCancellation.
 type fakeSink struct {
 	mu       sync.Mutex
 	batches  [][]store.AttemptRecord
 	failNext error
 	rows     int
+
+	entered     chan struct{}
+	hold        chan struct{}
+	enteredOnce sync.Once
+	releaseOnce sync.Once
 }
 
 func (f *fakeSink) RecordAttempts(_ context.Context, batch []store.AttemptRecord) (int, error) {
+	if f.entered != nil {
+		f.enteredOnce.Do(func() { close(f.entered) })
+	}
+	// Held outside the lock: a test that polls the sink while a call is held would
+	// otherwise block behind it.
+	if f.hold != nil {
+		<-f.hold
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.batches = append(f.batches, append([]store.AttemptRecord(nil), batch...))
@@ -35,6 +54,15 @@ func (f *fakeSink) RecordAttempts(_ context.Context, batch []store.AttemptRecord
 	}
 	f.rows += len(batch)
 	return len(batch), nil
+}
+
+// release unblocks a held call. It is safe to call more than once, so a test can
+// both release deliberately and defer a release as an escape hatch.
+func (f *fakeSink) release() {
+	if f.hold == nil {
+		return
+	}
+	f.releaseOnce.Do(func() { close(f.hold) })
 }
 
 func (f *fakeSink) batchCount() int {
@@ -280,12 +308,36 @@ func TestNewFlusherRequiresASink(t *testing.T) {
 	}
 }
 
-// TestRunDrainsOnCancellation is D-3 end to end: Run keeps flushing while the
-// context lives, and when the context is cancelled it flushes what is left before
-// returning ctx.Err().
+// TestRunDrainsOnCancellation is D-3 end to end: when the context is cancelled,
+// Run flushes what is still buffered before returning ctx.Err().
+//
+// The cancellation is driven by the sink rather than raced against it: the first
+// pass's insert is held open inside the sink (fakeSink.hold) and the test cancels
+// while it is there. Two things follow, and both are deliberate.
+//
+// The flusher provably is not acknowledging a batch at that instant, so the
+// cancellation cannot revoke an ack. That was this test's flake on a loaded box:
+// `rowCount() >= 5` becomes visible inside the sink call, so the cancel landed
+// between the insert and its ack, the ack (XACK/XDEL) was revoked, and the batch
+// stayed in the stream with nothing able to reclaim it — StaleAfter is an hour
+// here and the flusher's retry slot was already cleared by the successful insert.
+// The test then read depth 5 and failed as if the drain had not run.
+//
+// Running the held insert into a failure instead leaves the batch in the flusher's
+// retry slot when the shutdown starts, which is what gives the drain something to
+// flush on its own uncancellable context — so the assertions below are about D-3
+// rather than about one unlucky interleaving.
 func TestRunDrainsOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	fl, sink, buf := newTestFlusher(t, 10)
+	sink.failNext = errors.New("transient")
+	// Hold the first pass inside the sink, and release it from whichever path
+	// leaves this test, so a failure cannot strand Run's goroutine.
+	sink.entered = make(chan struct{})
+	sink.hold = make(chan struct{})
+	defer sink.release()
+
 	for i := 1; i <= 5; i++ {
 		if err := buf.Push(context.Background(), rec(int64(i), 1)); err != nil {
 			t.Fatalf("Push: %v", err)
@@ -295,23 +347,36 @@ func TestRunDrainsOnCancellation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- fl.Run(ctx) }()
 
-	// Wait for the first pass to insert the five entries, then cancel.
-	deadline := time.Now().Add(2 * time.Second)
-	for sink.rowCount() < 5 {
-		if time.Now().After(deadline) {
-			t.Fatalf("Run did not flush within 2s; rows=%d", sink.rowCount())
-		}
-		time.Sleep(5 * time.Millisecond)
+	// The first pass has read the five entries and is inside the failing insert:
+	// nothing is acknowledged, so the batch stays the drain's to flush.
+	select {
+	case <-sink.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not reach the sink within 5s")
 	}
 	cancel()
+	sink.release()
 
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Run returned %v, want context.Canceled", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancellation")
+	}
+
+	// The drain runs on its own context, so the batch the cancelled pass left
+	// behind is inserted and acknowledged before Run returns.
+	if got := sink.batchCount(); got != 2 {
+		t.Fatalf("sink was called %d times, want 2 (the cancelled pass and the shutdown drain)", got)
+	}
+	if !sameRecords(sink.batches[0], sink.batches[1]) {
+		t.Fatalf("the drain did not flush the batch the cancelled pass left: %+v then %+v",
+			sink.batches[0], sink.batches[1])
+	}
+	if got := sink.rowCount(); got != 5 {
+		t.Fatalf("sink inserted %d rows, want 5 (the shutdown drain must flush what is buffered)", got)
 	}
 	if depth, _ := buf.Depth(context.Background()); depth != 0 {
 		t.Fatalf("buffer depth after the shutdown drain = %d, want 0", depth)
