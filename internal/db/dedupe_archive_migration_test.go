@@ -9,7 +9,7 @@ import (
 )
 
 // TestDedupeArchiveMigrationCatalog is FR-905/AC-46's catalogue proof: after a
-// fresh Migrate over every migration in order, the archive 0013 creates is
+// fresh Migrate over every migration in order, the archive 0014 creates is
 // partitioned by day (SB-1), carries the tenant policy on itself AND on the leaves
 // the primitive makes later (MT-1), has A-4's primary key and no surrogate id, and
 // is reachable through the one UNION view the support path reads (FR-903).
@@ -29,7 +29,7 @@ func TestDedupeArchiveMigrationCatalog(t *testing.T) {
 	defer pool.Close()
 
 	if err := Migrate(ctx, pool, 30*time.Second); err != nil {
-		t.Fatalf("Migrate over every migration file (0001…0013, ascending, as CI applies them): %v", err)
+		t.Fatalf("Migrate over every migration file (0001…0014, ascending, as CI applies them): %v", err)
 	}
 
 	// The appended migration is recorded exactly once: 0012 is S8's and may not be
@@ -37,11 +37,11 @@ func TestDedupeArchiveMigrationCatalog(t *testing.T) {
 	// own file.
 	var recorded int
 	if err := pool.QueryRow(ctx,
-		`select count(*) from schema_migrations where version = '0013'`).Scan(&recorded); err != nil {
+		`select count(*) from schema_migrations where version = '0014'`).Scan(&recorded); err != nil {
 		t.Fatalf("read schema_migrations: %v", err)
 	}
 	if recorded != 1 {
-		t.Fatalf("schema_migrations has %d rows for 0013, want 1", recorded)
+		t.Fatalf("schema_migrations has %d rows for 0014, want 1", recorded)
 	}
 
 	// SB-1: daily range partitions on the day column the copy stamps.

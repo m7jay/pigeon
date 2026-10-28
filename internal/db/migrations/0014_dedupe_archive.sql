@@ -1,4 +1,4 @@
--- 0013_dedupe_archive.sql — FR-905/AC-46: the dedupe answer outlives delivery
+-- 0014_dedupe_archive.sql — FR-905/AC-46: the dedupe answer outlives delivery
 -- retention, in Postgres, and the copy is atomic with the drop that ends it.
 --
 -- 0012 turned `deliveries` and `attempts` into daily partitions and made the
@@ -8,7 +8,7 @@
 -- `delivery_dedupe`, a range-partitioned archive filled from the partition being
 -- dropped, in the same transaction as the drop.
 --
--- Why 0013 and not an edit to 0012: db.Migrate records each applied file's
+-- Why 0014 and not an edit to 0012: db.Migrate records each applied file's
 -- checksum, so an applied migration is never edited. 0012 stays as it landed and
 -- this file appends. It restates both partition primitives in full
 -- (`pigeon_ensure_partition`, `pigeon_drop_partition`) because they are

@@ -676,7 +676,7 @@ and letting a retried fan-out batch create duplicates.
 **Encoded by.** FR-903 (rewritten), FR-905, §6's two dedupe rows, I-3 (amended),
 AC-46.
 
-**As implemented (0013_dedupe_archive.sql, 0013 because 0012's checksum is applied).**
+**As implemented (0014_dedupe_archive.sql, 0014 because 0012's checksum is applied).**
 Four points where the code had to say something this section left open, so the next
 reader does not have to rediscover them:
 

@@ -15,7 +15,7 @@
 // It is deliberately one place. The sweeper (which owns the leadership lease,
 // D-7) drives RunOnce; the HTTP layer only reads Status/OverBudget. Partition DDL
 // itself lives behind two SECURITY DEFINER functions in 0012_partitioning.sql,
-// extended by 0013_dedupe_archive.sql, because the runtime role owns nothing and
+// extended by 0014_dedupe_archive.sql, because the runtime role owns nothing and
 // must not hold CREATE on the schema.
 package retention
 
