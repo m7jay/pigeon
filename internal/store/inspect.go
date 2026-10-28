@@ -47,7 +47,8 @@ const (
 //
 //   - pending             in flight, so the event's outcome is not settled;
 //   - delivered           attempted and accepted (FR-803);
-//   - anything else       terminal without a delivery: `failed`, `skipped`, and
+//   - anything else       terminal without a delivery: `failed_terminal`
+//     (0007 wrote `failed`; 0013 renamed it, I-4/FR-1201), `skipped`, and
 //     whatever terminal status a later slice adds.
 const (
 	statusPending   = "pending"
@@ -322,7 +323,7 @@ func attemptsFor(ctx context.Context, tx pgx.Tx, deliveryID int64) ([]Attempt, e
 // was never attempted, and an empty trail would read as "nothing happened"
 // rather than "this endpoint could not take the event".
 //
-// A `failed` delivery needs no synthesis: its last attempt is a row.
+// A `failed_terminal` delivery needs no synthesis: its last attempt is a row.
 func effectiveAttempt(d DeliverySummary) *EffectiveAttempt {
 	switch d.Status {
 	case statusDelivered:
@@ -493,8 +494,8 @@ func statusesOf(ds []DeliveryDetail) []string {
 //     row breaks this: a matched endpoint that could not take the event means
 //     the event did not fully deliver, whatever the other rows say.
 //  4. `failed` - nothing was delivered: every row is terminal without a
-//     delivery (`failed`, `skipped`), or the event produced no rows and recorded
-//     an event-level reason of its own (§7.5a's `not_delivered:*`).
+//     delivery (`failed_terminal`, `skipped`), or the event produced no rows
+//     and recorded an event-level reason of its own (§7.5a's `not_delivered:*`).
 //  5. `partially_failed` - a mix: something was delivered and something was not.
 //
 // Two shapes worth naming. An event whose fan-out has not run yet has no rows
@@ -570,7 +571,8 @@ type ReplayResult struct {
 // as it picks up a first attempt, spaced at ReplayReleasePerSecond per endpoint.
 //
 // What is replayable: a delivery that was attempted and reached a terminal
-// state - `delivered` or `failed`, plus any terminal status a later slice adds.
+// state - `delivered` or `failed_terminal`, plus any terminal status a later
+// slice adds.
 // `pending` is in flight and must not be duplicated. `skipped` is refused on
 // purpose: it was never attempted, and its reasons (an unverified endpoint, a
 // paused endpoint or subscription) are §7.5a conditions whose fix is to change

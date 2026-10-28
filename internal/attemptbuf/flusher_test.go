@@ -478,3 +478,355 @@ func TestMetricsAdvanceOnFlush(t *testing.T) {
 		t.Fatalf("%s = %d, want 3", metrics.AttemptsFlushed, got)
 	}
 }
+
+// cancelAfterCommitSink fails the first insert, so the batch lands in the
+// flusher's retry slot, and cancels the pass's context from inside the retry's
+// own RecordAttempts. The cancellation therefore lands after the rows are
+// committed and before the flusher retires the entries - the exact window W1
+// measured - and it is driven by the sink rather than raced against the flusher,
+// so the instant is the same on every run.
+type cancelAfterCommitSink struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	calls  int
+	rows   int
+}
+
+func (s *cancelAfterCommitSink) RecordAttempts(_ context.Context, batch []store.AttemptRecord) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls == 1 {
+		return 0, errors.New("transient")
+	}
+	s.cancel()
+	s.rows += len(batch)
+	return len(batch), nil
+}
+
+// count is the race-free read of the sink's own state: Run's goroutine writes it
+// while the test goroutine reads it.
+func (s *cancelAfterCommitSink) count() (calls, rows int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, s.rows
+}
+
+// TestRunRetiresTheBatchEvenWhenThePassIsCancelled is D-9's property for W1: a
+// cancellation that lands after the rows are committed must not leave a batch the
+// process cannot hand back. The retry slot is already empty at that instant, the
+// stale window is an hour, and the entries are still pending - so if the
+// retirement is revocable, nothing short of the next start's reclaim(0) can
+// recover them (depth 1, pending 1, and a duplicate insert plus an
+// AttemptsConflicted bump next boot).
+func TestRunRetiresTheBatchEvenWhenThePassIsCancelled(t *testing.T) {
+	ctx := context.Background()
+	buf, _ := newTestBuffer(t)
+	if err := buf.Push(ctx, rec(1, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sink := &cancelAfterCommitSink{cancel: cancel}
+	fl, err := NewFlusher(buf, sink, FlusherOptions{
+		Batch:       10,
+		Interval:    10 * time.Millisecond,
+		StaleAfter:  time.Hour,
+		FailBackoff: 5 * time.Millisecond,
+		DrainGrace:  2 * time.Second,
+		Metrics:     metrics.New(),
+	})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- fl.Run(runCtx) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the cancelled pass")
+	}
+
+	if calls, rows := sink.count(); calls != 2 || rows != 1 {
+		t.Fatalf("the sink saw %d calls and %d rows, want 2 calls (the failure and its retry) and 1 row", calls, rows)
+	}
+	// Run has returned, so reading the flusher's own state is race-free here.
+	if got := len(fl.stuck); got != 0 {
+		t.Fatalf("the flusher still holds %d entries in its retry slot", got)
+	}
+	if depth, err := buf.Depth(ctx); err != nil || depth != 0 {
+		t.Fatalf("buffer depth after Run returned = %d, %v; want 0: a cancelled pass must not leave a batch nothing can hand back", depth, err)
+	}
+	if got := pendingCount(t, buf); got != 0 {
+		t.Fatalf("pending after Run returned = %d, want 0: the retirement must not be revocable by the cancellation", got)
+	}
+}
+
+// TestStrandedEntriesAreSweptAtStartup: a strand created before this process
+// started - the tear a transaction cannot cover - is retired by Run's startup
+// sweep, so the depth gauge OBS-9 watches stops counting entries that are not
+// work (D-9, OBS-9).
+func TestStrandedEntriesAreSweptAtStartup(t *testing.T) {
+	ctx := context.Background()
+	fl, sink, buf := newTestFlusher(t, 10)
+
+	for i := 1; i <= 3; i++ {
+		if err := buf.Push(ctx, rec(int64(i), 1)); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+	entries, err := buf.Read(ctx, 10)
+	if err != nil || len(entries) != 3 {
+		t.Fatalf("Read = %d entries, %v; want 3", len(entries), err)
+	}
+	// Strand the first two the way a torn retirement does, and leave the third
+	// pending for the startup reclaim to pick up.
+	if err := buf.rdb.XAck(ctx, buf.Key(), buf.group, entries[0].ID, entries[1].ID).Err(); err != nil {
+		t.Fatalf("XAck: %v", err)
+	}
+	// And one entry nobody has read.
+	if err := buf.Push(ctx, rec(4, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- fl.Run(runCtx) }()
+
+	// The pending entry and the unread one are the run's to flush, so the only
+	// reason the depth can reach 0 is the sweep retiring the stranded pair.
+	if !waitFor(5*time.Second, func() bool {
+		depth, err := buf.Depth(ctx)
+		return err == nil && depth == 0
+	}) {
+		depth, _ := buf.Depth(ctx)
+		t.Fatalf("the buffer never drained: depth=%d pending=%d rows=%d (the startup sweep must retire the stranded entries)",
+			depth, pendingCount(t, buf), sink.rowCount())
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	// The flush path saw each real entry exactly once: the reclaimed pending one
+	// and the unread one. The two strands carry rows a previous process already
+	// committed, so they must not be inserted again.
+	if got := sink.rowCount(); got != 2 {
+		t.Fatalf("the sink inserted %d rows, want 2 (the pending entry and the unread one)", got)
+	}
+	if got := sink.batchCount(); got != 2 {
+		t.Fatalf("the sink was called %d times, want 2 (the startup reclaim and the read)", got)
+	}
+	if got := pendingCount(t, buf); got != 0 {
+		t.Fatalf("pending after the run = %d, want 0", got)
+	}
+	if depth, err := buf.Depth(ctx); err != nil || depth != 0 {
+		t.Fatalf("buffer depth after the run = %d, %v; want 0", depth, err)
+	}
+}
+
+// TestNewFlusherDefaultsTheAckTimeout: the retirement's bound defaults to 2 s and
+// lives on FlusherOptions rather than on a PIGEON_ knob, which is FailBackoff's
+// status too - an operator has no business tuning it.
+func TestNewFlusherDefaultsTheAckTimeout(t *testing.T) {
+	buf, _ := newTestBuffer(t)
+	fl, err := NewFlusher(buf, &fakeSink{}, FlusherOptions{})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+	if fl.opts.AckTimeout != 2*time.Second {
+		t.Fatalf("AckTimeout = %v, want the 2 s default", fl.opts.AckTimeout)
+	}
+	fl, err = NewFlusher(buf, &fakeSink{}, FlusherOptions{AckTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+	if fl.opts.AckTimeout != 50*time.Millisecond {
+		t.Fatalf("AckTimeout = %v, want the caller's 50 ms", fl.opts.AckTimeout)
+	}
+}
+
+// TestInsertRetiresWithinAckTimeoutOnAHungRedis: the retirement's non-revocable
+// context is bounded by AckTimeout and not by the client's read timeout, so a
+// Redis that has stopped answering cannot hold a pass open (D-9). The rows are
+// committed before the retirement, which is why this may fail as an error without
+// being a loss.
+func TestInsertRetiresWithinAckTimeoutOnAHungRedis(t *testing.T) {
+	rdb, err := clientFromURL("redis://" + hungListener(t).Addr().String() + "/0")
+	if err != nil {
+		t.Fatalf("clientFromURL: %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	buf, err := New(rdb, Options{Consumer: "test-flusher"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	fl, err := NewFlusher(buf, &fakeSink{}, FlusherOptions{AckTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+
+	start := time.Now()
+	// The sink is a fake, so the insert commits and this is the retirement path:
+	// one MULTI/EXEC against a socket that accepts and never answers.
+	inserted, err := fl.insert(context.Background(), []Entry{{ID: "1-0", Record: rec(1, 1)}})
+	elapsed := time.Since(start)
+	if inserted != 1 {
+		t.Fatalf("insert reported %d rows, want 1: the commit happens before the retirement", inserted)
+	}
+	if err == nil {
+		t.Fatal("insert reported success against a Redis that never answers")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("insert returned %v, want a deadline error", err)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("the retirement took %v, want about AckTimeout (200 ms): the bound was not the one that was set", elapsed)
+	}
+}
+
+// refuseRetireHook fails every pipeline carrying a retirement's XACK, so
+// Buffer.Ack reports an error with nothing applied: what a Redis that is down,
+// or that has stopped answering within AckTimeout, looks like to the flusher.
+// The refusal is raised on the client (the hook returns before the commands are
+// sent) rather than by a server answering errors mid-transaction, because a
+// MULTI answered with an error leaves go-redis holding an unread reply and
+// dropping the connection - noise in a test about the flusher's bookkeeping.
+type refuseRetireHook struct {
+	mu       sync.Mutex
+	refusals int
+}
+
+func (h *refuseRetireHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *refuseRetireHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+
+func (h *refuseRetireHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		for _, c := range cmds {
+			if c.Name() == "xack" {
+				h.mu.Lock()
+				h.refusals++
+				h.mu.Unlock()
+				return errors.New("LOADING Redis is loading the dataset in memory")
+			}
+		}
+		return next(ctx, cmds)
+	}
+}
+
+// refused is the race-free read of how many retirements the hook failed: the
+// test's proof that a retirement was attempted at all.
+func (h *refuseRetireHook) refused() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.refusals
+}
+
+// TestAFailedRetirementLeavesTheRetrySlotEmpty pins the order inside insert():
+// the retry slot is cleared once the rows are committed and BEFORE the
+// retirement is attempted, so a retirement that fails after the commit returns
+// its error without re-parking the batch (D-9).
+//
+// Why the slot must stay empty (the rejected alternative, the decision record's
+// section 2 q3): readBatch returns the retry slot FIRST, so a batch retained
+// there is handed back on every pass. Nothing new is read while Redis is
+// unhappy, every retry re-inserts a batch whose rows are already in Postgres
+// (which counts AttemptsConflicted), and the stream grows behind it.
+//
+// The retirement fails here the way a Redis that cannot apply the
+// acknowledgement makes it fail (refuseRetireHook). The hung listener
+// TestInsertRetiresWithinAckTimeoutOnAHungRedis uses fails it just as well and
+// would do for the slot assertion, but it never answers again, and the last
+// assertions below need a healthy buffer: the pass after the failure has to be
+// able to read.
+func TestAFailedRetirementLeavesTheRetrySlotEmpty(t *testing.T) {
+	ctx := context.Background()
+	buf, _ := newTestBuffer(t)
+	hook := &refuseRetireHook{}
+	buf.rdb.AddHook(hook)
+	sink := &fakeSink{}
+	fl, err := NewFlusher(buf, sink, FlusherOptions{
+		Interval:   10 * time.Millisecond,
+		StaleAfter: time.Hour,
+		AckTimeout: 200 * time.Millisecond,
+		DrainGrace: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+
+	// The state the invariant is about, driven rather than seeded: one entry is
+	// pushed, the sink refuses the insert, and insert parks the batch in the
+	// retry slot. StaleAfter is an hour, so nothing below can be a stale reclaim
+	// handing the same entry back.
+	if err := buf.Push(ctx, rec(1, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	sink.failNext = errors.New("transient")
+	if _, err := fl.FlushOnce(ctx); err == nil {
+		t.Fatal("the first FlushOnce returned nil after a failed insert")
+	}
+	if got := len(fl.stuck); got != 1 {
+		t.Fatalf("the failed insert left %d entries in the retry slot, want 1", got)
+	}
+	failed := fl.stuck[0]
+
+	// A second entry arrives while the first batch is still unretired: it is what
+	// the pass after the failed retirement must read.
+	if err := buf.Push(ctx, rec(2, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+
+	// The retry's insert commits - the fake sink accepts it - and its retirement
+	// cannot be applied.
+	inserted, err := fl.FlushOnce(ctx)
+	if got := hook.refused(); got != 1 {
+		t.Fatalf("the retirement was attempted %d times, want 1: the batch is retired after its insert", got)
+	}
+	if err == nil {
+		t.Fatal("FlushOnce reported success while the retirement could not be applied")
+	}
+	if inserted != 1 {
+		t.Fatalf("FlushOnce inserted %d rows, want 1: the insert commits before the retirement, so the failure is the retirement's", inserted)
+	}
+
+	// The invariant: the retry slot is empty, so the next pass is free to read.
+	if got := len(fl.stuck); got != 0 {
+		t.Fatalf("after a failed retirement the retry slot holds %d entries, want 0: readBatch returns the retry slot first, so a retained batch is handed back on every pass and nothing new is read while Redis is unhappy", got)
+	}
+	// And the batch really was not retired: its entry stays pending for the stale
+	// reclaim window, which is what makes retaining it a stall rather than a loss.
+	if got := pendingCount(t, buf); got != 1 {
+		t.Fatalf("pending entries after the failed retirement = %d, want 1 (the committed batch is still pending; nothing acknowledged it)", got)
+	}
+
+	// The next read is the entry pushed during the failure, not the batch whose
+	// retirement failed. A flusher that retained that batch hands it back here
+	// instead, and that is the stall this pins.
+	entries, err := fl.readBatch(ctx)
+	if err != nil {
+		t.Fatalf("readBatch after the failed retirement: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("readBatch returned %d entries %v, want the one entry pushed after the failure", len(entries), IDs(entries))
+	}
+	if entries[0].ID == failed.ID {
+		t.Fatalf("readBatch returned the batch whose retirement failed (%s, delivery %d) instead of the entry pushed after it (delivery 2): readBatch returns the retry slot first, so a retained batch is read again on every pass and nothing new is", failed.ID, failed.Record.DeliveryID)
+	}
+	if got := entries[0].Record.DeliveryID; got != 2 {
+		t.Fatalf("readBatch returned the entry with delivery %d, want the one pushed after the failure (delivery 2)", got)
+	}
+}
