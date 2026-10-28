@@ -1007,8 +1007,103 @@ bound - the bound is what keeps the trim off an entry nobody has acknowledged.
 transaction and is not revocable by the cancellation that ends a pass), §19's decision row;
 `internal/attemptbuf`'s `Buffer.Ack`, `Buffer.SweepStranded`, `Flusher.insert`/`Run`,
 `FlusherOptions.AckTimeout`, `clientFromURL`.
+### A-10 — The retry budget is the worker's attempt budget, not a second endpoint limit
 
-## Gap list — nine decided, one open
+**Decision.** FR-1303's "separate budget" is the platform's attempt-execution capacity, not the
+receiver's: a delivery worker MUST partition its attempt budget into a **first-attempt lane**
+(`deliveries.attempts = 0`) and a **retry lane** (`attempts > 0`) with independent allowances, and
+every attempt class MUST keep sharing the endpoint's concurrency slots and RPS bucket (FR-1302,
+FR-1306, FR-1308, unchanged). FR-1308 is a promise to the receiver, and a second slot set for
+retries would break it exactly when the receiver is least able to absorb it. FR-1303 is a promise
+to the publisher: the ability to make a first attempt MUST NOT be consumed by the platform's own
+retry work.
+
+**The gap.** §7.13's fairness half had three rows with no slice, no acceptance criterion and no
+implementation - FR-1301, FR-1303, FR-1304 - and FR-1303's own text could not be made to agree with
+FR-1308: read as an endpoint limit it gives retries a second slot set, and the receiver sees twice
+the concurrency it was promised; read as a producer quota it needs FR-1301, which does not exist.
+Neither is the mechanism. The budget that separates is the worker's.
+
+**Mechanism.**
+
+- **Class.** `deliveries.attempts = 0` is a first attempt and `> 0` is a retry; a replay creates a
+  new delivery row (FR-1106), so a replayed delivery's first attempt is a first attempt on the
+  first-attempt lane, and FR-1308 keeps it on the endpoint's shared limits.
+- **Claim side.** `pigeon_claim_delivery` gains an attempt-class predicate, so a lane selects only
+  its own class. Today it cannot: it selects `order by d.id limit 1` over every pending delivery
+  (`0013_s5_retry_pause_limits.sql:288-330`), so the oldest row wins and a retry backlog is claimed
+  ahead of every newer first attempt.
+- **Lane side.** The worker runs one claim loop per lane. The first-attempt lane keeps
+  `PIGEON_DELIVERY_CONCURRENCY` (FR-816's per-process cap, default 64); the retry lane gets
+  `PIGEON_DELIVERY_RETRY_CONCURRENCY` (default 16), clamped into
+  `[1, PIGEON_DELIVERY_CONCURRENCY - 1]` so no configuration can starve the first-attempt lane to
+  zero. Both are per process, the scope FR-816's cap and FR-207's rate limits already have (§13.1):
+  the property is that this worker can always start a first attempt, and a cross-replica budget
+  would need Redis on the dispatch path.
+- **A hold is not an attempt.** When the endpoint cannot admit a request (no free slot, empty
+  bucket), the worker MUST NOT sleep holding the claim and the lane slot. `limit.Acquire` and
+  `limit.Allow` already return the wait; the worker reschedules the delivery at `now + wait`,
+  consumes no attempt, leaves `retry_deadline` untouched, and records the hold.
+- **Why the hold is load-bearing, and what it replaces.** `dispatch` claims a delivery and takes
+  the process slot *before* `acquireEndpointLimits` (`internal/delivery/delivery.go:439-486`), then
+  sleeps inside that path (lines 502-534). With `PIGEON_DELIVERY_WORKERS=1`, the shipped default
+  (`internal/config/config.go:166`), one capped endpoint therefore occupies the process's only
+  dispatch loop. An endpoint at its default cap of 10 with 5 s hangs drains at 2 attempts/s, so a
+  due backlog of `D` rows parks that process for `D/2` seconds - 1,000 rows for about 8 minutes -
+  while every other endpoint and producer waits, and nothing says why. That is FR-1304's "silent
+  latency", and it is also the precondition of AC-16's NFR-2 leg: S10 measures that leg, and it
+  cannot pass while the dispatch path parks.
+- **Visibility.** The hold is control state, not evidence: `held_back_since` and `held_back_reason`
+  on the delivery row, returned by the delivery view (FR-1102, FR-1103), plus
+  `endpoint_held_back_total` and `endpoint_held_back_seconds` (OBS-13). The producer portal renders
+  the field because it is a thin API client (M2a, `t_c0144baa`).
+
+**Composition with FR-1308, stated once.** An attempt passes two independent admissions: its lane's
+allowance (FR-1303, platform capacity, per process) and the endpoint's shared limits (FR-1302,
+FR-1306, FR-1308, receiver capacity, cluster-wide). Neither implies the other: the lane decides who
+may start, the endpoint limit decides how many reach the receiver. A retry storm saturates the retry
+lane and the endpoint's shared slots and cannot reach the first-attempt lane; a replay burst
+(FR-1107's 50/s per endpoint) is admitted as first attempts and bounded by the same endpoint limits
+it always was. FR-1308 is neither amended nor weakened here.
+
+**One overloaded phrase, disambiguated.** FR-406 and FR-503 already say that a paused endpoint
+"holds in-flight ones without consuming retry budget" and that an event with no matching
+subscription "consume[s] no retry budget". There, *retry budget* is the **per-delivery** allowance -
+§9's 15 retries inside the 72 h window - and those rows mean the delivery advances no attempt
+counter toward FR-1201's bound. Nothing here changes them, and the two readings agree on every case
+those rows name, because a delivery that is held or paused is not an attempt either way. The phrase
+is now doing two jobs, so this paragraph is where a reader is sent, rather than FR-406 and FR-503
+being rewritten for a distinction their own cases do not turn on.
+
+**FR-1301's split.** Its publish half is met and shipped: FR-207's per-key and per-producer rate
+limits (`internal/ratelimit`, `429` with `Retry-After`, per process). Its delivery-quota half is
+deferred to v1.1 (§17.1) with the cost stated - a producer with many endpoints can occupy the shared
+lanes up to the sum of its endpoints' caps - because the enforcement is a producer-keyed lease
+beside `internal/limit` (the claim row already carries `producer_id`), while the *configurable*
+value is a config surface and an API that v1.0 does not otherwise need. §7.13's row names both
+halves so it stops reading as one unowned claim.
+
+**Trade-off.** A retry lane caps how fast a failing endpoint's backlog drains, and every slot given
+to the retry lane is a slot the first-attempt lane does not have: a deployment that wants one
+endpoint's 20,000-row backlog drained as fast as its cap allows must now raise a knob and pay for it
+in first-attempt capacity. A hold delays a delivery without extending its window, so an endpoint
+saturated for hours can push deliveries past their 72 h deadline that a pause would have extended
+(FR-1207). That is deliberate - the window is the consumer's promise about staleness, and a cap is a
+rate that drains - but it is a real difference and it is stated rather than incidental.
+
+**Rejected.** A second endpoint slot set or bucket for retries (breaks FR-1302 and FR-1308, and
+doubles the burst a capped receiver sees); a per-producer delivery quota as FR-1303's mechanism (a
+different axis, deferred as FR-1301 rather than smuggled in here); lowering
+`PIGEON_DELIVERY_CONCURRENCY` (throttles first attempts, which is the property being protected);
+leaving FR-1303 as prose over one shared pool (what shipped, and the state in which AC-16 cannot
+pass).
+
+**Encoded by.** FR-1303 (rewritten), FR-1304 (rewritten with the hold and its surface), FR-1301
+(halves named), §7.13's mechanism note, AC-52 and AC-53, OBS-13, §17's M3 exit, §17.1's deferral
+row, §19's decision row; `internal/store`'s claim, `internal/delivery`'s dispatch and limiter wait,
+`PIGEON_DELIVERY_RETRY_CONCURRENCY` in `internal/config`; slice S11, card `t_558a9f59`.
+
+## Gap list — eleven decided, one open
 
 Six gaps, each now a decision with a mechanism and a named trade-off. Row 4b is a
 seventh contradiction found while resolving the fourth, recorded here instead of being
@@ -1020,6 +1115,12 @@ is a decision taken *before* its mechanism: §6's attempt-evidence row promised 
 acknowledgement after the commit and said nothing about a cancellation revoking it, and
 the two windows in `Flusher.insert` (A-9) show what that silence cost - a retirement
 delayed by `StaleAfter`, and an entry the stream can never retire.
+
+Row 11 is A-10, found by the review of S5: three rows of §7.13's fairness half had no owner, no
+slice and no implementation, and the one that names a budget could not be read without
+contradicting FR-1308. Row 10 was held for A-9 (card `t_af54d465`), the attempt-buffer
+acknowledgement, while that branch was unlanded, so each row keeps the number it was written with;
+A-9 has since landed into row 10, and the heading's count is now eleven.
 
 | # | Gap | Decision | Contract changed | Unblocks |
 |---|---|---|---|---|
@@ -1033,6 +1134,7 @@ delayed by `StaleAfter`, and an entry the stream can never retire.
 | 8 | D-2 named the Redis Streams pending-entry count as the attempt counter | A-7 | D-2 rewritten to name `deliveries.attempts`; §6's attempt-evidence row names the Redis Stream and its consumer group | S6 (landed), S7's inspect API |
 | 9 | LOG-2's "above 100/s" fixed neither a burst allowance nor a replica count | A-8 | LOG-2, §13.1 and AC-33 state `PIGEON_SUCCESS_LOG_RPS` sustained per process and at most 2 × that in any one-second window | S6 (landed), S10's AC-33 load test |
 | 10 | The acknowledgement could be revoked midway (a batch the flusher cannot hand back), and nothing retired an entry that lost its removal | A-9 | D-9 added; §6's attempt-evidence row states an acknowledgement after the commit that is one transaction and is not revocable by the cancellation ending a pass | S6's flusher (implementation routed separately) |
+| 11 | §7.13's FR-1301, FR-1303 and FR-1304 had no slice, no AC and no implementation, and FR-1303's "separate budget" contradicted FR-1308 read as an endpoint limit | A-10 | FR-1303 and FR-1304 rewritten with the lane and hold mechanisms; FR-1301's halves named (publish = FR-207, delivery deferred to v1.1); AC-52, AC-53 and OBS-13 added; §17's M3 exit and §17.1 amended | S11 (card `t_558a9f59`), and AC-16's NFR-2 leg in S10 |
 
 **They do not contradict each other**, checked pairwise where they touch: A-1's pause
 flags and A-4's archive both ride the control/evidence split in §6 (D-8, FR-812); A-2's
@@ -1051,7 +1153,14 @@ emission, and no requirement names both. A-9 is D-1's buffer again: it moves no 
 no write class, it makes one retirement indivisible and bounded, so A-7's counter, A-8's gate
 and A-2's numbers stay where they were; the one requirement it touches is NFR-6, and it
 touches it by making the gauge that requirement is read from honest rather than by moving its
-bound.
+bound. A-10 reaches the delivery worker's dispatch path: its
+class predicate reads `deliveries.attempts`, which is A-7's counter and not A-9's pending-entry
+list, so A-9's decision does not reach it, and its added delivery columns are read by the
+delivery view A-7 left alone. The check that mattered most is against the rows A-10 amends:
+FR-1308, FR-1302 and FR-1306 are untouched, because no decision in this list adds a second endpoint
+limit, and A-10's lanes are per process exactly as A-8's log gate and FR-207's rate limits are -
+which is also why neither A-10 nor A-8 raises a deployment's ceiling with its replica count without
+saying so.
 
 One thing this list no longer leaves open: whether the endpoint pause threshold scales
 with subscription count. It does - `N = min(active, max(3, ceil(active/4)))` in FR-1203
