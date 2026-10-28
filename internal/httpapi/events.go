@@ -64,6 +64,24 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SB-7: while the volume is over its disk budget, shed load here with a 429
+	// rather than accept events the platform cannot keep. The check is deliberately
+	// before body validation: spending work on a request we are about to refuse is
+	// exactly the wrong thing to do while the disk is the bottleneck. IngestGate
+	// reads a cached gauge (the sweeper refreshes it, and the request path at most
+	// once per TTL), so this does not statfs the volume per publish. A 429 here is
+	// deliberate: Retry-After tells the producer when to come back, and the shed
+	// counter tells "we shed" apart from "we were down" (SB-6).
+	if s.deps.Retention != nil && s.deps.Retention.IngestGate(r.Context()) {
+		if s.deps.Metrics != nil {
+			s.deps.Metrics.RecordShed(1)
+		}
+		w.Header().Set("Retry-After", "30")
+		writeError(w, http.StatusTooManyRequests, "over_budget",
+			"disk usage is above the configured budget; the oldest partitions are being dropped and ingest resumes when it clears")
+		return
+	}
+
 	var in publishRequest
 	if !s.decodePublish(w, r, &in) {
 		return
