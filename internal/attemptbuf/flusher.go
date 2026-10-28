@@ -193,6 +193,12 @@ func (f *Flusher) Run(ctx context.Context) error {
 // Buffer.SweepStranded unchanged and keeps every property that function has: the
 // XLEN <= pending gate, the bound, and a warn line only when it removed
 // something.
+//
+// A sweep that did remove something also records the depth, because the trim
+// moves XLEN with nothing behind it on the insert path: the gauge is otherwise
+// whatever the last committed batch recorded, so a strand this sweep retired
+// would leave OBS-9's queue depth one count high until the next batch - which on
+// an idle process is never, the failure the cadence exists to close.
 func (f *Flusher) sweep(ctx context.Context) {
 	f.lastSweep = time.Now()
 	n, err := f.buf.SweepStranded(ctx)
@@ -212,6 +218,11 @@ func (f *Flusher) sweep(ctx context.Context) {
 		// later sweep (sweepIfDue) rather than this one.
 		f.log.Warn("flusher: swept entries a peer acknowledged but never removed from the stream; a retirement was torn and they had left the pending list",
 			"entries", n)
+		// The trim just moved XLEN and no insert is behind it, so the gauge
+		// would keep the depth those entries had. Recording it here is what
+		// makes the repair visible to an operator rather than only to the
+		// stream.
+		f.depth(ctx)
 	}
 }
 

@@ -362,8 +362,10 @@ func (b *Buffer) Ack(ctx context.Context, ids []string) error {
 }
 
 // SweepStranded removes entries that have left the pending list but not the
-// stream, and returns how many it removed. It runs once at flusher startup,
-// after the initial reclaim (D-9).
+// stream, and returns how many it removed. Run issues it at startup, after the
+// initial reclaim, and then at most once per StaleAfter for as long as it runs
+// (D-9): the call is the same either way, and what a sweep can retire is decided
+// by the bound it reads, not by when it runs.
 //
 // A strand is the tear a transaction cannot cover: an acknowledgement applied in
 // halves by a hard kill between the two commands inside MULTI/EXEC, or by a Redis
@@ -371,8 +373,7 @@ func (b *Buffer) Ack(ctx context.Context, ids []string) error {
 // list, where XAUTOCLAIM can never see it again, and out of the unread range,
 // where Read(">") never returns it either. Only XLEN still counts it, for the
 // life of the stream: the queue-depth gauge OBS-9 watches over-reports forever
-// (NFR-6 can never hold again) until somebody trims it by hand. This is that
-// trim, done once per start.
+// (NFR-6 can never hold again) until a sweep trims it. This is that trim.
 //
 // The entire safety argument is the bound, because XTRIM does not consult the
 // pending list: every entry below it has been delivered (last-delivered-id only
