@@ -266,6 +266,20 @@ func (e *env) countRows(t *testing.T, query string, args ...any) int {
 	return n
 }
 
+// ensurePartition creates the daily partition for a day, the same way fan-out does
+// before it writes a delivery stamped with the event's created_at (SB-1). Under
+// partitioning a row's day is a prerequisite rather than a column value, so a fixture
+// that writes or moves a delivery to an old day has to create that day first - the
+// production path does exactly this (internal/store/fanout.go, EnsurePartitionCached),
+// which is why an event that sat in the outbox for a week still fans out.
+func (e *env) ensurePartition(t *testing.T, table string, day time.Time) {
+	t.Helper()
+	if _, err := e.admin.Exec(context.Background(),
+		`select pigeon_ensure_partition($1, $2::date)`, table, day.UTC().Format("2006-01-02")); err != nil {
+		t.Fatalf("ensure %s partition for %s: %v", table, day.UTC().Format("2006-01-02"), err)
+	}
+}
+
 // bulkDeliveries inserts n delivered deliveries for one tenant and endpoint,
 // each on its own event (the (event_id, endpoint_id) pair is unique), created at
 // the given time.
@@ -276,6 +290,7 @@ func (e *env) countRows(t *testing.T, query string, args ...any) int {
 // the selection the API bounds is the selection a support engineer would see.
 func (e *env) bulkDeliveries(t *testing.T, tn *tenant, consumerID, endpointID, tag string, n int, createdAt time.Time) {
 	t.Helper()
+	e.ensurePartition(t, "deliveries", createdAt)
 	ctx := context.Background()
 	_, err := e.admin.Exec(ctx, `
 		insert into events (id, producer_id, env, event_type, payload_version, routing_mode,
@@ -420,7 +435,11 @@ func TestDeliveryListFiltersAndCursorPagination(t *testing.T) {
 	}
 
 	// Time range. One delivery is aged out of the window by hand, so the filter
-	// is proven to read the column rather than to accept a parameter.
+	// is proven to read the column rather than to accept a parameter. Under SB-1's
+	// partitioning a row's day is a prerequisite, not just a column value: moving a
+	// delivery back in time needs that day's partition to exist, exactly as fan-out
+	// creates the partition for the event's day before it writes a delivery.
+	e.ensurePartition(t, "deliveries", time.Now().Add(-30*24*time.Hour))
 	if _, err := e.admin.Exec(context.Background(),
 		`update deliveries set created_at = now() - interval '30 days' where id = $1`, delivered); err != nil {
 		t.Fatal(err)

@@ -249,6 +249,16 @@ partitions, and drops the legacy tables — all inside `db.Migrate`'s single
 transaction, so a failure leaves the plain tables untouched. Day boundaries are
 UTC so a partition's contents do not depend on the server's `TimeZone`.
 
+**A row's day is a prerequisite, not a column value.** A write, or an update that
+moves a row to a day with no partition, fails with SQLSTATE 23514 (`no partition of
+relation "deliveries" found for row`), so the writer has to create the day first.
+Fan-out does that for the **event's** day before it inserts
+(`internal/store/fanout.go`, `EnsurePartitionCached`) — which is what keeps an event
+that waited in the outbox for a week fannable — and the sweeper creates days ahead of
+today. Nothing in the product moves a row backwards in time (retention only ever
+removes whole partitions), but a fixture or an operator backfill has to create its day
+explicitly; two of S7's inspection-test fixtures that back-dated deliveries now do.
+
 **The dedupe key now includes the partition key.** The first-fan-out arbiter that
 0011 created — `UNIQUE (event_id, endpoint_id) WHERE replay_of_delivery_id IS NULL`
 (A-4) — becomes `UNIQUE (event_id, endpoint_id, created_at) WHERE
@@ -284,7 +294,8 @@ not reached. Renumbering rather than editing an applied migration is deliberate:
 every database that had already applied them.
 
 **Retention windows are configuration, once.** The merged base carried a second,
-day-granularity set of retention knobs (`PIGEON_RETENTION_*_DAYS`) with no consumer,
+day-granularity set of retention knobs (`PIGEON_RETENTION_DELIVERIES_DAYS`,
+`…_ATTEMPTS_DAYS`, `…_EVENTS_DAYS`) with no consumer,
 while `retention.Options` takes durations and S6's
 `PIGEON_RETENTION_DELIVERIES/ATTEMPTS/EVENTS` parse them. The duplicates were removed
 rather than kept: one window, one setting. `PIGEON_RETENTION_MAX_DISK_PCT`,
@@ -337,7 +348,7 @@ run concurrently with itself even across processes; a contended drop returns fal
 and is retried on the next tick.
 
 **Events retention is reported, not enforced.** `events` is not partitioned yet, so
-the configured `PIGEON_RETENTION_EVENTS_DAYS` window appears in the usage payload
+the configured `PIGEON_RETENTION_EVENTS` window appears in the usage payload
 but no partitions are dropped for it. This is a known gap, not a silent promise.
 
 **SB-6's dashboard half has no dashboard to put it in.** SB-6 asks for the disk
