@@ -42,6 +42,11 @@ func valid() Config {
 		RetentionDeliveries:  14 * 24 * time.Hour,
 		RetentionAttempts:    7 * 24 * time.Hour,
 		RetentionEvents:      14 * 24 * time.Hour,
+		// FR-905's archive window. It answers the dedupe question between the
+		// deliveries window and this one, so it is the longest of the four and has
+		// to be here: a hand-built reference config that leaves it zero is refused
+		// by the same SB-5 rule that refuses a zero deliveries window.
+		RetentionDedupe: 30 * 24 * time.Hour,
 	}
 }
 
@@ -300,6 +305,10 @@ func TestValidateRefusesNonPositiveRetention(t *testing.T) {
 		func(c *Config) { c.RetentionDeliveries = 0 },
 		func(c *Config) { c.RetentionAttempts = 0 },
 		func(c *Config) { c.RetentionEvents = 0 },
+		// FR-905's archive window is the same kind of promise about how long an
+		// answer survives, so zero is refused here too rather than meaning "no
+		// archive", which would silently break FR-903's 30 days.
+		func(c *Config) { c.RetentionDedupe = 0 },
 	} {
 		c := valid()
 		zero(&c)
@@ -312,5 +321,8 @@ func TestValidateRefusesNonPositiveRetention(t *testing.T) {
 	d := defaults()
 	if d.RetentionDeliveries != 14*24*time.Hour || d.RetentionAttempts != 7*24*time.Hour || d.RetentionEvents != 14*24*time.Hour {
 		t.Fatalf("SB-5 defaults drifted: %s / %s / %s", d.RetentionDeliveries, d.RetentionAttempts, d.RetentionEvents)
+	}
+	if d.RetentionDedupe != 30*24*time.Hour {
+		t.Fatalf("FR-905 archive default drifted: %s, want 30 d", d.RetentionDedupe)
 	}
 }
