@@ -341,6 +341,15 @@ loop:
 				break loop
 			case <-time.After(d):
 			}
+		} else if now.Sub(next) > interval {
+			// The schedule has fallen more than one slot behind wall clock. Resync
+			// it: a pacer that lags cannot make the instance faster, and if the
+			// schedule is allowed to drift, the phase windows computed below - which
+			// are wall-clock - stop intersecting the samples, which were being
+			// attributed to the schedule. Measured consequence of not resyncing: a
+			// 30-minute run whose last ten minutes contained zero samples, so the
+			// criteria graded an empty window and AC-30 "passed" on no evidence.
+			next = now
 		}
 		select {
 		case <-ctx.Done():
@@ -357,7 +366,11 @@ loop:
 			case sem <- struct{}{}:
 			}
 		}
-		at := next
+		// `at` is when the request was actually sent, not when the schedule said it
+		// should be. With a lagging pacer the two differ by seconds: the phase
+		// windows are wall-clock, and the measured latency has to be the instance's
+		// answer time rather than the time the generator spent waiting for a slot.
+		at := time.Now()
 		next = next.Add(interval)
 		id := seq.Add(1)
 		dispatched.Add(1)
