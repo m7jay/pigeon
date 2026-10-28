@@ -108,13 +108,22 @@ jobs:
           # AC-42 plus MT-1 and D-7's second half) registered theirs the same
           # way, after their PRs merged. AC-16/AC-17 stay S10's: they are
           # load-level criteria and no harness for them exists in the tree.
-          # Where one criterion's own sentence names two outcomes and two
-          # different tests pin them - AC-18's drop and its 429, AC-35's durable
-          # row and its 72 h arithmetic, AC-36's terminal row and its <= 16
-          # attempt bound, AC-37's governing window and the terminal it causes,
-          # AC-42's leadership handover and its single drop - both names are
-          # here: either half can be deleted with the job still green, which is
-          # the failure this list exists to stop.
+          # Where one criterion's own sentence names more than one outcome,
+          # every leg it names has a name here: either leg can otherwise be
+          # deleted with the job still green, which is the failure this list
+          # exists to stop. AC-18 names three - the oldest partition dropped
+          # under disk pressure (TestRunOnceOverBudgetDropsOldestPartitionFirst),
+          # the log record of that drop (TestRunOnceLogsTheDroppedPartition) and
+          # the 429 shed (TestPublishShedsWith429OverDiskBudget). AC-42 names
+          # three - leadership handed over within 30 s
+          # (TestSweeperStandbyTakesOverWhenTheHolderIsKilled), exactly one
+          # partition dropped (TestTwoSweepersDropExactlyOnePartition) and no
+          # delivery re-queued twice, which the pre-existing
+          # TestSweeperRequeuesExpiredLease and
+          # TestLeaseExpiryReclaimsWithoutDuplicateAttempts already pin. AC-35
+          # (durable row and 72 h arithmetic), AC-36 (terminal row and <= 16
+          # attempt bound) and AC-37 (governing window and the terminal it
+          # causes) each name two, and both halves are registered.
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -190,7 +199,8 @@ jobs:
             TestDropPartitionSerialisesWithAConcurrentDrop \
             TestSweeperStandbyTakesOverWhenTheHolderIsKilled \
             TestTwoSweepersDropExactlyOnePartition \
-            TestPartitionLeavesEnforceTenantIsolation
+            TestPartitionLeavesEnforceTenantIsolation \
+            TestRunOnceLogsTheDroppedPartition
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
