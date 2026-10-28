@@ -428,8 +428,9 @@ branch directly, and it still does not merge a PR whose review or CI it has not 
   (measured on run 40653425306). There is no way to re-run a red run, and the only
   lever is a **new head**: GitHub starts a fresh run for a new SHA. An empty commit
   (`git commit --allow-empty`) is not that lever, it is a rerun wearing a commit
-  message. If the failure is a flake, card it first (§9, "CI is red on a test my diff
-  does not touch") and push the retry head after.
+  message. If the failure is a flake, card it - after checking the board for a card
+  that already names the test (§9, "CI is red on a test my diff does not touch") - and
+  push the retry head after.
 
 ## 9. Troubleshooting
 
@@ -443,7 +444,32 @@ branch directly, and it still does not merge a PR whose review or CI it has not 
 | an open PR turns `CLOSED` by itself, right after a merge, and cannot be reopened | its `baseRefName` was the branch that merge deleted — GitHub closes children of a deleted base | open a replacement PR from the same head SHA (`gh pr create --base feat/m0-skeleton --head <branch>`); the old PR is dead. Give the child a real base next time (§3), and never delete a branch that is someone's base (§7 step 7) |
 | a card sits in `review` for hours and no reviewer process appears | the dispatcher refuses the spawn: `task_events` shows `respawn_guarded` with `reason: blocker_auth` about once a minute | the guard matches `tasks.last_failure_error`, and a run's rate-limit text (`exited rate-limited (quota wall)`) is never cleared by the requeue that follows it, so the stale string blocks every later spawn — clear it with the stdlib driver (there is no `sqlite3` CLI on these hosts, only Python's module): `python3 -c "import sqlite3;c=sqlite3.connect('/opt/data/kanban/boards/pigeon/kanban.db');c.execute('UPDATE tasks SET last_failure_error=NULL, consecutive_failures=0 WHERE id=?',('<card-id>',));c.commit()"`; the dispatcher picks the card up on its next tick |
 | `GraphQL: Head branch was modified` on `pr merge` | `--match-head-commit` found the head was not the SHA you supplied — usually a push landed between your read and the merge, occasionally a stale cached head right after a fast push | Read the head without a checkout: `GH=/opt/data/toolchain/gh; $GH api repos/m7jay/pigeon/git/ref/heads/<branch> --jq .object.sha`. **If it equals the SHA you supplied**, retry the merge once. **If it does not**, stop — the head moved: go back to §7 step 1 and review the new head. Never retry against a SHA that is no longer the head, and never drop `--match-head-commit` to get past the error |
-| CI is red on a test my diff does not touch | the `--- FAIL:` names a package the diff never touches: a flake, not your change | read the failing package out of the log (`gh run view <run-id> --log`, the `FAIL <pkg>` line), prove the diff cannot reach it (`git diff --name-only origin/<default-branch>...HEAD` lists no path under that package), card the flake to its owner with the failing test and the code path, and only then push a retry head (a red run cannot be re-run, §8). If the base has moved, merging it into your branch is a legitimate new head (§7 `BEHIND`/`DIRTY`); if it has not, you have no lever at all and say so in the handoff instead of calling the flake a pass. Worked example: `t_1090fb6e` (`internal/attemptbuf` `TestRunRetriesAStuckBatch` failed run 40653425306 at head `b7327759`, on the docs-only PR #27) |
+| CI is red on a test my diff does not touch | the `--- FAIL:` names a package the diff never touches: a flake, not your change | read the failing package out of the log (`gh run view <run-id> --log`, the `FAIL <pkg>` line), prove the diff cannot reach it (`git diff --name-only origin/<default-branch>...HEAD` lists no path under that package), **check the board before you card it** - if a card's title, body or comments already name the test, `kanban_comment` your failing run id, the head and your measurement onto *that* card instead of filing anything (the command under this table lists them); card the flake to its owner with the failing test and the code path only when nothing on the board names it, and only then push a retry head (a red run cannot be re-run, §8). If the base has moved, merging it into your branch is a legitimate new head (§7 `BEHIND`/`DIRTY`); if it has not, you have no lever at all and say so in the handoff instead of calling the flake a pass. Worked example: `t_1090fb6e` (`internal/attemptbuf` `TestRunRetriesAStuckBatch` failed run 40653425306 at head `b7327759`, on the docs-only PR #27) |
+
+**One flake, one card: comment on the existing card, do not file a second.** The check
+above is not a formality. On 28 Oct 2026 `internal/attemptbuf` `TestRunRetriesAStuckBatch`
+was carded three times inside four minutes - `t_07bc844a` (its PR #30 landed the fix at
+`f3af323`), `t_1090fb6e` (the worked example in the row above; it parked its branch as a
+duplicate) and `t_8ba5309b` (it verified the landed fix and yielded) - and each of the
+three root-caused the same window alone, ~40 minutes of duplicated work in one of the runs.
+Nothing was lost only because they deduped by hand: the second said so on the first card,
+the third verified the merge instead of re-implementing it. One commit's worth of change
+came within one push of being reviewed three times, and the reviewer's time is the scarce
+resource in this loop (PR #30 alone carried a four-mutation battery). That hand-dedupe is
+the judgement this rule makes the default. List the board for the test's name:
+
+```bash
+python3 -c "import sqlite3;c=sqlite3.connect('/opt/data/kanban/boards/pigeon/kanban.db');q='%<TestName>%';print('CARDS');print(*c.execute('SELECT id,status,substr(title,1,70) FROM tasks WHERE title LIKE ? OR body LIKE ? ORDER BY created_at DESC',(q,q)),sep='\n');print('COMMENTS');print(*c.execute('SELECT DISTINCT task_id,substr(body,1,70) FROM task_comments WHERE body LIKE ?',(q,)),sep='\n')"
+```
+
+`<TestName>` is the symbol from the `--- FAIL:` line. Read a candidate with
+`kanban_show(task_id=...)`, ignore your own card id, and let the status column decide: a
+`done` card (or one whose fix has already merged) means **verify the landed SHA and record
+that on the existing card**, do not re-open the work; `running`/`todo`/`review`/`blocked`
+means **comment your measurement and the failing run id on that card**; nothing on the
+board means card it to its owner as the row says. In every case name the card you deduped
+onto in your own handoff. A second card, or a second PR, for a flake an existing card
+already names is the failure this step exists to prevent.
 
 ## 10. Rollback and revocation
 
