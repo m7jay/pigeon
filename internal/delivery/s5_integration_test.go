@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/m7jay/pigeon/internal/config"
 	"github.com/m7jay/pigeon/internal/limit"
+	"github.com/m7jay/pigeon/internal/metrics"
 	"github.com/m7jay/pigeon/internal/pause"
 	"github.com/m7jay/pigeon/internal/store"
 )
@@ -122,15 +124,22 @@ func (f *s5Fixture) options(mutate func(*Options)) Options {
 }
 
 // publish registers one event of eventType and fans it out, returning the event id
-// and the delivery it produced for the fixture's endpoint.
+// and the delivery it produced for the fixture's endpoint (f.endpointID).
 func (f *s5Fixture) publish(t *testing.T, eventType, payload string) (string, int64) {
+	return f.publishTo(t, f.consumerRef, f.endpointID, eventType, payload)
+}
+
+// publishTo registers one event of eventType on a given endpoint, returning the
+// event id and the delivery it produced for endpointID. The consumerRef must be
+// the ref of a consumer that has a subscription for eventType on endpointID.
+func (f *s5Fixture) publishTo(t *testing.T, consumerRef, endpointID string, eventType, payload string) (string, int64) {
 	t.Helper()
 	ctx := context.Background()
-	ref := f.consumerRef
 	pub, err := f.st.PublishEvent(ctx, f.sc, store.PublishInput{
-		EventType: eventType, Payload: json.RawMessage(payload), ConsumerRef: &ref,
+		EventType: eventType, Payload: json.RawMessage(payload), ConsumerRef: &consumerRef,
 	})
 	if err != nil {
+		t.Logf("payload=[%s] err=[%v]", payload, err)
 		t.Fatalf("PublishEvent(%s): %v", eventType, err)
 	}
 	if _, err := f.st.FanOutEvent(ctx, f.sc, pub.ID); err != nil {
@@ -139,8 +148,8 @@ func (f *s5Fixture) publish(t *testing.T, eventType, payload string) (string, in
 	var deliveryID int64
 	if err := f.admin.QueryRow(ctx,
 		`select id from deliveries where event_id=$1 and endpoint_id=$2`,
-		pub.ID, f.endpointID).Scan(&deliveryID); err != nil {
-		t.Fatalf("resolve delivery for %s: %v", eventType, err)
+		pub.ID, endpointID).Scan(&deliveryID); err != nil {
+		t.Fatalf("resolve delivery for %s on %s: %v", eventType, endpointID, err)
 	}
 	return pub.ID, deliveryID
 }
@@ -1329,5 +1338,660 @@ func TestFR1207EndpointResumeKeepsAStampedDeadline(t *testing.T) {
 	}
 	if delta > paused+paused/2 {
 		t.Errorf("the stamped deadline moved %s, want the %s pause added once, not twice (FR-1207)", delta, paused)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// S11 (FR-1303, FR-1304; SPEC.md A-10): the attempt-class lanes and the visible
+// hold.
+//
+// Three properties are pinned here. The two lanes PARTITION the process attempt
+// budget, so retry work cannot consume the allowance a first attempt draws on
+// while attempts in flight for one process still total at most C. An endpoint
+// that cannot admit a request is HELD - recorded on the row, visible to the
+// producer, consuming no attempt and moving no window - instead of parking the
+// dispatch path on it. And the parking this card exists for is pinned as a
+// regression: at the base the healthy endpoint's delivery waits behind the capped
+// endpoint's backlog; here it does not.
+// ---------------------------------------------------------------------------
+
+// addEndpoint registers one more consumer (its ref must be unused under the
+// fixture's producer) with a verified endpoint subscribed to every eventType, and
+// returns the consumer's ref and the endpoint's id.
+func (f *s5Fixture) addEndpoint(t *testing.T, consumerRef, name, url string, eventTypes ...string) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	con, err := f.st.CreateConsumer(ctx, f.sc, consumerRef, "Consumer "+consumerRef)
+	if err != nil {
+		t.Fatalf("CreateConsumer(%s): %v", consumerRef, err)
+	}
+	created, err := f.st.CreateEndpoint(ctx, f.sc, store.NewEndpoint{
+		ConsumerID: con.ID, Name: name, URL: url, Internal: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateEndpoint(%s): %v", name, err)
+	}
+	if err := f.st.VerifyEndpoint(ctx, f.sc, created.Endpoint.ID, created.VerificationToken); err != nil {
+		t.Fatalf("VerifyEndpoint(%s): %v", name, err)
+	}
+	for _, et := range eventTypes {
+		if _, err := f.st.CreateSubscription(ctx, f.sc, store.NewSubscription{
+			EndpointID: created.Endpoint.ID, EventType: et,
+		}); err != nil {
+			t.Fatalf("CreateSubscription(%s on %s): %v", et, name, err)
+		}
+	}
+	return con.Ref, created.Endpoint.ID
+}
+
+// capEndpoint writes limit columns on an endpoint by id: the fixture's setEndpoint
+// only reaches the fixture's own endpoint, and these tests need a second one with
+// its own cap (FR-1302) or rate (FR-1306).
+func (f *s5Fixture) capEndpoint(t *testing.T, endpointID, assignment string) {
+	t.Helper()
+	if _, err := f.admin.Exec(context.Background(),
+		`update endpoints set `+assignment+` where id=$1`, endpointID); err != nil {
+		t.Fatalf("update endpoint %s (%s): %v", endpointID, assignment, err)
+	}
+}
+
+// seedRetryBacklog flips every delivery on one endpoint to a RETRY
+// (deliveries.attempts = 1), which is the only thing that puts a row on FR-1303's
+// retry lane: a delivery's class is its own counter, never how it was published.
+func seedRetryBacklog(t *testing.T, admin *pgxpool.Pool, endpointID string) {
+	t.Helper()
+	if _, err := admin.Exec(context.Background(),
+		`update deliveries set attempts = 1 where endpoint_id = $1`, endpointID); err != nil {
+		t.Fatalf("seed retry backlog on %s: %v", endpointID, err)
+	}
+}
+
+// deliveryRow is the durable state FR-1304's contract turns on, read back from the
+// row rather than inferred from what the worker did.
+type deliveryRow struct {
+	attempts       int
+	status         string
+	heldSince      sql.NullTime
+	heldReason     sql.NullString
+	retryDeadline  sql.NullTime
+	gate           sql.NullTime // next_attempt_at, the instant the row is claimable again
+	firstAttemptAt sql.NullTime
+	attemptRows    int
+}
+
+func readDelivery(t *testing.T, f *s5Fixture, deliveryID int64) deliveryRow {
+	t.Helper()
+	ctx := context.Background()
+	var d deliveryRow
+	if err := f.admin.QueryRow(ctx,
+		`select attempts, status, held_back_since, held_back_reason, retry_deadline,
+		        next_attempt_at, first_attempt_at
+		   from deliveries where id = $1`, deliveryID).
+		Scan(&d.attempts, &d.status, &d.heldSince, &d.heldReason, &d.retryDeadline,
+			&d.gate, &d.firstAttemptAt); err != nil {
+		t.Fatalf("read delivery %d: %v", deliveryID, err)
+	}
+	if err := f.admin.QueryRow(ctx,
+		`select count(*) from attempts where delivery_id = $1`, deliveryID).Scan(&d.attemptRows); err != nil {
+		t.Fatalf("count attempt rows for %d: %v", deliveryID, err)
+	}
+	return d
+}
+
+// waitFor polls until cond holds, up to budget, and reports whether it did. The
+// conditions here are durable-state reads (a hold on a row, an attempt that
+// started), never a guess at a sleep.
+func waitFor(budget time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}
+
+// pendingOn counts the still-pending deliveries of one endpoint: the backlog that
+// is either due or held, and so the work still standing in front of anything
+// published after it.
+func pendingOn(t *testing.T, admin *pgxpool.Pool, endpointID string) int {
+	t.Helper()
+	var n int
+	if err := admin.QueryRow(context.Background(),
+		`select count(*) from deliveries where endpoint_id = $1 and status = 'pending'`, endpointID).Scan(&n); err != nil {
+		t.Fatalf("count pending deliveries on %s: %v", endpointID, err)
+	}
+	return n
+}
+
+// runWorker starts one worker on the fixture with the given options and stops it
+// when the test ends.
+func (f *s5Fixture) runWorker(t *testing.T, mutate func(*Options)) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = New(f.st, f.options(mutate)).Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+}
+
+// TestAC52DeliveryLanesPartitionTheProcessBudget is AC-52's lane half (FR-1303):
+// one endpoint at its cap holding a due RETRY backlog, a second endpoint healthy
+// with due FIRST attempts, and one process serving both. The retry backlog keeps
+// the retry lane busy for the whole window; the healthy endpoint's first attempts
+// must keep being claimed and started alongside it; retries in flight never exceed
+// R, first attempts never exceed C - R, and the two together never exceed C.
+//
+// "The first-attempt lane is never empty" is deliberately NOT the assertion: a
+// lane's allowance is an allowance, not an occupancy (a lane is empty whenever
+// nothing of its class is in flight, which a correct implementation does all the
+// time). What is asserted is that the allowance is never consumed by the other
+// class, and that first attempts make progress throughout the drain.
+func TestAC52DeliveryLanesPartitionTheProcessBudget(t *testing.T) {
+	const (
+		processCap  = 4 // PIGEON_DELIVERY_CONCURRENCY, FR-816's per-process cap
+		retryLane   = 2 // PIGEON_DELIVERY_RETRY_CONCURRENCY, FR-1303's R
+		firstLane   = processCap - retryLane
+		endpointCap = 2
+		dueRetry    = 60
+		dueFirst    = 20
+		service     = 100 * time.Millisecond
+	)
+
+	// The shipped defaults come from the deployment's own loader rather than from
+	// numbers written here: R is partitioned OUT of C, so the first-attempt lane
+	// keeps C - R and neither allowance may be zero at a deployment's defaults.
+	t.Setenv("PIGEON_DATABASE_URL", "postgres://unused/unused?sslmode=disable")
+	t.Setenv("PIGEON_REDIS_URL", "redis://unused:6379/0")
+	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "not-the-documented-weak-default")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load with the required variables set: %v", err)
+	}
+	if cfg.DeliveryConcurrency != 64 || cfg.DeliveryRetryConcurrency != 16 {
+		t.Errorf("shipped lane defaults are C=%d R=%d, want C=64 and R=16 (FR-1303)",
+			cfg.DeliveryConcurrency, cfg.DeliveryRetryConcurrency)
+	}
+	if first := cfg.DeliveryConcurrency - cfg.DeliveryRetryConcurrency; first < 1 {
+		t.Errorf("the shipped partition leaves the first-attempt lane %d slots (FR-1303)", first)
+	}
+
+	// Each receiver takes a fixed 100 ms, so the number of handlers running at once
+	// IS the number of attempts in flight - the shape AC-41 measures with.
+	var retrySide, firstSide inFlightCounter
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		retrySide.enter()
+		time.Sleep(service)
+		retrySide.leave()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstSide.enter()
+		time.Sleep(service)
+		firstSide.leave()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srvB.Close()
+
+	// The capped endpoint is the fixture's own, at FR-1302's cap, holding a due
+	// retry backlog (FR-1303's class predicate is `deliveries.attempts > 0`).
+	f := newS5Fixture(t, srvA.URL, "order.created")
+	f.setEndpoint(t, `max_concurrency = `+strconv.Itoa(endpointCap))
+	for i := 0; i < dueRetry; i++ {
+		f.publish(t, "order.created", `{"id":"retry-`+strconv.Itoa(i)+`"}`)
+	}
+	seedRetryBacklog(t, f.admin, f.endpointID)
+
+	// The healthy endpoint: a second one, capped well above the process budget so
+	// that only FR-1303's lanes can bound this process, holding due first attempts.
+	refB, idB := f.addEndpoint(t, "school_s11b", "eB", srvB.URL, "order.created")
+	f.capEndpoint(t, idB, "max_concurrency = 20")
+	for i := 0; i < dueFirst; i++ {
+		f.publishTo(t, refB, idB, "order.created", `{"id":"first-`+strconv.Itoa(i)+`"}`)
+	}
+
+	f.runWorker(t, func(o *Options) {
+		o.Concurrency = processCap
+		o.RetryConcurrency = retryLane
+		o.Limits = f.limits
+		o.MaxConnsPerHost = 10
+		o.PollInterval = time.Millisecond
+	})
+
+	// Observe the drain. The assertion is progress-based rather than rate-based, so
+	// a slower box (or a busy shared Postgres) makes the test take longer rather
+	// than fail: AC-52 is about one class not consuming the other's allowance, not
+	// about a throughput number. Sampling stops once BOTH classes have made
+	// progress - the retry backlog is being served AND first attempts keep being
+	// claimed and started - or the budget runs out.
+	const progress = 3
+	var worstRetry, worstFirst, worstTotal, startedRetry, startedFirst int
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		curRetry, peakRetry, startRetry := retrySide.snapshot()
+		curFirst, peakFirst, startFirst := firstSide.snapshot()
+		worstRetry = max(worstRetry, peakRetry)
+		worstFirst = max(worstFirst, peakFirst)
+		worstTotal = max(worstTotal, curRetry+curFirst)
+		startedRetry, startedFirst = startRetry, startFirst
+		if startedRetry >= progress && startedFirst >= progress {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if startedRetry < progress {
+		t.Errorf("the capped endpoint served %d of its %d due retries in 30s: the retry lane was idle, so its bound proves nothing (FR-1303)",
+			startedRetry, dueRetry)
+	}
+	if startedFirst < progress {
+		t.Errorf("the healthy endpoint started %d of its %d due first attempts while the retry backlog drained (FR-1303)",
+			startedFirst, dueFirst)
+	}
+	// The two classes overlapped: first attempts were starting while the capped
+	// endpoint still had a backlog due. Without that overlap the bounds below prove
+	// nothing - a lane that is never busy cannot overrun its allowance.
+	if stillDue := pendingOn(t, f.admin, f.endpointID); stillDue == 0 {
+		t.Errorf("the retry backlog had already drained when the first-attempt progress was observed, so the two classes never overlapped (FR-1303)")
+	} else {
+		t.Logf("first attempts started (%d) with %d of the capped endpoint's %d due retries still pending",
+			startedFirst, stillDue, dueRetry)
+	}
+	if worstFirst == 0 {
+		t.Error("no first attempt was ever in flight; the first-attempt lane was starved by the retry backlog (FR-1303)")
+	}
+	if worstRetry > retryLane {
+		t.Errorf("retry attempts in flight peaked at %d, want <= R = %d (FR-1303)", worstRetry, retryLane)
+	}
+	if worstFirst > firstLane {
+		t.Errorf("first-attempt attempts in flight peaked at %d, want <= C - R = %d (FR-1303)", worstFirst, firstLane)
+	}
+	if worstTotal > processCap {
+		t.Errorf("attempts in flight across both lanes peaked at %d, want <= C = %d (FR-816: the lanes partition the budget, they do not add to it)",
+			worstTotal, processCap)
+	}
+}
+
+// TestAC52SharedLaneAtOneProcessSlotRunsBothClasses is A-10's boundary: the clamp
+// reaches R = 0 only at C = 1, where ONE lane serves both classes because a
+// degenerate partition MUST NOT starve FR-1201's retry policy. The assertion is
+// progress - both a first attempt and a retry get attempted, with at most one in
+// flight - not the lane bounds, which are not claimed at that boundary.
+func TestAC52SharedLaneAtOneProcessSlotRunsBothClasses(t *testing.T) {
+	var served inFlightCounter
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		served.enter()
+		defer served.leave()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	f := newS5Fixture(t, srv.URL, "order.created")
+	_, firstID := f.publish(t, "order.created", `{"id":"first"}`)
+	_, retryID := f.publish(t, "order.created", `{"id":"retry"}`)
+	if _, err := f.admin.Exec(context.Background(),
+		`update deliveries set attempts = 1 where id = $1`, retryID); err != nil {
+		t.Fatalf("seed the retry: %v", err)
+	}
+
+	f.runWorker(t, func(o *Options) {
+		// C = 1 is the only configuration that reaches R = 0.
+		o.Concurrency = 1
+		o.RetryConcurrency = 1
+		o.Limits = f.limits
+		o.MaxConnsPerHost = 10
+		o.PollInterval = time.Millisecond
+	})
+
+	delivered := func() bool {
+		var n int
+		if err := f.admin.QueryRow(context.Background(),
+			`select count(*) from deliveries where status = 'delivered'`).Scan(&n); err != nil {
+			t.Fatalf("count delivered: %v", err)
+		}
+		return n == 2
+	}
+	if !waitFor(10*time.Second, delivered) {
+		first, retry := readDelivery(t, f, firstID), readDelivery(t, f, retryID)
+		t.Fatalf("at C = 1 one shared lane must still run both classes: first attempt is %s (attempts %d), retry is %s (attempts %d) (FR-1201, FR-1303)",
+			first.status, first.attempts, retry.status, retry.attempts)
+	}
+	if _, peak, started := served.snapshot(); peak != 1 {
+		t.Errorf("at C = 1 the process ran %d attempts at once (started %d), want exactly 1 (FR-816, FR-1303)", peak, started)
+	}
+	for _, tc := range []struct {
+		name string
+		id   int64
+	}{{"first attempt", firstID}, {"retry", retryID}} {
+		row := readDelivery(t, f, tc.id)
+		if row.status != "delivered" || !row.firstAttemptAt.Valid {
+			t.Errorf("%s: status %s, first_attempt_at %v; the shared lane did not attempt it (FR-1201)",
+				tc.name, row.status, row.firstAttemptAt)
+		}
+	}
+}
+
+// TestAC53HoldOnTheEndpointConcurrencyCap is AC-53's concurrency leg (FR-1304): an
+// endpoint at its cap with deliveries due. Nothing is attempted and no attempt row
+// is written; each held delivery carries held_back_since and a reason, the delivery
+// view returns them, endpoint_held_back_total advances, retry_deadline is unchanged
+// and deliveries.attempts does not advance; and when the cap frees, the delivery's
+// next attempt is the one it already owed.
+func TestAC53HoldOnTheEndpointConcurrencyCap(t *testing.T) {
+	const (
+		processCap  = 4
+		retryLane   = 2
+		endpointCap = 1
+		slotTTL     = 1500 * time.Millisecond
+	)
+
+	var served atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		served.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	f := newS5Fixture(t, srv.URL, "order.created")
+	f.setEndpoint(t, `max_concurrency = 1`)
+	_, deliveryID := f.publish(t, "order.created", `{"id":"held"}`)
+	before := readDelivery(t, f, deliveryID)
+	if before.attempts != 0 || before.retryDeadline.Valid || before.heldSince.Valid {
+		t.Fatalf("the delivery is not in its pristine state: %+v", before)
+	}
+
+	// Put the endpoint AT its cap through the real limiter (FR-1307): one slot
+	// leased by a holder that is not this delivery, which is what another replica's
+	// in-flight attempt looks like in the shared slot set. The lease is short so the
+	// test does not have to wait a whole SlotTTL for the cap to free, and the
+	// worker's own SlotTTL stays at the shipped 3 x timeout ratio.
+	ctx := context.Background()
+	holder, ok, _, err := f.limits.Acquire(ctx, f.endpointID, endpointCap, slotTTL, "s11-test-holder")
+	if err != nil {
+		t.Fatalf("lease the endpoint's slot: %v", err)
+	}
+	if !ok {
+		t.Fatalf("the endpoint's slot set was not empty: ok=%v", ok)
+	}
+
+	m := metrics.New()
+	f.runWorker(t, func(o *Options) {
+		o.Concurrency = processCap
+		o.RetryConcurrency = retryLane
+		o.Limits = f.limits
+		o.MaxConnsPerHost = 10
+		o.PollInterval = time.Millisecond
+		o.Metrics = m
+	})
+
+	if !waitFor(5*time.Second, func() bool { return readDelivery(t, f, deliveryID).heldSince.Valid }) {
+		t.Fatal("a delivery due at a capped endpoint was never held back: it was either attempted (FR-1304) or never claimed")
+	}
+	held := readDelivery(t, f, deliveryID)
+	if held.heldReason.String != HoldReasonConcurrency {
+		t.Errorf("held_back_reason is %q, want %q (FR-1302's cap is what refused it)", held.heldReason.String, HoldReasonConcurrency)
+	}
+	if got := served.Load(); got != 0 {
+		t.Errorf("%d requests reached the endpoint's receiver while the delivery was held; a held delivery MUST NOT be attempted (FR-1304)", got)
+	}
+	if held.attemptRows != 0 {
+		t.Errorf("%d attempt rows were written for a held delivery; the producer must see the hold, not a slow attempt (FR-1304)", held.attemptRows)
+	}
+	if held.attempts != before.attempts {
+		t.Errorf("deliveries.attempts advanced from %d to %d on a hold; a hold consumes no attempt (FR-1304)", before.attempts, held.attempts)
+	}
+	if held.retryDeadline != before.retryDeadline {
+		t.Errorf("retry_deadline moved from %v to %v on a hold; only a pause extends the window (FR-1207, FR-1304)",
+			before.retryDeadline, held.retryDeadline)
+	}
+	if !held.gate.Valid || !held.gate.Time.After(held.heldSince.Time) {
+		t.Errorf("the claim gate is %v, not after the hold started at %v: a held delivery must not be re-claimed in the same instant (FR-1304)",
+			held.gate, held.heldSince)
+	}
+	if got := m.HeldBackFor(f.endpointID); got.Total < 1 || got.Seconds() <= 0 {
+		t.Errorf("endpoint_held_back_total is %d and the held seconds are %v, want both to advance (OBS-13, FR-1304)",
+			got.Total, got.Seconds())
+	}
+
+	// The delivery view (FR-1102/FR-1103) is where the producer reads the hold.
+	detail, err := f.st.GetDelivery(ctx, f.sc, deliveryID)
+	if err != nil {
+		t.Fatalf("GetDelivery: %v", err)
+	}
+	if detail.Delivery.HeldBackSince == nil || detail.Delivery.HeldBackReason == nil {
+		t.Errorf("the delivery view returned held_back_since=%v held_back_reason=%v, want both set (FR-1102, FR-1103)",
+			detail.Delivery.HeldBackSince, detail.Delivery.HeldBackReason)
+	} else {
+		if !detail.Delivery.HeldBackSince.Equal(held.heldSince.Time) {
+			t.Errorf("the view reports the hold starting at %v, the row at %v", detail.Delivery.HeldBackSince, held.heldSince.Time)
+		}
+		if *detail.Delivery.HeldBackReason != HoldReasonConcurrency {
+			t.Errorf("the view reports reason %q, want %q", *detail.Delivery.HeldBackReason, HoldReasonConcurrency)
+		}
+	}
+
+	// A second refusal is the same episode: held_back_since is the START of the
+	// hold, not the instant of the last refusal (FR-1304's "since when").
+	again, err := f.st.HoldDelivery(ctx, deliveryID, HoldReasonConcurrency, held.gate.Time)
+	if err != nil {
+		t.Fatalf("re-record the hold: %v", err)
+	}
+	if !again {
+		t.Fatal("re-recording the hold on a still-pending delivery reported that nothing was held")
+	}
+	if second := readDelivery(t, f, deliveryID); !second.heldSince.Time.Equal(held.heldSince.Time) {
+		t.Errorf("held_back_since moved from %v to %v on a repeated refusal; it is the start of the episode",
+			held.heldSince.Time, second.heldSince.Time)
+	}
+	// A hold on a row that is no longer pending is a no-op, not an error: another
+	// worker may have finished the delivery while this one was refused admission.
+	if held, err := f.st.HoldDelivery(ctx, 1<<62, HoldReasonConcurrency, time.Now().Add(time.Second)); err != nil || held {
+		t.Errorf("holding a delivery that does not exist = (%v, %v), want (false, nil) (FR-1304)", held, err)
+	}
+
+	// Free the cap, then let the hold lapse: the next attempt is the one the
+	// delivery already owed - attempt 1, with no attempt consumed by the hold.
+	holder.Release(ctx)
+	if !waitFor(10*time.Second, func() bool { return readDelivery(t, f, deliveryID).firstAttemptAt.Valid }) {
+		t.Fatal("the delivery was never attempted after its endpoint's cap freed (FR-1304)")
+	}
+	after := readDelivery(t, f, deliveryID)
+	if after.status != "delivered" {
+		t.Errorf("status is %s after the cap freed, want delivered (the attempt it owed)", after.status)
+	}
+	if after.attempts != 1 {
+		t.Errorf("deliveries.attempts is %d after its first attempt, want 1: the hold consumed an attempt (FR-1304)", after.attempts)
+	}
+	if after.attemptRows != 0 {
+		t.Errorf("%d attempt rows were written for a successful first attempt (FR-811, AC-28)", after.attemptRows)
+	}
+	if after.heldSince.Valid {
+		t.Errorf("held_back_since is still %v after the attempt started; the hold ends when the attempt runs (FR-1304)", after.heldSince.Time)
+	}
+	if got := served.Load(); got != 1 {
+		t.Errorf("the receiver served %d requests, want exactly the one attempt the delivery owed", got)
+	}
+}
+
+// TestAC53HoldOnTheEndpointsEmptyRateBucket is AC-53's second leg (FR-1306): the
+// endpoint's concurrency is free and its rate bucket is empty. The delivery is held
+// for the same reason shape, with the OTHER limiter named in the reason, and no
+// attempt is made or recorded.
+func TestAC53HoldOnTheEndpointsEmptyRateBucket(t *testing.T) {
+	var served atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		served.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	f := newS5Fixture(t, srv.URL, "order.created")
+	// Cap high, rate 1/s: the concurrency step admits, the bucket is what refuses,
+	// and the wait the limiter reports is long enough to observe (FR-1306).
+	f.setEndpoint(t, `max_concurrency = 20, max_rps = 1`)
+	ctx := context.Background()
+	_, deliveryID := f.publish(t, "order.created", `{"id":"rate-held"}`)
+	before := readDelivery(t, f, deliveryID)
+
+	// Empty the bucket: FR-1306's bucket is a Redis hash the limiter refills
+	// continuously, and an empty one is what an endpoint whose traffic has outrun
+	// its rate looks like.
+	if err := f.rdb.HSet(ctx, limit.RPSKey(f.endpointID), "tokens", float64(0), "ts", time.Now().UnixMilli()).Err(); err != nil {
+		t.Fatalf("empty the rate bucket: %v", err)
+	}
+
+	m := metrics.New()
+	f.runWorker(t, func(o *Options) {
+		o.Concurrency = 4
+		o.RetryConcurrency = 2
+		o.Limits = f.limits
+		o.MaxConnsPerHost = 10
+		o.PollInterval = time.Millisecond
+		o.Metrics = m
+	})
+
+	if !waitFor(5*time.Second, func() bool { return readDelivery(t, f, deliveryID).heldSince.Valid }) {
+		t.Fatal("a delivery due at an endpoint whose rate bucket is empty was never held back (FR-1304, FR-1306)")
+	}
+	held := readDelivery(t, f, deliveryID)
+	if held.heldReason.String != HoldReasonRate {
+		t.Errorf("held_back_reason is %q, want %q (FR-1306's bucket is what refused it)", held.heldReason.String, HoldReasonRate)
+	}
+	if got := served.Load(); got != 0 {
+		t.Errorf("%d requests reached the receiver while the delivery was held (FR-1304)", got)
+	}
+	if held.attemptRows != 0 || held.attempts != before.attempts {
+		t.Errorf("a held delivery took an attempt: %d rows, attempts %d -> %d (FR-1304)",
+			held.attemptRows, before.attempts, held.attempts)
+	}
+	if held.retryDeadline != before.retryDeadline {
+		t.Errorf("retry_deadline moved from %v to %v on a hold (FR-1207, FR-1304)", before.retryDeadline, held.retryDeadline)
+	}
+	if got := m.HeldBackFor(f.endpointID); got.Total < 1 || got.Seconds() <= 0 {
+		t.Errorf("endpoint_held_back_total is %d and the held seconds are %v, want both to advance (OBS-13)", got.Total, got.Seconds())
+	}
+
+	// And when the bucket refills, the delivery's owed attempt is the one that runs.
+	if !waitFor(10*time.Second, func() bool { return readDelivery(t, f, deliveryID).firstAttemptAt.Valid }) {
+		t.Fatal("the delivery was never attempted after its endpoint's rate bucket refilled (FR-1306)")
+	}
+	if after := readDelivery(t, f, deliveryID); after.attempts != 1 || after.status != "delivered" {
+		t.Errorf("after the bucket refilled: status %s, attempts %d; want delivered on attempt 1 (FR-1304)", after.status, after.attempts)
+	}
+}
+
+// TestAC52RegressionHealthyEndpointNotParkedBehindCappedBacklog is the regression
+// pin for the failure this card fixes. At the base, one claim loop takes the
+// process slot, claims the oldest due row (the capped endpoint's backlog), and
+// SLEEPS on the limiter while holding both - so the healthy endpoint's delivery,
+// which stands behind that backlog in id order, waits a full slot TTL or more.
+// After the change the healthy endpoint's first attempt starts as soon as the
+// worker does, and the capped backlog cannot be in its way.
+//
+// The measured number is publish -> first attempt at the healthy endpoint; the
+// threshold is 2 s, against a base that parks for a whole slot TTL per refused
+// admission (3 s here, the shipped 3 x attempt-timeout ratio).
+func TestAC52RegressionHealthyEndpointNotParkedBehindCappedBacklog(t *testing.T) {
+	const (
+		processCap  = 4
+		retryLane   = 2
+		endpointCap = 2
+		dueBacklog  = 5
+		// probeBudget bounds the wait for the healthy endpoint's first attempt, and
+		// threshold is the wall-clock guard under it: the property is the overlap
+		// asserted below, and the clock is only what makes the base's parking
+		// visible (it measures 15.9 s there, so 3 s separates the two cleanly).
+		probeBudget = 5 * time.Second
+		threshold   = 3 * time.Second
+	)
+
+	// The capped endpoint's receiver holds every request until the test ends, so its
+	// slots stay leased for the whole run: that is the saturated endpoint whose
+	// backlog parks a shared dispatch path. The release is closed by a cleanup
+	// registered AFTER the server's, so it runs FIRST (cleanups are LIFO) and
+	// httptest's Close never waits on a handler that is still parked.
+	release := make(chan struct{})
+	var backlogServed atomic.Int32
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backlogServed.Add(1)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srvA.Close)
+	t.Cleanup(func() { close(release) })
+
+	f := newS5Fixture(t, srvA.URL, "order.created")
+	f.setEndpoint(t, `max_concurrency = `+strconv.Itoa(endpointCap))
+	for i := 0; i < dueBacklog; i++ {
+		f.publish(t, "order.created", `{"id":"backlog-`+strconv.Itoa(i)+`"}`)
+	}
+	seedRetryBacklog(t, f.admin, f.endpointID)
+
+	// The healthy endpoint: its own receiver, one due first-attempt delivery
+	// published AFTER the backlog, so at the base it is the last row in id order.
+	firstAttempt := make(chan time.Time, 1)
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case firstAttempt <- time.Now():
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srvB.Close()
+	refB, idB := f.addEndpoint(t, "school_s11c", "eC", srvB.URL, "order.created")
+	f.capEndpoint(t, idB, "max_concurrency = 20")
+	// The healthy endpoint's one due first attempt is published AFTER the backlog,
+	// so it is the youngest row: at the base it is the last one the single loop
+	// would reach.
+	f.publishTo(t, refB, idB, "order.created", `{"id":"healthy"}`)
+
+	f.runWorker(t, func(o *Options) {
+		o.Concurrency = processCap
+		o.RetryConcurrency = retryLane
+		o.Limits = f.limits
+		o.MaxConnsPerHost = 10
+		o.PollInterval = time.Millisecond
+		o.Timeout = time.Second
+		o.SlotTTL = 3 * time.Second
+	})
+	published := time.Now()
+	var arrived time.Time
+	served := waitFor(probeBudget, func() bool {
+		select {
+		case arrived = <-firstAttempt:
+			return true
+		default:
+			return false
+		}
+	})
+	elapsed := arrived.Sub(published)
+	if !served {
+		elapsed = time.Since(published)
+	}
+	t.Logf("healthy endpoint publish->first-attempt: %s (the capped endpoint had served %d requests and still had %d of its %d deliveries pending)",
+		elapsed.Round(time.Millisecond), backlogServed.Load(), pendingOn(t, f.admin, f.endpointID), dueBacklog)
+	if !served {
+		t.Fatalf("the healthy endpoint's first attempt had not started %s after publish, want it while the capped endpoint's backlog is still there: the dispatch path is parked behind that backlog (FR-1303, FR-1304)",
+			elapsed.Round(time.Millisecond))
+	}
+	if elapsed >= threshold {
+		t.Errorf("the healthy endpoint's publish->first-attempt took %s, want < %s: the dispatch path is parked behind the capped endpoint's backlog (FR-1303, FR-1304)",
+			elapsed.Round(time.Millisecond), threshold)
+	}
+	// And it started while the backlog was still there, which is the property rather
+	// than a wall clock: at the base the single loop works through that backlog
+	// first (a whole slot TTL parked on each refused admission), so the healthy
+	// endpoint's row is reached only after every backlog delivery has been claimed.
+	if still := pendingOn(t, f.admin, f.endpointID); still < dueBacklog {
+		t.Errorf("the healthy endpoint's first attempt started only after %d of the capped endpoint's %d deliveries had left the pending set, so it waited behind the backlog (FR-1303)",
+			dueBacklog-still, dueBacklog)
 	}
 }
