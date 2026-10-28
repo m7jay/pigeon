@@ -10,6 +10,7 @@
 <div class="userbox">
   {{if .Email}}<span class="user-email">{{.Email}}</span>
   <form method="post" action="/logout" class="inline">
+    {{template "csrf_field" .}}
     <button class="link-btn" type="submit">Log out</button>
   </form>
   {{else}}
@@ -49,7 +50,10 @@
 <span class="htmx-indicator" hx-indicator>processing…</span>
 {{end}}
 
-{{define "csrf_field"}}{{/* no CSRF token: the portals are same-origin cookie
-     sessions protected by the httpOnly, SameSite=Lax session cookie and the
-     Bearer token never reaching the browser. A cross-origin POST cannot read the
-     cookie the portal set, so it cannot forge a state-changing request. */}}{{end}}
+{{define "csrf_field"}}{{/* FR-1009 (AC-50): the hidden token every form must carry. It is
+     rendered by the server from the token the portal's CSRF middleware minted for
+     this request and bound to the session cookie, so a form cannot be forged from
+     another origin - and a same-origin sibling origin, or Chrome's Lax+POST window
+     on a freshly set cookie, cannot forge one either. Called with the page or the
+     fragment view, both of which carry CSRFToken. */}}
+<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">{{end}}

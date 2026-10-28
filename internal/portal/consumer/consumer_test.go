@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/m7jay/pigeon/internal/portal"
 	"github.com/m7jay/pigeon/internal/portalui"
 )
 
@@ -159,6 +160,25 @@ func signedInHtmx(t *testing.T, h *Handler, method, target string, form url.Valu
 
 func signedInWith(t *testing.T, h *Handler, method, target string, form url.Values, htmx bool) *httptest.ResponseRecorder {
 	t.Helper()
+	enc, err := h.cookie.Encode("test-session-token")
+	if err != nil {
+		t.Fatalf("encode session cookie: %v", err)
+	}
+	// FR-1009: every state-changing request needs the token the portal's
+	// middleware accepts, so the helper carries the pair a rendered form would
+	// (the cookie and the matching hidden field) exactly as a browser does. The
+	// AC-50 test does the opposite on purpose: it strips or mismatches the token.
+	var token string
+	if method != http.MethodGet && method != http.MethodHead {
+		token, err = portal.MintRandom(h.cfg.CookieSecret, enc)
+		if err != nil {
+			t.Fatalf("mint csrf token: %v", err)
+		}
+		if form == nil {
+			form = url.Values{}
+		}
+		form.Set("csrf_token", token)
+	}
 	var body io.Reader
 	if form != nil {
 		body = strings.NewReader(form.Encode())
@@ -170,11 +190,10 @@ func signedInWith(t *testing.T, h *Handler, method, target string, form url.Valu
 	if htmx {
 		req.Header.Set("HX-Request", "true")
 	}
-	enc, err := h.cookie.Encode("test-session-token")
-	if err != nil {
-		t.Fatalf("encode session cookie: %v", err)
-	}
 	req.AddCookie(&http.Cookie{Name: h.cfg.CookieName, Value: enc})
+	if token != "" {
+		req.AddCookie(&http.Cookie{Name: portal.CSRFCookieName, Value: token})
+	}
 	rec := httptest.NewRecorder()
 	h.Handler().ServeHTTP(rec, req)
 	return rec
@@ -239,29 +258,39 @@ func TestLoginPageRenders(t *testing.T) {
 // TestSnippetRequiresLogin is UI-18's boundary: the snippet is generated behind
 // login, and it is reached by POST. A GET was how the secret used to travel in a
 // query string, where it lands in access logs, browser history and any pasted link.
+//
+// The POST half carries a valid CSRF token and no session, which is the only
+// combination that reaches the login gate: without a token the request is refused
+// by FR-1009's middleware before any handler runs (AC-50), and that refusal is
+// asserted separately. Order matters and is deliberate - the token check is
+// cheaper, needs no session, and applies to anonymous routes too.
 func TestSnippetRequiresLogin(t *testing.T) {
 	h := testHandler(t)
-	cases := []struct {
-		method string
-		target string
-		form   url.Values
-	}{
-		{http.MethodGet, "/snippet", nil},
-		{http.MethodPost, "/snippet", url.Values{"whsec": {"whsec_ABCDEF"}}},
+	rec := httptest.NewRecorder()
+	h.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/snippet", nil))
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("GET /snippet without a session: status = %d, want 303 to login", rec.Code)
 	}
-	for _, tc := range cases {
-		var body io.Reader
-		if tc.form != nil {
-			body = strings.NewReader(tc.form.Encode())
-		}
-		rec := httptest.NewRecorder()
-		h.Handler().ServeHTTP(rec, httptest.NewRequest(tc.method, tc.target, body))
-		if rec.Code != http.StatusSeeOther {
-			t.Fatalf("%s %s without a session: status = %d, want 303 to login", tc.method, tc.target, rec.Code)
-		}
-		if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "/login?next=") {
-			t.Fatalf("%s %s redirected to %q, want the login page carrying next", tc.method, tc.target, loc)
-		}
+	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "/login?next=") {
+		t.Fatalf("GET /snippet redirected to %q, want the login page carrying next", loc)
+	}
+
+	// A POST with a token but no session: the gate is what answers.
+	token, err := portal.MintRandom(h.cfg.CookieSecret, "")
+	if err != nil {
+		t.Fatalf("mint token: %v", err)
+	}
+	form := url.Values{"whsec": {"whsec_ABCDEF"}, "csrf_token": {token}}
+	req := httptest.NewRequest(http.MethodPost, "/snippet", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: portal.CSRFCookieName, Value: token})
+	rec = httptest.NewRecorder()
+	h.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST /snippet without a session: status = %d, want 303 to login", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "/login?next=") {
+		t.Fatalf("POST /snippet redirected to %q, want the login page carrying next", loc)
 	}
 }
 

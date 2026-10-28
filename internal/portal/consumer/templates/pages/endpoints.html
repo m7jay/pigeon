@@ -10,6 +10,7 @@
     <dt>Verification token</dt><dd class="mono">{{.Data.Created.VerificationToken}}</dd>
   </div>
   <form method="post" action="/endpoints/{{.Data.Created.ID}}/verify" class="inline" style="margin-top:0.5rem">
+    {{template "csrf_field" .}}
     <input type="hidden" name="token" value="{{.Data.Created.VerificationToken}}">
     <button class="btn btn-sm" type="submit">Verify now</button>
   </form>
@@ -19,6 +20,7 @@
 <div class="card">
   <h2>Register an endpoint</h2>
   <form method="post" action="/endpoints">
+    {{template "csrf_field" .}}
     <div class="form-row"><label for="name">Name</label><input id="name" type="text" name="name" required placeholder="production webhook"></div>
     <div class="form-row"><label for="url">URL</label><input id="url" type="url" name="url" required placeholder="https://you.example.com/hooks"></div>
     <button class="btn" type="submit">Register</button>

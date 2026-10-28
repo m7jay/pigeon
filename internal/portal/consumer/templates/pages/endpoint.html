@@ -11,9 +11,11 @@
   </dl>
   <div class="row-actions" style="margin-top:0.75rem">
     <form method="post" action="/endpoints/{{.Data.ID}}/{{if .Data.Paused}}resume{{else}}pause{{end}}">
+      {{template "csrf_field" .}}
       <button class="btn btn-sm btn-secondary" type="submit">{{if .Data.Paused}}Resume{{else}}Pause{{end}}</button>
     </form>
     <form method="post" action="/endpoints/{{.Data.ID}}/delete" onsubmit="return confirm('Delete this endpoint? It will stop receiving events.')">
+      {{template "csrf_field" .}}
       <button class="btn btn-sm btn-danger" type="submit">Delete</button>
     </form>
     <a class="btn btn-sm btn-secondary" href="/snippet?endpoint={{.Data.ID}}">Webhook snippet</a>
@@ -24,6 +26,7 @@
   <h2>Edit this endpoint</h2>
   <p class="page-sub">Rename it, move it to another URL, or set the address failure notifications go to (UI-13). A new URL is checked against the same rules as registration.</p>
   <form method="post" action="/endpoints/{{.Data.ID}}/edit">
+    {{template "csrf_field" .}}
     <div class="form-row"><label for="name">Name</label><input id="name" type="text" name="name" value="{{.Data.Name}}" required></div>
     <div class="form-row"><label for="url">URL</label><input id="url" type="url" name="url" value="{{.Data.URL}}" required></div>
     <div class="form-row"><label for="notification_email">Notification email</label><input id="notification_email" type="email" name="notification_email" value="{{.Data.NotificationEmail}}" placeholder="you@example.com"><span class="muted">Leave empty to clear it.</span></div>
@@ -36,6 +39,7 @@
   <h2>Verify ownership</h2>
   <p class="page-sub">Paste the verification token that was shown once when you registered this endpoint. Until it is answered the endpoint receives no live events (FR-403).</p>
   <form method="post" action="/endpoints/{{.Data.ID}}/verify" class="inline">
+    {{template "csrf_field" .}}
     <input type="text" name="token" placeholder="vrf_..." required style="width:auto;max-width:24rem">
     <button class="btn btn-sm" type="submit">Verify endpoint</button>
   </form>
@@ -51,6 +55,7 @@
   <p class="page-sub">Each endpoint signs with its own secret (UI-13). Rotating mints a new one and retires the old one, so update your verifier before the next delivery.</p>
   {{end}}
   <form method="post" action="/endpoints/{{.Data.ID}}/rotate" onsubmit="return confirm('Rotate the signing secret? Your verifier must be updated with the new secret.')">
+    {{template "csrf_field" .}}
     <button class="btn btn-sm btn-secondary" type="submit">Rotate signing secret</button>
   </form>
 </div>
@@ -65,6 +70,7 @@
        document with no layout and no htmx, whose own controls are then inert. */}}
   <form method="post" action="/endpoints/{{.Data.ID}}/subscriptions" class="inline"
         hx-post="/endpoints/{{.Data.ID}}/subscriptions" hx-target="#subs-list" hx-swap="outerHTML">
+    {{template "csrf_field" .}}
     <select name="event_type" required style="width:auto;max-width:24rem">
       {{range .Data.AvailableTypes}}<option value="{{.}}">{{.}}</option>{{end}}
     </select>
