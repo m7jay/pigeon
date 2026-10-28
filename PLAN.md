@@ -28,6 +28,7 @@ disagree, the requirements win and this file is wrong.
 | S8 | Partitioning, retention-by-disk, partition drop under the sweeper lease | AC-10, AC-18, AC-42 | S4 | — |
 | S9 | Portals — consumer portal (M2b) landed as `t_0eea0b84`; producer portal (M2a) is S9a `t_c0144baa` — scoped tokens, branding; **FR-106 optional OIDC login** and FR-111's password-reset flow (both deferred here — a second login method is a portal-visible feature, and neither exists in S1) | AC-38, AC-39, AC-40, AC-47 (AC-01 → S9a) | S3 | — |
 | S10 | Hardening: SSRF at three points, secret rotation, `doctor`, load test, fault-injection matrix in CI; **portal session security (FR-1009)** — `HttpOnly`/`Secure`/`SameSite=Lax` on every portal cookie, a CSRF token on every state-changing POST, cookie lifetime read from the core's `expires_at` | AC-19, AC-22, AC-30, AC-31, AC-34, AC-43, AC-49, AC-50, AC-51 | S5…S9 | — |
+| S11 | Delivery fairness (**FR-1303**, **FR-1304**): stop parking the dispatch path on a capped endpoint, split the attempt budget into a first-attempt lane and a retry lane, and make a hold visible | AC-52, AC-53 | S5 | — |
 
 Two items are in S2/S3 rather than later, for the reason §17 gives: the outbox
 changes the ingest transaction, and per-endpoint throttling changes the queue
@@ -50,6 +51,31 @@ lacks. That amendment landed first, so AC-44…AC-51 are one contiguous block in
 `REQUIREMENTS.md` §16 and AC-47 keeps its own number on the S9 row above. The 12 h
 constant is A-5's *default* session TTL, which is why it looked deliberate; it is wrong
 for every other `PIGEON_SESSION_TTL`.
+
+**§7.13's fairness rows had no owner either, and the answer is not one answer.** S5's
+requirement line named §9 and FR-1201…FR-1308, and its AC list (AC-14, AC-16, AC-17,
+AC-35…AC-37, AC-41) covers the failure-policy half of that range only: the retry policy, the
+pause thresholds and the per-endpoint limits. Three rows of the fairness half were implemented,
+tested and owned by nothing, which is why the slice was approved without them. `SPEC.md` A-10
+disposes of them, and the split is deliberate:
+
+- **FR-1303 (P0) and FR-1304 are S11** (card `t_558a9f59`, `pigeon-dev`), because the shipped
+  dispatch path *violates* them. `dispatch` claims a delivery and takes the process slot before
+  it asks the endpoint for a slot, then sleeps there (`internal/delivery/delivery.go:439-486`,
+  `:502-534`), so with the default `PIGEON_DELIVERY_WORKERS=1` one capped endpoint occupies a
+  process's only dispatch loop and nothing reports it. S11 adds no second endpoint limit:
+  FR-1308 is untouched, and the retry budget it partitions is the worker's attempt budget.
+- **FR-1301's publish half is already shipped** as FR-207's per-key and per-producer rate
+  limits; its **delivery**-quota half is deferred to v1.1 with its cost stated
+  (`REQUIREMENTS.md` §17.1), because a per-producer value needs a config surface and an API to
+  set it. §7.13's row names both halves so it no longer reads as one unowned claim.
+
+**Consequence for S10, recorded rather than acted on.** AC-16's "hanging endpoint capped" leg
+is measured in S10, and its NFR-2 leg (normal publish to first attempt ≤ 60 s) cannot pass
+while the dispatch path parks behind the first capped endpoint. S11 is a precondition for that
+measurement, not a replacement for it: AC-16 and AC-17 stay S10's. Whether that re-gates S10's
+`Depends on` is the leader's call, so the dependency is written here instead of by editing the
+row under a running card.
 
 ## Current state (S0) — closed
 
