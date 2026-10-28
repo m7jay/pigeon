@@ -206,6 +206,9 @@ func run() error {
 		// so ingest admission and worker writes are one bounded resource rather
 		// than two queues that cannot see each other.
 		Writes: writes,
+		// FR-1007: the allowlist GET /v1/meta/egress-ips publishes. Empty means
+		// the handler reports the host's own interfaces and says so.
+		EgressIPs: cfg.EgressIPs,
 		// FR-206: last_used_at is an evidence write and runs off the request path,
 		// inside the middleware that authenticated the key.
 		TouchKey:         st.TouchKey,

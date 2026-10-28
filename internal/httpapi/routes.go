@@ -114,6 +114,11 @@ func (s *Server) routes() []route {
 		// max_disk_pct, the partition catalogue with sizes and row estimates, and
 		// the retention windows. Infrastructure telemetry, so admin only.
 		{http.MethodGet, "/v1/meta/usage", kindAdmin, s.handleUsage},
+		// FR-1007: the addresses a receiver should allowlist. It describes the
+		// deployment, not a tenant, and the people who need it are whoever
+		// configures an allowlist on either side, so it needs a session and no
+		// more; see handleEgressIPs.
+		{http.MethodGet, "/v1/meta/egress-ips", kindSession, s.handleEgressIPs},
 
 		// Producer membership and invitations (FR-104, FR-105, FR-109).
 		{http.MethodGet, "/v1/producer/members", kindMember, s.handleListMembers},

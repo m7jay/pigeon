@@ -131,8 +131,38 @@ constrained by.
 | **migrator** | 1 | advisory lock, but only one process should contend: set `PIGEON_MIGRATIONS_ON_BOOT=false` on replicas 2..N |
 | **sweeper** | 1 active | leadership by advisory lock (D-7); every other replica is a standby |
 
+## Egress addresses (FR-1007)
+
+A receiver that firewalls its ingress needs to know which addresses your
+deliveries come from. `GET /v1/meta/egress-ips` is the answer, and it exists so
+that list is not folklore passed between support tickets:
+
+```sh
+curl -s -H "Authorization: Bearer $SESSION" https://pigeon.example/v1/meta/egress-ips
+# {"ips":["203.0.113.7"],"source":"configured"}
+```
+
+- **Set `PIGEON_EGRESS_IPS`** to the addresses (or CIDR blocks) receivers will
+  actually see. Behind NAT, a load balancer, a proxy or a container network the
+  public source address is not one the process can discover, so this is the only
+  correct answer there. A malformed entry is refused at boot (OPS-7): the list is
+  someone else's allowlist, and a typo surfaces as their delivery outage.
+- **Leave it empty on a flat network.** The route then reads the host's own
+  non-loopback interfaces and reports `"source":"discovered"` with a note saying
+  so, including the knob that fixes it. That is deliberately not presented as
+  authoritative - an allowlist built from a container's private address is a
+  thing that looks right and never matches.
+- **Any authenticated session may read it** (`kindSession`). The list describes
+  the deployment rather than a tenant, and the people who need it are whoever
+  configures an allowlist - a producer member adding an endpoint and a consumer
+  user running one alike.
+
 ## Verifying a deployment
 
-`pigeon doctor` (OPS-4, S10) reports the same arithmetic. Until it exists, the
-boot refusal above is the check, and `show max_connections` plus `pg_stat_activity`
-grouped by `application_name = 'pigeon-core'` answers "what is actually connected".
+`pigeon doctor` (OPS-4, OPS-10, OPS-11) reports the same arithmetic without
+writing anything: Postgres reachability and the connection budget, Redis and its
+AOF setting, clock skew, disk headroom, and `ulimit -n` against the concurrency
+the shipped caps need. It exits 0 when nothing failed, 1 on a failure, 2 on
+warnings only and 3 when it could not run; `--json` emits the same facts.
+`show max_connections` plus `pg_stat_activity` grouped by
+`application_name = 'pigeon-core'` still answers "what is actually connected".
