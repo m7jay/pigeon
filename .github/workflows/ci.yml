@@ -120,7 +120,12 @@ jobs:
           # partition dropped (TestTwoSweepersDropExactlyOnePartition) and no
           # delivery re-queued twice, which the pre-existing
           # TestSweeperRequeuesExpiredLease and
-          # TestLeaseExpiryReclaimsWithoutDuplicateAttempts already pin. AC-35
+          # TestLeaseExpiryReclaimsWithoutDuplicateAttempts already pin. That
+          # "exactly one partition dropped" leg compares the live partition
+          # catalogue against each replica's books, so it can only hold while a
+          # cancelled caller cannot revoke the outcome of a DROP it has already
+          # sent: TestDropPartitionOutcomeSurvivesCallerCancellation (registered
+          # last, with the fix for that window) is the pin. AC-35
           # (durable row and 72 h arithmetic), AC-36 (terminal row and <= 16
           # attempt bound) and AC-37 (governing window and the terminal it
           # causes) each name two, and both halves are registered.
@@ -200,7 +205,8 @@ jobs:
             TestSweeperStandbyTakesOverWhenTheHolderIsKilled \
             TestTwoSweepersDropExactlyOnePartition \
             TestPartitionLeavesEnforceTenantIsolation \
-            TestRunOnceLogsTheDroppedPartition
+            TestRunOnceLogsTheDroppedPartition \
+            TestDropPartitionOutcomeSurvivesCallerCancellation
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
