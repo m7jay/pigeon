@@ -555,6 +555,78 @@ func TestDeliveryDetailExposesOrderedAttempts(t *testing.T) {
 
 func ptr[T any](v T) *T { return &v }
 
+// TestDeliveryViewReturnsTheHold is AC-53's view leg (FR-1102, FR-1103, FR-1304):
+// a delivery its endpoint's limits are holding back reads through the delivery view
+// - list and detail - with held_back_since and held_back_reason, a delivery that is
+// not held carries neither (the field exists and is null, so a client can rely on
+// it), and clearing the hold clears the view. The worker's half of AC-53 (the hold
+// it writes, and the attempt it does not run) is
+// TestAC53HoldOnTheEndpointConcurrencyCap in the delivery package.
+func TestDeliveryViewReturnsTheHold(t *testing.T) {
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+	id := e.deliver(t, fx)
+
+	detail := func() deliveryJSON {
+		t.Helper()
+		code, raw := e.do(http.MethodGet, fmt.Sprintf("/v1/producer/deliveries/%d?env=live", id), tn.OwnerToken, nil)
+		mustStatus(t, code, raw, http.StatusOK)
+		return decode[deliveryJSON](t, raw)
+	}
+
+	if d := detail(); d.HeldBackSince != nil || d.HeldBackReason != nil {
+		t.Fatalf("a delivery nothing has held back reports held_back_since=%v held_back_reason=%v, want both null",
+			d.HeldBackSince, d.HeldBackReason)
+	}
+
+	// The hold as the worker records it on the row. It is written here rather than
+	// driven through the limiter so this test is about the VIEW; the hold's own
+	// contract is the delivery package's.
+	heldAt := time.Now().Add(-30 * time.Second).UTC().Truncate(time.Second)
+	if _, err := e.admin.Exec(context.Background(),
+		`update deliveries set held_back_since = $2, held_back_reason = $3 where id = $1`,
+		id, heldAt, "endpoint_concurrency_cap"); err != nil {
+		t.Fatalf("record the hold: %v", err)
+	}
+
+	d := detail()
+	if d.HeldBackSince == nil || *d.HeldBackSince != heldAt.Format(time.RFC3339) {
+		t.Errorf("held_back_since = %v, want %s (FR-1304: since when the endpoint held it)",
+			d.HeldBackSince, heldAt.Format(time.RFC3339))
+	}
+	if d.HeldBackReason == nil || *d.HeldBackReason != "endpoint_concurrency_cap" {
+		t.Errorf("held_back_reason = %v, want endpoint_concurrency_cap (FR-1304: which limit held it)", d.HeldBackReason)
+	}
+
+	// FR-1102's list carries the same pair, so the producer sees the hold where it
+	// looks for deliveries rather than only on the detail page.
+	page := e.listDeliveries(t, tn.OwnerToken, "&status=pending")
+	var listed bool
+	for _, row := range page.Deliveries {
+		if row.ID != id {
+			continue
+		}
+		listed = true
+		if row.HeldBackSince == nil || row.HeldBackReason == nil {
+			t.Errorf("the list reports held_back_since=%v held_back_reason=%v for a held delivery, want both set (FR-1102)",
+				row.HeldBackSince, row.HeldBackReason)
+		}
+	}
+	if !listed {
+		t.Errorf("the held delivery %d is not in the pending list at all", id)
+	}
+
+	// Clearing the hold - what the worker does the moment an attempt starts - clears
+	// the view with it.
+	if err := e.st.ClearDeliveryHold(context.Background(), id); err != nil {
+		t.Fatalf("clear the hold: %v", err)
+	}
+	if d := detail(); d.HeldBackSince != nil || d.HeldBackReason != nil {
+		t.Errorf("after the hold was cleared the view still reports held_back_since=%v held_back_reason=%v (FR-1304)",
+			d.HeldBackSince, d.HeldBackReason)
+	}
+}
+
 // --- AC-32, FR-1109, FR-1110, FR-1111: the event view and the rollup ------
 
 // TestEventRollupStatuses is FR-1109: one event, its fan-out outcome and the
