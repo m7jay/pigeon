@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/m7jay/pigeon/internal/db"
 )
@@ -44,12 +45,22 @@ func TestBootstrapIsIdempotentAndForcesAChange(t *testing.T) {
 	}
 
 	var mustChange bool
+	var storedHash string
 	if err := pool.QueryRow(ctx, `
-		select must_change_password from users where is_instance_admin limit 1`).Scan(&mustChange); err != nil {
+		select must_change_password, password_hash from users where is_instance_admin limit 1`).Scan(&mustChange, &storedHash); err != nil {
 		t.Fatalf("read admin: %v", err)
 	}
 	if !mustChange {
 		t.Fatal("the bootstrap credential does not require a change (FR-101)")
+	}
+	// The production cost is what the stored hash must carry: the harness knob
+	// (SetPasswordCostForTests) is test-only, and this is the row a real login
+	// verifies against. It is asserted here rather than in a hash of its own so
+	// that the production path is the one under test.
+	if cost, err := bcrypt.Cost([]byte(storedHash)); err != nil {
+		t.Fatalf("read the bcrypt cost out of the bootstrap hash: %v", err)
+	} else if cost != DefaultPasswordCost {
+		t.Fatalf("the bootstrap password is stored at bcrypt cost %d, want the production default %d", cost, DefaultPasswordCost)
 	}
 
 	// A second boot with a different password must not recreate or overwrite it:
