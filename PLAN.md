@@ -225,7 +225,7 @@ Per-requirement map, corrected:
 | MT-5 | `TestInstanceAdminCreatesProducersAndIsAudited`, `TestAuditLogIsAppendOnly` |
 | OPS-8 | `TestValidateBudgetIsTheOPS8Arithmetic`, `docs/topology.md` |
 | **S10 additions** | |
-| FR-1004 | `TestRotationCarriesBothSignaturesFor24h`, `TestRotationOverlapEndsAt24Hours`, `TestRotateKeepsThePreviousSecretForTheOverlap`, `TestClaimScansAnEndpointThatHasNeverRotated` (migration `0014_s10_rotation_overlap.sql`) |
+| FR-1004 | `TestRotationCarriesBothSignaturesFor24h`, `TestRotationOverlapEndsAt24Hours`, `TestRotateKeepsThePreviousSecretForTheOverlap`, `TestClaimScansAnEndpointThatHasNeverRotated` (migration `0015_s10_rotation_overlap.sql`) |
 | FR-1005 | `TestRebindingIsCaughtAtEveryCallSite`, `TestDialControlIsTheOnlyCheckWithoutAWindow`, `TestCheckVerificationURLRejectsAChangedAnswer`, `TestRequestTimeRefusalIsTerminal`, `TestTransportRefusesToDialABlockedAddress` |
 | FR-1006 | **removed from this slice by a scope change.** Investigating it here found that FR-405 - the feature it hardens - does not exist in this tree: no headers column on `endpoints`, no registration or delivery path for headers, so there was nothing to encrypt at rest or redact. Jay ruled that FR-405 and FR-1006 ship **together** as one feature slice on `t_f65f1bc1`. |
 | AC-19 | FR-1005's five tests above; `169.254.0.0/16` is rejected at registration, at verification and at dial time |
