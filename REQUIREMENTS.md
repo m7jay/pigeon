@@ -865,10 +865,12 @@ A service delivering 2,500 requests a second cannot log a line per success - tha
 
 Logs are for **debugging the process**; the database is for **answering questions about deliveries**. Neither substitutes for the other, and no consumer-visible fact may exist only in a log.
 
+**The success line is gated, and the gate's bound is stated here so no other document has to guess it.** A delivery that succeeds increments its counters either way; it writes a success line only while the process is below `PIGEON_SUCCESS_LOG_RPS` (LOG-2; 100 lines/s by default). The gate is a token bucket that holds one second's allowance and refills at that rate, so LOG-2's bound is **`PIGEON_SUCCESS_LOG_RPS` sustained, and at most 2 × that rate in any one-second window**: the bucket starts full, so the first second of a burst can carry the allowance plus that second's refill - measured, a 10,000-deliveries-in-one-second burst emits 199 lines in its first second at the default, and never more than the rate in any later one. Two scopes come with that number: the gate is **per process**, so a deployment's ceiling is `replicas × PIGEON_SUCCESS_LOG_RPS` sustained (the same scope FR-207's rate limits have), and the bound covers successes only - failures and state transitions are never gated, because those are the lines the log exists for.
+
 | ID | Requirement | Pri |
 |---|---|---|
 | LOG-1 | Logs MUST be structured JSON on stdout carrying `event_id`, `delivery_id`, `endpoint_id`, `producer_id`, `attempt` and `status` where applicable, so one delivery is one grep. | P0 |
-| LOG-2 | A successful delivery MUST NOT emit a log line per attempt above 100/s; successes increment counters. Failures and state transitions MUST always log at warn. | P0 |
+| LOG-2 | A successful delivery MUST NOT emit a log line per attempt above `PIGEON_SUCCESS_LOG_RPS` (100/s by default) in one process, sustained; the gate holds a one-second allowance, so a one-second window MUST NOT exceed 2 × the rate (§13.1). Successes increment counters either way. Failures and state transitions MUST always log at warn. | P0 |
 | LOG-3 | Payload bodies, secrets and full response bodies MUST never be logged; a redacted status plus error class is the maximum. | P0 |
 | LOG-4 | Log level MUST be runtime-configurable, and `debug` MUST be rate-limited per endpoint so enabling it cannot take the box down. | P1 |
 
@@ -1007,7 +1009,7 @@ a second token beside this one.
 | AC-30 | Load one instance past its documented delivery ceiling | Publish sheds with `429`; no silent latency growth; the ceiling matches the §8.1 table within 20% |
 | AC-31 | 250 events/s with 10 subs on 2 vCPU / 4 GB | NFR-1/2 hold at the default machine; delivery ceiling reported honestly rather than degrading silently |
 | AC-32 | Open a delivered event in the UI | Rollup `all_delivered`; each delivery shows status, timestamp and duration; no attempt rows and no empty trail rendered |
-| AC-33 | 10,000 deliveries/s, all succeeding | No per-success log lines; log volume stays under the documented bound; counters advance |
+| AC-33 | 10,000 deliveries/s, all succeeding | No line per success: one process emits at most §13.1's documented bound (`PIGEON_SUCCESS_LOG_RPS` sustained, ≤ 2 × the rate in any one-second window), and the emitted and suppressed counters advance together |
 | AC-34 | 2,500 concurrent attempts on 2 vCPU | Goroutines bounded by pool plus per-endpoint caps; FD usage within the documented `ulimit`; CPU largely idle |
 | AC-35 | Endpoint down 20 h, then healthy | Delivered on a scheduled retry inside the 72 h window with no operator action |
 | AC-36 | Endpoint still failing at 72 h | `failed_terminal` at the window boundary; attempt count ≤ 16; replayable |
@@ -1113,6 +1115,7 @@ Recorded so they are not relitigated in review.
 | Tenancy | Producer → consumer → endpoint | Models "send webhooks to *our* customers" without a second product |
 | Routing | Producer supplies `consumer_id` or `consumer_ref`; platform resolves | The producer declares the subject, the consumer owns the endpoint and its subscriptions; producer code never changes when a consumer adds or moves an endpoint |
 | Attempt writes | Buffered in Redis, `sync` optional | Throughput on a small box; the loss window is evidence-only and documented |
+| Attempt counter and success-log bound (S6) | The attempt counter is `deliveries.attempts`, control state advanced by the write that schedules a retry; the buffer's pending-entry list is the buffer's accounting only (D-2). The success gate is `PIGEON_SUCCESS_LOG_RPS` per process, sustained, with a one-second allowance (LOG-2) | The pending-entry list cannot number attempts in `sync` mode, where no stream exists, and its counts move with the flusher's reclaims rather than with delivery attempts; a per-window clamp on the log gate would cost a quiet deployment its first visible successes to save at most one extra second's worth of lines. Recorded in `SPEC.md` A-7 and A-8 |
 | Retry policy | 15 retries, exponential, 72 h window, 12 h cap | Matches the market default shape (Hook0 8 d / 24 attempts, Svix days); 10 min lost a receiver's whole afternoon to the DLQ. Priority-class endpoints override to 1-6 h so stale events are not replayed |
 | Deployables | Three: core, producer portal, consumer portal | Different audiences, auth, branding and release cadence. Svix ships no portal in OSS and Hook0's themes stop at a logo, so this is the differentiator, and fusing them is what made the production portal internal-only. Portals are thin API consumers, so the core can run without either |
 | Transport, compute | Kafka and serverless both rejected | Argued once in §0.1; not restated here |

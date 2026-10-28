@@ -694,6 +694,45 @@ its consumer group, because "Redis list" cannot keep the row's own "0 on worker 
 promise), FR-811, FR-902, AC-07, AC-28; `0010_attempt_buffer.sql`,
 `store.LeasedDelivery.NextAttemptNumber`, `store.NextAttempt`.
 
+### A-8 — LOG-2's bound is the gate's rate, sustained, with a one-second allowance
+
+**Decision.** LOG-2's normative bound is `PIGEON_SUCCESS_LOG_RPS` (100 lines/s by default)
+sustained per process, and at most twice that rate in any one-second window. §13.1 states
+it and AC-33 asserts it. The gate keeps the shape it shipped with - a token bucket, full at
+start, capacity equal to the rate - rather than being clamped to `rps` per window.
+
+**Mechanism.** `internal/delivery/successlog.go`: the bucket starts holding one second's
+allowance, refills at the configured rate on each call and never above it, and emits while
+it holds a whole token. Emitted and suppressed successes increment separate counters, so the
+volume the line would have carried is never lost. Below the rate every success still logs
+(`TestSuccessLogGateIsAFullBucketOnStart`), which is the property a small deployment wants
+and the reason the bucket starts full rather than empty. Measured by replaying the gate's
+own arithmetic: a 10,000-deliveries-in-one-second burst emits **199** lines in its first
+second at the default (the ceiling `2 × rps` is not reached, because the refill that would
+complete the 200th token lands exactly at the window's edge), and every later second emits
+at the rate. `TestSuccessLogGateHoldsTheBoundAtLoad` asserts `allowed <= 2*rps`; S6's
+review measured the real worker path at `SuccessLogRPS=1` over 12 successes and got exactly
+one line. A negative `PIGEON_SUCCESS_LOG_RPS` is the explicit "log every success" escape
+hatch, `0` takes the default, and failures and state transitions are never gated.
+
+**Trade-off.** The alternative bound - "at most `rps` in any one-second window" - needs the
+bucket to start near-empty or a per-window clamp, and either shape costs the visible first
+successes after a quiet period: the liveness signal §13.1's own table row is about
+("what was the process doing at 14:02?"). What it buys is one second of a burst dropping
+from 199 lines to 100 at the default, in a window where the requirement's purpose - a
+service not answering its own log I/O problem - is already met by two orders of magnitude,
+and a per-window clamp puts new state on the hot success path to get it. Chose the bound the
+code already holds, so LOG-2, §13.1 and AC-33 name the number the gate enforces. Two scopes
+ship with it, both deliberate and both now stated in §13.1: the gate is **per process**, so
+a deployment's ceiling is `replicas × PIGEON_SUCCESS_LOG_RPS` sustained (a cross-replica
+bound would need Redis on the success path, the very I/O the gate exists to avoid, and
+FR-207's rate limits are per process for the same reason), and the bound covers successes
+only.
+
+**Encoded by.** LOG-2 (rewritten), §13.1 (states the bound, the 199-line measurement and the
+per-process scope), AC-33 (rewritten to point at that bound); `internal/delivery/successlog.go`,
+`PIGEON_SUCCESS_LOG_RPS` in `internal/config`; S10's AC-33 load test.
+
 ## Gap list — eight decided, one open
 
 Six gaps, each now a decision with a mechanism and a named trade-off. Row 4b is a
@@ -713,6 +752,7 @@ is the case PLAN.md's rule 5 sends to this list rather than into a code comment.
 | 5 | Consumer session format unspecified | A-5 | FR-110 rewritten; FR-112, FR-113 added; AC-47 | S9 |
 | 6 | `pigeon doctor` unspecified | A-6 | OPS-4 and OPS-10 amended; OPS-11 added; AC-48 | S10 |
 | 8 | D-2 named the Redis Streams pending-entry count as the attempt counter | A-7 | D-2 rewritten to name `deliveries.attempts`; §6's attempt-evidence row names the Redis Stream and its consumer group | S6 (landed), S7's inspect API |
+| 9 | LOG-2's "above 100/s" fixed neither a burst allowance nor a replica count | A-8 | LOG-2, §13.1 and AC-33 state `PIGEON_SUCCESS_LOG_RPS` sustained per process and at most 2 × that in any one-second window | S6 (landed), S10's AC-33 load test |
 
 **They do not contradict each other**, checked pairwise where they touch: A-1's pause
 flags and A-4's archive both ride the control/evidence split in §6 (D-8, FR-812); A-2's
@@ -721,7 +761,13 @@ A-4 decides what Postgres remembers, and dedupe keys on ids so neither reaches t
 other; A-5's sessions are control-state rows read
 most of the time, written at most once a minute; A-6 reads the same environment config
 that A-5's session TTL and A-1's thresholds come from, and its `db.connection_budget`
-check is OPS-8's formula, not a second one.
+check is OPS-8's formula, not a second one. A-7 is D-1's other half - the buffer keeps the
+evidence path and the counter moves to control state - so nothing it says crosses the
+write-class split §6 and FR-812 define; A-8 quantifies the bound LOG-2 already had instead
+of adding a mechanism, and takes FR-207's per-process scope so a deployment's ceiling is
+`replicas × PIGEON_SUCCESS_LOG_RPS`, stated rather than left to be discovered by a load
+test. Neither reaches the other: A-7 touches the delivery row's counter, A-8 touches log
+emission, and no requirement names both.
 
 One thing this list no longer leaves open: whether the endpoint pause threshold scales
 with subscription count. It does - `N = min(active, max(3, ceil(active/4)))` in FR-1203
