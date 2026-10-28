@@ -51,13 +51,17 @@ func (e *env) seedInspectTenant(t *testing.T, slug string) *tenant {
 // s7Fixture is one test's slice of S7's shared tenant: its own consumer, its own
 // endpoint subscribed to the tenant's consumer-routed type, and its own events.
 //
-// The tenant is shared because seedTenant sets five passwords and hashing them
-// costs ~16 s per tenant under -race on a CI runner: nine S7 tests each seeding
-// their own tenant added ~150 s to a package whose pre-S7 run already used 419 s
-// of the default 10-minute test timeout. A consumer, an endpoint and a
-// subscription cost no hashing, so isolation comes from those instead - every
-// assertion below is scoped to this test's own consumer or endpoint rather than
-// to "everything the tenant has".
+// The tenant is shared because seedTenant is the expensive half of this package's
+// fixtures - it accepts three invitations and logs in four times, seven bcrypt
+// calls - and nine S7 tests each seeding their own tenant added ~150 s to a
+// package that was already the suite's long pole (S7's head, CI run
+// 40586485856). A consumer, an endpoint and a subscription cost no hashing, so
+// isolation comes from those instead - every assertion below is scoped to this
+// test's own consumer or endpoint rather than to "everything the tenant has".
+// The harness now hashes test identities at a cheaper cost (main_test.go), which
+// made those seven calls cheap; the sharing stays because it is free isolation of
+// the tenant itself, and re-cutting nine tests would be a change to the
+// assertions rather than to the harness.
 type s7Fixture struct {
 	Tenant     *tenant
 	Ref        string
