@@ -775,15 +775,30 @@ func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
 	}
 
 	// The new deliveries: pending, linked to the row they repair, same event and
-	// endpoint, no attempts yet, and released at 1/50 s apart per endpoint.
+	// endpoint, no attempts yet, and released one 1/50 s slot apart per endpoint
+	// (FR-1107), counted from the instant the replay created them.
+	//
+	// The schedule is read from the two stamps the SERVER wrote on the row -
+	// created_at and lease_expires_at, both now() inside the replay's own
+	// transaction - and never against time.Now() in this loop. A wall clock here
+	// measures the box, not the schedule: the lease is stamped when the replay
+	// commits, and the snapshot and count queries above this loop cost seconds on
+	// a loaded box, so a correctly scheduled replay reads as "in the past"
+	// whatever fixed tolerance is picked (measured 2026-10-28: 2 FAIL / 4
+	// fresh-DB runs at load 26-40, every failure at this line with a lease the
+	// server had stamped at the replay instant, while CI on the same commit is
+	// green in 0.10 s). The selection is this test's own endpoint, so the ids
+	// below are one release sequence.
+	slot := time.Second / time.Duration(store.ReplayReleasePerSecond)
+	lastSlot := time.Duration(len(first.DeliveryIDs)-1) * slot
 	for _, id := range first.DeliveryIDs {
 		var status, eventID, endpointID string
 		var replayOf *int64
 		var attempts int
-		var lease time.Time
+		var lease, createdAt time.Time
 		err := e.admin.QueryRow(context.Background(), `
-			select status, event_id, endpoint_id, replay_of_delivery_id, attempts, lease_expires_at
-			from deliveries where id = $1`, id).Scan(&status, &eventID, &endpointID, &replayOf, &attempts, &lease)
+			select status, event_id, endpoint_id, replay_of_delivery_id, attempts, lease_expires_at, created_at
+			from deliveries where id = $1`, id).Scan(&status, &eventID, &endpointID, &replayOf, &attempts, &lease, &createdAt)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -799,8 +814,15 @@ func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
 		if _, ok := e.eventFor(t, eventID); !ok {
 			t.Fatalf("replayed delivery %d lost its event %s", id, eventID)
 		}
-		if lease.Before(time.Now().Add(-time.Second)) {
-			t.Fatalf("replayed delivery %d is not scheduled: lease %v", id, lease)
+		// FR-1107: row k of an endpoint's selection is released (k-1)/50 s after
+		// the transaction's now(), so every replayed lease lies between its own
+		// created_at and created_at + one slot per row before it. A lease before
+		// created_at is a replay scheduled in the past - the defect this
+		// assertion exists for - and one past the last row's slot is a schedule
+		// FR-1107 does not state.
+		if offset := lease.Sub(createdAt); offset < 0 || offset > lastSlot {
+			t.Fatalf("replayed delivery %d is not scheduled: lease %v, created %v (%v apart), want 0 to %v apart (FR-1107's %d/s)",
+				id, lease, createdAt, offset, lastSlot, store.ReplayReleasePerSecond)
 		}
 	}
 	leaseGap := e.leaseGap(t, first.DeliveryIDs)
