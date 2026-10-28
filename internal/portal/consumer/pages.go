@@ -600,14 +600,6 @@ func (h *Handler) unsubscribe(w http.ResponseWriter, r *http.Request) {
 	h.renderSubsFragment(w, r, id)
 }
 
-// deliveries is the delivery-log page (UI-15/UI-16). The inspect and replay API it
-// reads is a separate slice (S7), so the page states the dependency plainly instead
-// of rendering an empty log that would read as "you have no deliveries". The
-// requirement is tracked as a card parented on S7, not by this notice.
-func (h *Handler) deliveries(w http.ResponseWriter, r *http.Request) {
-	h.renderPage(w, r, "deliveries", "Delivery log", "deliveries", nil)
-}
-
 // snippetForm renders the verification-snippet form (UI-18). A logged-in user only;
 // the secret is entered on the next request, never in a query string.
 func (h *Handler) snippetForm(w http.ResponseWriter, r *http.Request) {
