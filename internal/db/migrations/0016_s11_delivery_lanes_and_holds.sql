@@ -1,4 +1,4 @@
--- 0015_s11_delivery_lanes_and_holds.sql — S11: the attempt-class lanes, the
+-- 0016_s11_delivery_lanes_and_holds.sql — S11: the attempt-class lanes, the
 -- claim path that can select a class, and the visible hold (FR-1303, FR-1304;
 -- SPEC.md A-10).
 --
