@@ -905,9 +905,10 @@ per-process scope), AC-33 (rewritten to point at that bound); `internal/delivery
 **Decision.** `Buffer.Ack` is one atomic operation - the `XACK` and the entry's removal in a single
 `MULTI`/`EXEC` - and `Flusher.insert` runs it on a deadline of its own that the flush pass's
 cancellation cannot revoke. A start additionally sweeps the entries a peer acknowledged but never
-removed that lie below the oldest pending entry when it sweeps. The batch still leaves the retry
-slot before the retirement is attempted, `StaleAfter`'s reclaim stays the only recovery path for a
-batch whose insert failed, and OBS-9's depth gauge stays `XLEN`.
+removed that lie below the oldest pending entry when it sweeps, and keeps sweeping them on a
+cadence while it runs. The batch still leaves the retry slot before the retirement is attempted,
+`StaleAfter`'s reclaim stays the only recovery path for a batch whose insert failed, and OBS-9's
+depth gauge stays `XLEN`.
 
 **The two windows.** Both were found while root-causing `TestRunRetriesAStuckBatch` (`t_8ba5309b`,
 fixed as a test defect in `t_07bc844a`), and both are production behaviour rather than test
@@ -944,11 +945,11 @@ behaviour: `Flusher.insert` acknowledged on the pass's own context - the one `Ru
 - `Flusher.insert` retires on `context.WithTimeout(context.WithoutCancel(ctx), AckTimeout)`, 2 s by
   default. By the time `Ack` runs the transaction has committed, so the pass's cancellation can only
   revoke the retirement; `Run`'s own D-3 drain already uses `context.WithoutCancel` on the same
-  reasoning (`flusher.go:142`), and the retirement was the last write on that path a SIGTERM could
-  still cancel. `AckTimeout` is a `FlusherOptions` field and deliberately not a `PIGEON_` knob, the
-  same status as `FailBackoff`: a Redis that has stopped answering must not hold a pass open, and
-  the value is not an operator's to tune. The gauge read that follows the retirement uses the same
-  bounded context, so a shutdown still records the depth it retired.
+  reasoning (`flusher.go:172` at `f4f20dc`), and the retirement was the last write on that path a
+  SIGTERM could still cancel. `AckTimeout` is a `FlusherOptions` field and deliberately not a
+  `PIGEON_` knob, the same status as `FailBackoff`: a Redis that has stopped answering must not hold
+  a pass open, and the value is not an operator's to tune. The gauge read that follows the
+  retirement uses the same bounded context, so a shutdown still records the depth it retired.
 - `clientFromURL` enables `ContextTimeoutEnabled` on the buffer's client, because without it
   `AckTimeout` is not the bound it reads as. Measured against a listener that accepts and never
   answers: `XACK` with a 200 ms deadline returns in **3 s** with the options the package builds
@@ -965,7 +966,9 @@ behaviour: `Flusher.insert` acknowledged on the pass's own context - the one `Ru
   flag buys is the mid-flight reply, not the cancelled-before-send case: a context already cancelled
   at call time fails `Push` today as well, flag off and on (`buffer attempt 1/1: context canceled`,
   `XLEN 0`).
-- `Buffer.SweepStranded` runs once per process, at `Run`'s startup, after the startup `reclaim(0)`.
+- `Buffer.SweepStranded` runs at `Run`'s startup, after the startup `reclaim(0)`, and again from
+  `Run`'s loop at most once per `StaleAfter` of wall time, tracked from the last sweep (`sweepIfDue`
+  in `internal/attemptbuf`).
   It compares `XLEN` with the group's pending count (`XINFO GROUPS`) and, only when the former is
   larger, issues `XTRIM <key> MINID <bound>`, where the bound is the smallest pending id
   (`XPENDING`'s summary `Lower`) if anything is pending, else the group's `LastDeliveredID`
@@ -984,17 +987,24 @@ behaviour: `Flusher.insert` acknowledged on the pass's own context - the one `Ru
   (`last-delivered-id` only moves forward, and only a read or a claim moves it) and is not pending,
   so it has already been acknowledged. Above the bound sit three populations: pending entries,
   entries nobody has read, and the case the sweep exists for - a strand an earlier retirement tore
-  off above the bound. The first two are kept, and the third is reached only when nothing pending
-  holds the bound down, which is the residual the trade-off below names. A strand is an anomaly - it
-  means a retirement was torn - so what the sweep removes is logged at warn, with the count.
+  off above the bound. The first two are kept, and the third is reached by a sweep whose bound has
+  nothing pending below it: either a sweep at which nothing is pending, or a later one in the same
+  process, once the entries that held the bound down have themselves been retired. Repeating the
+  sweep changes none of that, which is what makes the cadence safe: the bound is read from the
+  group's own bookkeeping on the same live connection at each sweep, an entry still in flight is
+  pending and so anchors the bound below itself, and every sweep keeps everything at or above the
+  bound it computed. A strand is an anomaly - it means a retirement was torn - so what the sweep
+  removes is logged at warn, with the count.
 - The three failure shapes are each closed: a graceful SIGTERM can no longer revoke a retirement
   (the bounded context); a hard kill or a dropped connection mid-retirement cannot leave half of one
   (the transaction); and a Redis-side tear that splits the transaction anyway - a SIGKILL between
   the two commands inside `EXEC`, or a crash whose AOF replay stops after the `XACK` - is repaired
-  at the next start (the sweep), which is also when the gauge it skewed is corrected - provided that
-  start's sweep has nothing older pending, because the sweep runs once per process and its bound is
-  wherever the pending list puts it that moment. `cmd/pigeon`'s shutdown grace can still cut the
-  drain short, which is the same class and the same answer.
+  by the sweep, which is also when the gauge it skewed is corrected. The cadence is what makes that
+  repair unconditional: the bound is wherever the pending list puts it at each sweep, so a strand a
+  start's own sweep had to leave - because an older entry was still pending and held the bound below
+  it - is retired by a later sweep in the same process, once the retry has retired that entry.
+  `cmd/pigeon`'s shutdown grace can still cut the drain short, which is the same class and the same
+  answer.
 
 **Trade-off.** The atomic retire was chosen over a compensation path - a Redis-side list of ids
 awaiting removal, or a scan that deletes entries that are neither pending nor newer than the group's
@@ -1014,24 +1024,36 @@ retry slot first, so nothing new is read while Redis is unhappy, every retry re-
 batch and bumps the conflict counter, and the stream grows behind it. `XTRIM`/`MAXLEN` on `Push` as
 a bound on the stream is worse: trimming does not consult the pending list, so it drops entries
 nobody has read - the evidence loss that `XADD` → read → commit exists to prevent. What the sweep
-accepts is two shapes, both strands: a strand created after this process swept waits for the next
-start, where the operator sees it as a warn line rather than never; and a strand already in the
-stream when this process swept, newer than the oldest pending entry at that moment, waits for a
-start whose sweep has nothing older pending. The second is reachable: the startup reclaim's insert
-or its retirement can fail (a Redis or Postgres hiccup, an `AckTimeout` expiry), which leaves the
-entry it holds pending while this start's sweep runs, and the retry retires it a moment after the
-sweep has gone. Measured on the shipped code (`fbebd60`, miniredis, throwaway probe): in that state
-the live process reads `XLEN = 1` with `pending = 0`, `Reclaim(min-idle 0)` and `Read(">")` both
-return 0 entries, and a second sweep - which `Run` never issues - retires it (`removed = 1`). Until
-a start whose sweep has nothing older pending, `AttemptBufferPending` stays that one count high: the
-residual this decision accepts, and a standing queue-depth alert for an operator who alerts on any
-depth. Closing it needs a sweep that runs more than once per process (`t_204dd2b6`), not a wider
-bound - the bound is what keeps the trim off an entry nobody has acknowledged.
+accepts is one cadence of latency, for two strand shapes. A strand created after this process swept
+is seen by the next sweep in the same process - at most `StaleAfter` later, which is the interval a
+peer's untouched pending batch gets before the flusher takes it over anyway - and logged at warn
+there, rather than never until the next start. A strand already in the stream, newer than the oldest
+pending entry at that sweep - the shape a single sweep cannot reach at all - needs a sweep whose
+bound has moved up: the startup reclaim's insert or its retirement can fail (a Redis or Postgres
+hiccup, an `AckTimeout` expiry), which leaves the entry it holds pending while that start's sweep
+runs, and the retry retires it a moment after the sweep has gone. Measured against a one-shot sweep
+(throwaway probe, miniredis, `fbebd60`): in that state the live process reads `XLEN = 1` with
+`pending = 0`, `Reclaim(min-idle 0)` and `Read(">")` both return 0 entries, and a second sweep -
+which that `Run` never issued - retires it (`removed = 1`). With the cadence that second sweep is
+the loop's, so the strand costs at most one pending-batch interval of an inflated
+`AttemptBufferPending` instead of the process's life - which is what NFR-6's ten-minute return to
+baseline needs - and the retire is logged rather than silent.
+`internal/attemptbuf`'s `TestStrandAboveTheBoundIsRetiredByALaterSweep` pins it end to end through
+`Run`: while the run is live and after it settles, `Depth() == 0` with an empty pending set, and
+every record inserted exactly once.
+
+What the cadence does not do is reach a strand directly, and that is deliberate: the bound stays
+what keeps the trim off an entry nobody has acknowledged, so an entry above it is retired only once
+the bookkeeping puts it below. The alternative - `XDEL` by id, or a scan for ids that are below
+`last-delivered-id` and absent from the PEL - is the inferred-destructive-command mechanism this
+trade-off rejects, and it would trade a bounded gauge skew for the risk of deleting evidence on a
+guess.
 
 **Encoded by.** D-9 (added), §6's attempt-evidence row (the acknowledgement after the commit is one
 transaction and is not revocable by the cancellation that ends a pass), §19's decision row;
-`internal/attemptbuf`'s `Buffer.Ack`, `Buffer.SweepStranded`, `Flusher.insert`/`Run`,
-`FlusherOptions.AckTimeout`, `clientFromURL`.
+`internal/attemptbuf`'s `Buffer.Ack`, `Buffer.SweepStranded`, `Flusher.insert`/`Run` (including
+`Run`'s `sweep`/`sweepIfDue` cadence), `FlusherOptions.AckTimeout`, `clientFromURL`;
+`TestStrandAboveTheBoundIsRetiredByALaterSweep`, `TestCadencedSweepIsNotDestructiveInSteadyState`.
 ### A-10 — The retry budget is the worker's attempt budget, not a second endpoint limit
 
 **Decision.** FR-1303's "separate budget" is the platform's attempt-execution capacity, not the
