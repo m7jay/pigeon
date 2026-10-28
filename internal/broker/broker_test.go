@@ -3,8 +3,10 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +23,14 @@ func jsonRaw(s string) json.RawMessage { return json.RawMessage(s) }
 // relay's nil return really is the ack (FR-701). It runs against the real Redis
 // CI provides (PIGEON_TEST_REDIS_URL) when set, and against an in-process
 // miniredis otherwise, so the same assertion holds in both places.
+//
+// The assertions below are about stream *lengths* ("want 1"), so this test needs
+// a stream it owns. It gets one from the database index in the URL: the caller
+// points PIGEON_TEST_REDIS_URL at a dedicated db (`redis://host:port/3`) and the
+// test honours it. Dropping the index - as this test used to - makes the
+// assertion depend on the whole server being empty, so any other producer of
+// `pigeon:events:normal` on db 0 (a running instance, a load run) turns it red
+// for a reason that has nothing to do with the broker.
 func TestRedisBrokerPublishesToStream(t *testing.T) {
 	addr := os.Getenv("PIGEON_TEST_REDIS_URL")
 	var rdb *redis.Client
@@ -30,7 +40,16 @@ func TestRedisBrokerPublishesToStream(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse PIGEON_TEST_REDIS_URL: %v", err)
 		}
-		rdb = redis.NewClient(&redis.Options{Addr: u.Host})
+		// go-redis takes an address and a db number, not a URL, so the URL has
+		// to be decomposed rather than trimmed: `redis://host:port/3` is not a
+		// dialable string. Same parse the fault matrix uses.
+		db := 0
+		if u.Path != "" && u.Path != "/" {
+			if _, err := fmt.Sscanf(strings.TrimPrefix(u.Path, "/"), "%d", &db); err != nil {
+				t.Fatalf("parse redis database in %q: %v", addr, err)
+			}
+		}
+		rdb = redis.NewClient(&redis.Options{Addr: u.Host, DB: db})
 		cleanup = func() { rdb.Close() }
 	} else {
 		mr, err := miniredis.Run()
