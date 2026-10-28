@@ -13,7 +13,7 @@ import (
 // The threshold pause and its resume.
 //
 // The delivery worker is a system worker (S4): it carries no producer scope, so
-// these reach the tenant tables through the SECURITY DEFINER functions in 0009
+// these reach the tenant tables through the SECURITY DEFINER functions in 0013
 // exactly as the claim does. Both halves are CONTROL state and therefore run with
 // synchronous_commit=on (FR-812, D-8): a pause that was reported but not written
 // would leave the platform hammering a receiver it just told the operator it had
@@ -173,7 +173,7 @@ func (s *Store) ResumeSubscription(ctx context.Context, endpointID, eventType st
 	return out, nil
 }
 
-// PauseNotification is one FR-1204 notification as recorded (0009). It is
+// PauseNotification is one FR-1204 notification as recorded (0013). It is
 // evidence, not the pause itself: the pause is the flag on the endpoint or
 // subscription, and this row is what was said about it.
 type PauseNotification struct {
@@ -189,7 +189,7 @@ type PauseNotification struct {
 
 // PauseNotifications reads an endpoint's pause notifications, newest first. The
 // portal and an operator both need it: v1.0 has no mailer, so this row is the
-// notification (0009).
+// notification (0013).
 func (s *Store) PauseNotifications(ctx context.Context, endpointID string, limit int) ([]PauseNotification, error) {
 	rows, err := s.pool.Query(ctx, `select kind, endpoint_id, coalesce(event_type, ''),
 		coalesce(failing_subscriptions, 0), coalesce(first_response, ''),

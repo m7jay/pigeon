@@ -66,7 +66,7 @@ type LeasedDelivery struct {
 }
 
 // EndpointPolicy is one endpoint's retry policy and limits, as stored on its row
-// (0009). Every field has a documented default and a documented bound, so an
+// (0013). Every field has a documented default and a documented bound, so an
 // endpoint that has never been configured behaves exactly as §9, FR-1302 and
 // FR-1306 describe.
 type EndpointPolicy struct {
@@ -132,7 +132,7 @@ func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow tim
 	if err != nil {
 		return d, false, fmt.Errorf("claim delivery: %w", err)
 	}
-	// The policy's durations arrive as epoch seconds (0009 casts them), so the
+	// The policy's durations arrive as epoch seconds (0013 casts them), so the
 	// whole per-endpoint policy is a value the worker can use directly.
 	d.Endpoint.BackoffBase = seconds(backoffBaseS)
 	d.Endpoint.BackoffMax = seconds(backoffMaxS)
