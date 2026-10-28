@@ -696,3 +696,137 @@ func TestInsertRetiresWithinAckTimeoutOnAHungRedis(t *testing.T) {
 		t.Fatalf("the retirement took %v, want about AckTimeout (200 ms): the bound was not the one that was set", elapsed)
 	}
 }
+
+// refuseRetireHook fails every pipeline carrying a retirement's XACK, so
+// Buffer.Ack reports an error with nothing applied: what a Redis that is down,
+// or that has stopped answering within AckTimeout, looks like to the flusher.
+// The refusal is raised on the client (the hook returns before the commands are
+// sent) rather than by a server answering errors mid-transaction, because a
+// MULTI answered with an error leaves go-redis holding an unread reply and
+// dropping the connection - noise in a test about the flusher's bookkeeping.
+type refuseRetireHook struct {
+	mu       sync.Mutex
+	refusals int
+}
+
+func (h *refuseRetireHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *refuseRetireHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+
+func (h *refuseRetireHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		for _, c := range cmds {
+			if c.Name() == "xack" {
+				h.mu.Lock()
+				h.refusals++
+				h.mu.Unlock()
+				return errors.New("LOADING Redis is loading the dataset in memory")
+			}
+		}
+		return next(ctx, cmds)
+	}
+}
+
+// refused is the race-free read of how many retirements the hook failed: the
+// test's proof that a retirement was attempted at all.
+func (h *refuseRetireHook) refused() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.refusals
+}
+
+// TestAFailedRetirementLeavesTheRetrySlotEmpty pins the order inside insert():
+// the retry slot is cleared once the rows are committed and BEFORE the
+// retirement is attempted, so a retirement that fails after the commit returns
+// its error without re-parking the batch (D-9).
+//
+// Why the slot must stay empty (the rejected alternative, the decision record's
+// section 2 q3): readBatch returns the retry slot FIRST, so a batch retained
+// there is handed back on every pass. Nothing new is read while Redis is
+// unhappy, every retry re-inserts a batch whose rows are already in Postgres
+// (which counts AttemptsConflicted), and the stream grows behind it.
+//
+// The retirement fails here the way a Redis that cannot apply the
+// acknowledgement makes it fail (refuseRetireHook). The hung listener
+// TestInsertRetiresWithinAckTimeoutOnAHungRedis uses fails it just as well and
+// would do for the slot assertion, but it never answers again, and the last
+// assertions below need a healthy buffer: the pass after the failure has to be
+// able to read.
+func TestAFailedRetirementLeavesTheRetrySlotEmpty(t *testing.T) {
+	ctx := context.Background()
+	buf, _ := newTestBuffer(t)
+	hook := &refuseRetireHook{}
+	buf.rdb.AddHook(hook)
+	sink := &fakeSink{}
+	fl, err := NewFlusher(buf, sink, FlusherOptions{
+		Interval:   10 * time.Millisecond,
+		StaleAfter: time.Hour,
+		AckTimeout: 200 * time.Millisecond,
+		DrainGrace: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+
+	// The state the invariant is about, driven rather than seeded: one entry is
+	// pushed, the sink refuses the insert, and insert parks the batch in the
+	// retry slot. StaleAfter is an hour, so nothing below can be a stale reclaim
+	// handing the same entry back.
+	if err := buf.Push(ctx, rec(1, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	sink.failNext = errors.New("transient")
+	if _, err := fl.FlushOnce(ctx); err == nil {
+		t.Fatal("the first FlushOnce returned nil after a failed insert")
+	}
+	if got := len(fl.stuck); got != 1 {
+		t.Fatalf("the failed insert left %d entries in the retry slot, want 1", got)
+	}
+	failed := fl.stuck[0]
+
+	// A second entry arrives while the first batch is still unretired: it is what
+	// the pass after the failed retirement must read.
+	if err := buf.Push(ctx, rec(2, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+
+	// The retry's insert commits - the fake sink accepts it - and its retirement
+	// cannot be applied.
+	inserted, err := fl.FlushOnce(ctx)
+	if got := hook.refused(); got != 1 {
+		t.Fatalf("the retirement was attempted %d times, want 1: the batch is retired after its insert", got)
+	}
+	if err == nil {
+		t.Fatal("FlushOnce reported success while the retirement could not be applied")
+	}
+	if inserted != 1 {
+		t.Fatalf("FlushOnce inserted %d rows, want 1: the insert commits before the retirement, so the failure is the retirement's", inserted)
+	}
+
+	// The invariant: the retry slot is empty, so the next pass is free to read.
+	if got := len(fl.stuck); got != 0 {
+		t.Fatalf("after a failed retirement the retry slot holds %d entries, want 0: readBatch returns the retry slot first, so a retained batch is handed back on every pass and nothing new is read while Redis is unhappy", got)
+	}
+	// And the batch really was not retired: its entry stays pending for the stale
+	// reclaim window, which is what makes retaining it a stall rather than a loss.
+	if got := pendingCount(t, buf); got != 1 {
+		t.Fatalf("pending entries after the failed retirement = %d, want 1 (the committed batch is still pending; nothing acknowledged it)", got)
+	}
+
+	// The next read is the entry pushed during the failure, not the batch whose
+	// retirement failed. A flusher that retained that batch hands it back here
+	// instead, and that is the stall this pins.
+	entries, err := fl.readBatch(ctx)
+	if err != nil {
+		t.Fatalf("readBatch after the failed retirement: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("readBatch returned %d entries %v, want the one entry pushed after the failure", len(entries), IDs(entries))
+	}
+	if entries[0].ID == failed.ID {
+		t.Fatalf("readBatch returned the batch whose retirement failed (%s, delivery %d) instead of the entry pushed after it (delivery 2): readBatch returns the retry slot first, so a retained batch is read again on every pass and nothing new is", failed.ID, failed.Record.DeliveryID)
+	}
+	if got := entries[0].Record.DeliveryID; got != 2 {
+		t.Fatalf("readBatch returned the entry with delivery %d, want the one pushed after the failure (delivery 2)", got)
+	}
+}
