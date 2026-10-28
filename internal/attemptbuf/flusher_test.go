@@ -72,6 +72,38 @@ func newTestFlusher(t *testing.T, batch int) (*Flusher, *fakeSink, *Buffer) {
 	return fl, sink, buf
 }
 
+// waitFor polls cond until it holds or d reaches, and reports which happened. The
+// flusher runs on its own goroutine, so every state a test wants to see is waited
+// for rather than sampled; d is what keeps a state that never arrives (a mutation
+// that dropped the behaviour) a failure instead of a hang.
+func waitFor(d time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if cond() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// sameRecords reports whether two batches carry the same attempt records, which is
+// the retry property: the flusher re-inserts the batch it failed on, not a fresh
+// read of something else.
+func sameRecords(a, b []store.AttemptRecord) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].DeliveryID != b[i].DeliveryID || a[i].Attempt != b[i].Attempt {
+			return false
+		}
+	}
+	return true
+}
+
 // TestFlushOnceInsertsOneTransaction is FR-815's unit-level guarantee: every
 // FlushOnce call is exactly one Sink.RecordAttempts call, however many entries it
 // carried, and the batch is acknowledged only after the insert succeeds.
@@ -289,6 +321,14 @@ func TestRunDrainsOnCancellation(t *testing.T) {
 // TestRunRetriesAStuckBatch: a failed insert leaves the batch in the retry slot,
 // and the next pass inserts it without waiting for the stale-reclaim window. This
 // is what keeps a transient database blip from delaying evidence by 30 s.
+//
+// StaleAfter is an hour here, so a second sink call cannot come from the
+// stale-reclaim path: it can only be the retry of the batch the failed insert left
+// in the slot. The context is cancelled only once that retry has been
+// acknowledged, because a pass acknowledges on the context Run was given — a
+// cancel landing between the retry's sink call and its ack revokes the ack and
+// leaves the entry in the stream, and the assertions below would then be reading
+// an interleaving rather than the retry.
 func TestRunRetriesAStuckBatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -301,20 +341,49 @@ func TestRunRetriesAStuckBatch(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- fl.Run(ctx) }()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for sink.rowCount() < 1 {
-		if time.Now().After(deadline) {
-			t.Fatalf("Run did not retry the failed batch within 2s; batches=%d", sink.batchCount())
-		}
-		time.Sleep(5 * time.Millisecond)
+	// The retry: the sink's second call, which the flusher's own retry slot
+	// produces on the pass after the failure — far inside the hour StaleAfter
+	// would have made it wait for.
+	if !waitFor(5*time.Second, func() bool { return sink.batchCount() >= 2 }) {
+		t.Fatalf("Run did not retry the failed batch within 5s; sink calls=%d, rows=%d",
+			sink.batchCount(), sink.rowCount())
 	}
+	// And it is acknowledged: that ack is what retires the entries from the buffer.
+	if !waitFor(5*time.Second, func() bool {
+		depth, err := buf.Depth(context.Background())
+		return err == nil && depth == 0
+	}) {
+		depth, _ := buf.Depth(context.Background())
+		t.Fatalf("the retry was not acknowledged within 5s; buffer depth=%d, sink calls=%d, rows=%d",
+			depth, sink.batchCount(), sink.rowCount())
+	}
+
 	cancel()
-	<-done
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	if got := sink.batchCount(); got != 2 {
+		t.Fatalf("sink was called %d times, want 2 (the failed insert and its retry)", got)
+	}
+	if !sameRecords(sink.batches[0], sink.batches[1]) {
+		t.Fatalf("the retry did not carry the failed batch: first %+v, retry %+v", sink.batches[0], sink.batches[1])
+	}
+	if got := sink.rowCount(); got != 1 {
+		t.Fatalf("sink inserted %d rows, want 1", got)
+	}
+	// Run has returned, so reading the flusher's own state is race-free here: the
+	// retry slot is empty again, and the entry is out of the buffer.
+	if got := len(fl.stuck); got != 0 {
+		t.Fatalf("the flusher still holds %d entries in its retry slot after a successful retry", got)
+	}
 	if depth, _ := buf.Depth(context.Background()); depth != 0 {
 		t.Fatalf("buffer depth after the retry = %d, want 0", depth)
-	}
-	if got := sink.batchCount(); got < 2 {
-		t.Fatalf("sink was called %d times, want at least 2 (the failure and the retry)", got)
 	}
 }
 
