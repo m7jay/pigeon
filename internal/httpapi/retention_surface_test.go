@@ -201,7 +201,7 @@ func TestDedupeAnswerSurvivesTheSweep(t *testing.T) {
 	// TODAY's partition on any run at or after 12:00 UTC. Either way the sweep
 	// below drops nothing and the archive assertion reads 0 rows. Two days back is
 	// expired at every hour of the day.
-	day := time.Now().UTC().Truncate(24 * time.Hour).AddDate(0, 0, -2)
+	day := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -2)
 	at := time.Date(day.Year(), day.Month(), day.Day(), 12, 0, 0, 0, time.UTC)
 	leaf, err := e.st.EnsurePartition(ctx(), "deliveries", day)
 	if err != nil {
