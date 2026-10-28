@@ -65,7 +65,10 @@ disposes of them, and the split is deliberate:
   wait loops at `:502-514` and `:521-534`), so with the default `PIGEON_DELIVERY_WORKERS=1`
   one capped endpoint occupies a
   process's only dispatch loop and nothing reports it. S11 adds no second endpoint limit:
-  FR-1308 is untouched, and the retry budget it partitions is the worker's attempt budget.
+  FR-1308 is untouched, and the retry budget it partitions is the worker's attempt budget -
+  `PIGEON_DELIVERY_CONCURRENCY` (default 64) split into the retry lane `R` (default 16) and the
+  first-attempt lane `C - R` (default 48), so the process's ceiling stays `C` rather than becoming
+  `C + R`.
 - **FR-1301's publish half is already shipped** as FR-207's per-key and per-producer rate
   limits; its **delivery**-quota half is deferred to v1.1 with its cost stated
   (`REQUIREMENTS.md` §17.1), because a per-producer value needs a config surface and an API to
