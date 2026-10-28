@@ -899,7 +899,7 @@ Neither is the mechanism. The budget that separates is the worker's.
   first-attempt lane, and FR-1308 keeps it on the endpoint's shared limits.
 - **Claim side.** `pigeon_claim_delivery` gains an attempt-class predicate, so a lane selects only
   its own class. Today it cannot: it selects `order by d.id limit 1` over every pending delivery
-  (`0013_s5_retry_pause_limits.sql:288-330`), so the oldest row wins and a retry backlog is claimed
+  (`0013_s5_retry_pause_limits.sql:308`), so the oldest row wins and a retry backlog is claimed
   ahead of every newer first attempt.
 - **Lane side.** The worker runs one claim loop per lane. The first-attempt lane keeps
   `PIGEON_DELIVERY_CONCURRENCY` (FR-816's per-process cap, default 64); the retry lane gets
@@ -914,8 +914,9 @@ Neither is the mechanism. The budget that separates is the worker's.
   consumes no attempt, leaves `retry_deadline` untouched, and records the hold.
 - **Why the hold is load-bearing, and what it replaces.** `dispatch` claims a delivery and takes
   the process slot *before* `acquireEndpointLimits` (`internal/delivery/delivery.go:439-486`), then
-  sleeps inside that path (lines 502-534). With `PIGEON_DELIVERY_WORKERS=1`, the shipped default
-  (`internal/config/config.go:166`), one capped endpoint therefore occupies the process's only
+  sleeps inside that path (the two wait loops at `:502-514` and `:521-534`). With
+  `PIGEON_DELIVERY_WORKERS=1`, the shipped default
+  (`internal/config/config.go:165`), one capped endpoint therefore occupies the process's only
   dispatch loop. An endpoint at its default cap of 10 with 5 s hangs drains at 2 attempts/s, so a
   due backlog of `D` rows parks that process for `D/2` seconds - 1,000 rows for about 8 minutes -
   while every other endpoint and producer waits, and nothing says why. That is FR-1304's "silent
