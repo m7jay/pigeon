@@ -713,8 +713,11 @@ complete the 200th token lands exactly at the window's edge), and a load that st
 the rate emits at the rate from the second second on.
 `TestSuccessLogGateHoldsTheBoundAtLoad` asserts `allowed <= 2*rps`; S6's
 review measured the real worker path at `SuccessLogRPS=1` over 12 successes and got exactly
-one line. A negative `PIGEON_SUCCESS_LOG_RPS` is the explicit "log every success" escape
-hatch, `0` takes the default, and failures and state transitions are never gated.
+one line. `PIGEON_SUCCESS_LOG_RPS` is floored at one line per second by `config.Load` before
+`Validate` runs, so `0` and a negative value both become 1 and no environment value turns the
+gate off; the "log every success" path is a `delivery.New` caller passing a negative
+`Options.SuccessLogRPS` (`internal/delivery/delivery.go:165`), which the environment cannot
+reach. Failures and state transitions are never gated.
 
 **Trade-off.** The alternative bound - "at most `rps` in any one-second window" - needs the
 bucket to start near-empty or a per-window clamp, and either shape costs the visible first
