@@ -795,6 +795,15 @@ func (w *Worker) handle(ctx context.Context, d store.LeasedDelivery) {
 		w.log.Error("delivery: signing secret is not a decodable whsec_ value (FR-1001)",
 			"delivery_id", d.DeliveryID, "error", signErr)
 	}
+	if len(req.droppedHeaders) > 0 {
+		// The stored value did not authenticate, so it is not sent (FR-1006). The
+		// delivery still goes out: one bad entry must not wedge a delivery, and the
+		// operator needs to know which header was refused - by name, because the
+		// value is the secret that could not be read in the first place.
+		w.log.Warn("delivery: custom headers dropped, they did not authenticate (FR-1006)",
+			"delivery_id", d.DeliveryID, "endpoint_id", d.EndpointID,
+			"headers", req.droppedHeaders)
+	}
 	// Per-attempt timeout (FR-819), derived from ctx so it is also cancelled on
 	// shutdown, bounding the attempt in both time and goroutine lifetime.
 	attemptCtx, cancel := context.WithTimeout(ctx, w.timeoutFor(d))

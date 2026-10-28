@@ -30,6 +30,16 @@ type signedRequest struct {
 	webhookTime string // integer Unix seconds of the attempt (FR-1001, FR-1003)
 	webhookSig  string
 	userAgent   string
+	// customHeaders are the endpoint's FR-405 headers, decrypted for this one
+	// request (FR-1006). They are the only place a header plaintext exists
+	// outside the seal, and they are never logged.
+	customHeaders []store.CustomHeader
+	// droppedHeaders names the stored entries that did not authenticate on this
+	// claim - a value sealed under a different endpoint's id, or under a key this
+	// process does not have. They are NOT sent; the name is kept so the worker can
+	// say what it refused. Listing names, never values, is what keeps this
+	// diagnosable without putting a secret in the log (FR-1006, FR-1008).
+	droppedHeaders []string
 	// endpointID keys the per-endpoint transport (FR-817). It is carried on the
 	// request rather than looked up by URL so two endpoints that happen to share
 	// a host still get their own connection pools and their own caps.
@@ -75,12 +85,14 @@ func buildSignedRequest(d store.LeasedDelivery, attempt int, userAgent string, n
 	}
 	ts := envelope.WebhookTimestamp(now)
 	return signedRequest{
-		url:         d.EndpointURL,
-		endpointID:  d.EndpointID,
-		body:        body,
-		webhookID:   env.ID,
-		webhookTime: ts,
-		webhookSig:  env.Signature(key, ts, string(body)),
-		userAgent:   userAgent,
+		url:            d.EndpointURL,
+		endpointID:     d.EndpointID,
+		body:           body,
+		webhookID:      env.ID,
+		webhookTime:    ts,
+		webhookSig:     env.Signature(key, ts, string(body)),
+		userAgent:      userAgent,
+		customHeaders:  d.CustomHeaders,
+		droppedHeaders: d.DroppedCustomHeaders,
 	}, keyErr
 }
