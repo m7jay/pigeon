@@ -57,6 +57,21 @@ func portalRequest(t *testing.T, p *consumer.Handler, token, method, target stri
 	if err != nil {
 		t.Fatalf("encode session cookie: %v", err)
 	}
+	// FR-1009/AC-50: every state-changing request in this portal carries the pair a
+	// rendered form carries - the CSRF cookie and the matching hidden field - so
+	// this helper supplies both for anything but a safe method. AC-50's own test in
+	// internal/portal/consumer is the one that strips or mismatches them on purpose.
+	csrf := ""
+	if method != http.MethodGet && method != http.MethodHead {
+		csrf, err = portal.MintRandom("test-cookie-secret", enc)
+		if err != nil {
+			t.Fatalf("mint csrf token: %v", err)
+		}
+		if form == nil {
+			form = url.Values{}
+		}
+		form.Set("csrf_token", csrf)
+	}
 	var body io.Reader
 	if form != nil {
 		body = strings.NewReader(form.Encode())
@@ -66,6 +81,9 @@ func portalRequest(t *testing.T, p *consumer.Handler, token, method, target stri
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
 	req.AddCookie(&http.Cookie{Name: "consumer_session", Value: enc})
+	if csrf != "" {
+		req.AddCookie(&http.Cookie{Name: portal.CSRFCookieName, Value: csrf})
+	}
 	rec := httptest.NewRecorder()
 	p.Handler().ServeHTTP(rec, req)
 	return rec
