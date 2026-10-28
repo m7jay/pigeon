@@ -643,12 +643,65 @@ is an operator decision about data the app does not own.
 
 **Encoded by.** OPS-4 (amended), OPS-10 (amended), OPS-11, AC-48.
 
-## Gap list — six decided, one open
+### A-7 — The attempt counter is control state on the delivery row, not the buffer's pending-entry count
+
+**Decision.** The attempt counter is `deliveries.attempts`: control state, advanced by the
+same write that schedules a retry, and an attempt's number is
+`max(deliveries.attempts, the attempt rows already written) + 1`. The Redis Stream's
+pending-entry list is the *buffer's* recovery accounting and is never the attempt counter.
+D-2 said the opposite ("the attempt counter comes from the Redis Streams pending-entry
+delivery count"), which was the design intent behind §19's `Queue: Redis Streams` row
+rather than a measurement. S6 shipped the mechanism that works and documented the
+deviation in `0010_attempt_buffer.sql`'s header instead of in this list, which is the
+process defect PLAN.md rule 5 exists to catch; this amendment is that record, made after
+the fact.
+
+**Mechanism.**
+
+- `0010_attempt_buffer.sql` adds `pigeon_requeue_delivery(p_delivery_id, p_backoff,
+  p_attempt)`, which sets `lease_expires_at = now() + p_backoff` and
+  `attempts = greatest(attempts, p_attempt)`. It runs in the same control transaction the
+  retry already needed (`db.ControlTx`, `synchronous_commit=on`, FR-812), so the counter
+  costs no extra round trip and no extra fsync.
+- `greatest()`, never assignment, so a re-delivered requeue cannot walk the counter
+  backwards; `0008`'s completion and terminal writes still set `attempts` exactly to the
+  attempt that happened.
+- `pigeon_claim_delivery` returns the counter as `row_attempts` beside the evidence count
+  `prior_attempts`; `store.LeasedDelivery.NextAttemptNumber()` returns their maximum plus
+  one for the worker's own claim, and `pigeon_next_attempt()` takes the same maximum for
+  callers that hold only a delivery id (S7's inspect API).
+- `sync` mode is the reason this cannot live in the stream: `attempt_log.mode=sync` writes
+  every attempt row inline and has no stream at all. In `buffered` mode the stream's
+  pending-entry count moves with the flusher's bookkeeping - every reclaim of a dead
+  flusher's batch - rather than with delivery attempts.
+- The maximum is what makes the two modes agree. In `sync` both counters advance together;
+  on a database written before 0010 the evidence rows are the only counter there is.
+- The sweeper (D-6) does not touch the counter: a lapsed lease is not a new attempt.
+
+**Trade-off.** Two records of one fact - the counter on the delivery row and the rows in
+`attempts` - legitimately disagree while evidence is buffered: the counter leads by up to
+§6's 1 s flush window. The number handed out is their maximum, which can skip a number in
+exactly one shape: a retry whose schedule write committed and whose evidence row was then
+lost (a worker killed between the control commit and the buffer push, or an unclean Redis
+crash). A skipped number is a gap in a trail; the alternative, reusing a number, silently
+drops an evidence row against `attempts_delivery_attempt_key`'s unique
+`(delivery_id, attempt)` - which is the loss this change exists to prevent. The counter is
+also readable when Redis is not, which matters because a Redis outage sends attempts
+inline.
+
+**Encoded by.** D-2 (rewritten), §6's attempt-evidence row (now names the Redis Stream and
+its consumer group, because "Redis list" cannot keep the row's own "0 on worker crash"
+promise), FR-811, FR-902, AC-07, AC-28; `0010_attempt_buffer.sql`,
+`store.LeasedDelivery.NextAttemptNumber`, `store.NextAttempt`.
+
+## Gap list — eight decided, one open
 
 Six gaps, each now a decision with a mechanism and a named trade-off. Row 4b is a
 seventh contradiction found while resolving the fourth, recorded here instead of being
 left for S3 to guess at. The seventh numbered item below was found after the
-amendment and is not one of them; it stays open.
+amendment and is not one of them; it stays open. Rows 8 and 9 came after S6 landed:
+both are places where the shipped mechanism, not a silence, changed the answer, which
+is the case PLAN.md's rule 5 sends to this list rather than into a code comment.
 
 | # | Gap | Decision | Contract changed | Unblocks |
 |---|---|---|---|---|
@@ -659,6 +712,7 @@ amendment and is not one of them; it stays open.
 | 4b | I-3 said replay was unique with fan-out (found during 4) | A-4 | I-3 amended to a partial unique index | S3, S7 |
 | 5 | Consumer session format unspecified | A-5 | FR-110 rewritten; FR-112, FR-113 added; AC-47 | S9 |
 | 6 | `pigeon doctor` unspecified | A-6 | OPS-4 and OPS-10 amended; OPS-11 added; AC-48 | S10 |
+| 8 | D-2 named the Redis Streams pending-entry count as the attempt counter | A-7 | D-2 rewritten to name `deliveries.attempts`; §6's attempt-evidence row names the Redis Stream and its consumer group | S6 (landed), S7's inspect API |
 
 **They do not contradict each other**, checked pairwise where they touch: A-1's pause
 flags and A-4's archive both ride the control/evidence split in §6 (D-8, FR-812); A-2's
