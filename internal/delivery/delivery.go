@@ -124,8 +124,14 @@ type Options struct {
 	// Now supplies the clock the backoff and the pause windows are measured on.
 	// Nil means time.Now.
 	Now func() time.Time
-	// MaxConnsPerHost is a per-endpoint transport's connection cap (FR-817), the
-	// local backpressure bound that pairs with Concurrency. Defaults to 1.
+	// MaxConnsPerHost is the deployment's DEFAULT per-endpoint concurrency cap
+	// (FR-1302's 10), used when the endpoint sets no override of its own. It is
+	// one number for two jobs on purpose: the cluster-wide leased slot the worker
+	// must respect and the per-endpoint transport's MaxConnsPerHost (FR-817), so
+	// the local connection pool and the cluster-wide promise cannot disagree. A
+	// pool smaller than the endpoint's promise would make the promise
+	// unreachable; a larger one would let this process exceed the cap. Defaults
+	// to 10.
 	MaxConnsPerHost int
 	// PollInterval is how often an idle worker re-scans for due deliveries. Defaults
 	// to 1 s.
@@ -243,7 +249,10 @@ func New(st *store.Store, opts Options) *Worker {
 		opts.SlotTTL = 3 * opts.Timeout
 	}
 	if opts.MaxConnsPerHost <= 0 {
-		opts.MaxConnsPerHost = 1
+		// FR-1302's documented default. It is the deployment default for an
+		// endpoint that sets no override, and the transport pool for that
+		// endpoint, so the shipped configuration reaches the cap §9 promises.
+		opts.MaxConnsPerHost = defaultMaxConcurrency
 	}
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = time.Second
@@ -339,11 +348,14 @@ func (w *Worker) policyFor(d store.LeasedDelivery) RetryPolicy {
 	return p.Normalize()
 }
 
-// transportConnsFor is the endpoint's transport connection budget (FR-817): its
-// own concurrency cap, falling back to the process-wide default. It is the local
-// half of the concurrency bound - the authoritative half is the leased slot
-// (FR-1302), and the two agree because both read the same endpoint column.
-func (w *Worker) transportConnsFor(d store.LeasedDelivery) int {
+// effectiveConcurrency is FR-1302's cap for one endpoint: the endpoint's own
+// override when it sets one, else the deployment default
+// (PIGEON_DELIVERY_MAX_CONNS_PER_HOST, §9's 10 concurrent). It is the ONE number
+// the authoritative cluster-wide leased slot and the per-endpoint transport pool
+// (FR-817) both read, which is what makes them agree on the NULL case - and NULL
+// is the shipped default, so a second, smaller fallback here would make
+// FR-1302's documented default unreachable in production.
+func (w *Worker) effectiveConcurrency(d store.LeasedDelivery) int {
 	if d.Endpoint.MaxConcurrency > 0 {
 		return d.Endpoint.MaxConcurrency
 	}
@@ -485,10 +497,7 @@ func (w *Worker) acquireEndpointLimits(ctx context.Context, d store.LeasedDelive
 	if w.limits == nil {
 		return func() {}, nil
 	}
-	concCap := d.Endpoint.MaxConcurrency
-	if concCap <= 0 {
-		concCap = defaultMaxConcurrency
-	}
+	concCap := w.effectiveConcurrency(d)
 	var slot limit.Lease
 	for {
 		lease, ok, wait, err := w.limits.Acquire(ctx, d.EndpointID, concCap, w.opts.SlotTTL, w.holder)
@@ -579,7 +588,7 @@ func (w *Worker) handle(ctx context.Context, d store.LeasedDelivery) {
 	// Per-attempt timeout (FR-819), derived from ctx so it is also cancelled on
 	// shutdown, bounding the attempt in both time and goroutine lifetime.
 	attemptCtx, cancel := context.WithTimeout(ctx, w.timeoutFor(d))
-	res := w.deliver(attemptCtx, req, w.transportConnsFor(d), w.opts.MaxBodyBytes)
+	res := w.deliver(attemptCtx, req, w.effectiveConcurrency(d), w.opts.MaxBodyBytes)
 	cancel()
 	duration := w.now().Sub(attemptStart)
 

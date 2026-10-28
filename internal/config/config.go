@@ -110,7 +110,7 @@ type Config struct {
 	DeliveryJitter          float64       // PIGEON_DELIVERY_JITTER (§9: 0.2 = ±20%)
 	DeliveryConcurrency     int           // PIGEON_DELIVERY_CONCURRENCY (FR-816 per-process cap)
 	DeliverySlotTTL         time.Duration // PIGEON_DELIVERY_SLOT_TTL (FR-1302; 0 = 3x timeout)
-	DeliveryMaxConnsPerHost int           // PIGEON_DELIVERY_MAX_CONNS_PER_HOST (FR-817)
+	DeliveryMaxConnsPerHost int           // PIGEON_DELIVERY_MAX_CONNS_PER_HOST (FR-817, FR-1302's default cap: 10)
 	DeliveryPollInterval    time.Duration // PIGEON_DELIVERY_POLL_INTERVAL
 	DeliveryUserAgent       string        // PIGEON_DELIVERY_USER_AGENT (FR-810)
 	SweeperInterval         time.Duration // PIGEON_SWEEPER_INTERVAL (<= 10 s, D-6; clamped in Load)
@@ -172,7 +172,7 @@ func defaults() Config {
 		DeliveryRetryWindow:       72 * time.Hour,
 		DeliveryJitter:            0.2,
 		DeliveryConcurrency:       64,
-		DeliveryMaxConnsPerHost:   1,
+		DeliveryMaxConnsPerHost:   10,
 		DeliveryPollInterval:      time.Second,
 		SweeperInterval:           5 * time.Second,
 		SweeperLockWait:           60 * time.Second,

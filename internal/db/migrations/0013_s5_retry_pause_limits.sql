@@ -621,8 +621,29 @@ $$;
 -- gets its retry_deadline, next_attempt_at and lease pushed forward by exactly
 -- the paused duration, so a pause cannot consume a delivery's remaining window
 -- and the schedule resumes at its next interval rather than resetting.
+--
+-- The deadline case that matters is the NULL one: every delivery that was fanned
+-- out but never attempted has no retry_deadline yet (the first failure's requeue
+-- stamps it), and those are exactly the rows a pause holds. Extending "from now"
+-- there does not extend the window, it DESTROYS it: the row is promised
+-- resume_time + paused_for - a window of one pause - so a ten-minute pause would
+-- terminal every delivery it held after two attempts. The base has to be the
+-- window the delivery was promised: created_at + the endpoint's own retry_window
+-- when it sets one, else p_default_retry_window (the deployment's §9 window, the
+-- same value the claim schedules with). NULL + interval stays NULL, so the two
+-- schedule columns of a row that was never scheduled are left alone rather than
+-- pushed into the future.
+--
+-- p_default_retry_window is a parameter rather than a constant for the same
+-- reason the claim's is: the deployment config is the ONE source of the default,
+-- and a constant here would silently disagree with it.
 -- ---------------------------------------------------------------------------
-create or replace function pigeon_resume_endpoint(p_endpoint_id text)
+drop function if exists pigeon_resume_endpoint(text);
+
+create or replace function pigeon_resume_endpoint(
+        p_endpoint_id          text,
+        p_default_retry_window interval default interval '72 hours'
+    )
     returns table (
         resumed    boolean,
         producer_id text,
@@ -647,10 +668,14 @@ as $$
     ),
     extended as (
         update deliveries d
-        set retry_deadline  = coalesce(d.retry_deadline, now()) + (now() - m.paused_at),
-            next_attempt_at = coalesce(d.next_attempt_at, now()) + (now() - m.paused_at),
-            lease_expires_at = coalesce(d.lease_expires_at, now()) + (now() - m.paused_at)
+        set retry_deadline  = coalesce(d.retry_deadline,
+                                       d.created_at
+                                       + coalesce(ep.retry_window, p_default_retry_window))
+                              + (now() - m.paused_at),
+            next_attempt_at = d.next_attempt_at + (now() - m.paused_at),
+            lease_expires_at = d.lease_expires_at + (now() - m.paused_at)
         from moved m
+        join endpoints ep on ep.id = m.id
         where d.endpoint_id = m.id and d.status = 'pending'
         returning d.id
     )
@@ -660,7 +685,13 @@ as $$
            (select now() - paused_at from moved);
 $$;
 
-create or replace function pigeon_resume_subscription(p_endpoint_id text, p_event_type text)
+drop function if exists pigeon_resume_subscription(text, text);
+
+create or replace function pigeon_resume_subscription(
+        p_endpoint_id          text,
+        p_event_type           text,
+        p_default_retry_window interval default interval '72 hours'
+    )
     returns table (
         resumed    boolean,
         producer_id text,
@@ -687,11 +718,15 @@ as $$
     ),
     extended as (
         update deliveries d
-        set retry_deadline  = coalesce(d.retry_deadline, now()) + (now() - m.paused_at),
-            next_attempt_at = coalesce(d.next_attempt_at, now()) + (now() - m.paused_at),
-            lease_expires_at = coalesce(d.lease_expires_at, now()) + (now() - m.paused_at)
-        from moved m, events e
-        where e.id = d.event_id
+        set retry_deadline  = coalesce(d.retry_deadline,
+                                       d.created_at
+                                       + coalesce(ep.retry_window, p_default_retry_window))
+                              + (now() - m.paused_at),
+            next_attempt_at = d.next_attempt_at + (now() - m.paused_at),
+            lease_expires_at = d.lease_expires_at + (now() - m.paused_at)
+        from moved m, events e, endpoints ep
+        where ep.id = p_endpoint_id
+          and e.id = d.event_id
           and d.endpoint_id = p_endpoint_id
           and e.event_type = p_event_type
           and d.status = 'pending'
@@ -724,6 +759,6 @@ grant execute on function pigeon_finalize_delivery(bigint, int, timestamptz) to 
 grant execute on function pigeon_endpoint_subscription_stats(text) to current_user;
 grant execute on function pigeon_pause_subscription(text, text, text) to current_user;
 grant execute on function pigeon_pause_endpoint(text, text, int) to current_user;
-grant execute on function pigeon_resume_endpoint(text) to current_user;
-grant execute on function pigeon_resume_subscription(text, text) to current_user;
+grant execute on function pigeon_resume_endpoint(text, interval) to current_user;
+grant execute on function pigeon_resume_subscription(text, text, interval) to current_user;
 grant execute on function pigeon_pause_notifications(text, int) to current_user;

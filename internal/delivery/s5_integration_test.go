@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/m7jay/pigeon/internal/config"
 	"github.com/m7jay/pigeon/internal/limit"
 	"github.com/m7jay/pigeon/internal/pause"
 	"github.com/m7jay/pigeon/internal/store"
@@ -380,7 +381,7 @@ func TestAC14SubscriptionPauseAndResume(t *testing.T) {
 
 	// FR-1205/FR-1211: one action, no replay - the resume clears the flag and the
 	// counter state, and creates nothing.
-	resumer := pause.NewResumer(f.st, f.counters)
+	resumer := pause.NewResumer(f.st, f.counters, 0)
 	out, err := resumer.ResumeSubscription(ctx, f.endpointID, failing)
 	if err != nil {
 		t.Fatalf("ResumeSubscription: %v", err)
@@ -627,7 +628,7 @@ func TestEndpointBreadthPauseDoesNotTouchSubscriptions(t *testing.T) {
 
 	// FR-1211: an endpoint resume deletes the breadth set AND every member's
 	// window, so no member re-qualifies on one further failure.
-	resumer := pause.NewResumer(f.st, f.counters)
+	resumer := pause.NewResumer(f.st, f.counters, 0)
 	out, err := resumer.ResumeEndpoint(ctx, f.endpointID)
 	if err != nil {
 		t.Fatalf("ResumeEndpoint: %v", err)
@@ -701,6 +702,24 @@ func TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas(t *testing.T) {
 	}
 
 	observed := map[string]int{}
+
+	// The deployment defaults, from the shipped config rather than from a number
+	// written here: the third run below caps an endpoint that sets NO override, so
+	// the assertion has to be about what the deployment actually ships
+	// (PIGEON_DELIVERY_MAX_CONNS_PER_HOST, FR-1302's documented 10). Only the
+	// three variables Validate() requires are set; nothing else is configured.
+	t.Setenv("PIGEON_DATABASE_URL", "postgres://unused/unused?sslmode=disable")
+	t.Setenv("PIGEON_REDIS_URL", "redis://unused:6379/0")
+	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "not-the-documented-weak-default")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load with the required variables set: %v", err)
+	}
+	if cfg.DeliveryMaxConnsPerHost != concurrencyCap {
+		t.Errorf("the shipped default per-endpoint concurrency is %d, want AC-41's %d (FR-1302)",
+			cfg.DeliveryMaxConnsPerHost, concurrencyCap)
+	}
+
 	run := func(name string, replicas int) {
 		t.Helper()
 		counter.reset()
@@ -712,7 +731,11 @@ func TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas(t *testing.T) {
 				// assertion is that the ENDPOINT's limit binds, not the process's.
 				o.Concurrency = 4 * concurrencyCap
 				o.Limits = f.limits
-				o.MaxConnsPerHost = concurrencyCap
+				// The deployment default, as the process is configured: the
+				// per-endpoint transport pool and the cluster-wide lease both read
+				// this number, so the run below with no endpoint override is
+				// capping on exactly what a replica would.
+				o.MaxConnsPerHost = cfg.DeliveryMaxConnsPerHost
 				o.PollInterval = time.Millisecond
 			}))
 			wg.Add(1)
@@ -833,3 +856,4 @@ func (c *inFlightCounter) reset() {
 	defer c.mu.Unlock()
 	c.cur, c.peak, c.started = 0, 0, 0
 }
+
