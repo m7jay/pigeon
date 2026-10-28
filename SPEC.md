@@ -709,8 +709,9 @@ volume the line would have carried is never lost. Below the rate every success s
 and the reason the bucket starts full rather than empty. Measured by replaying the gate's
 own arithmetic: a 10,000-deliveries-in-one-second burst emits **199** lines in its first
 second at the default (the ceiling `2 × rps` is not reached, because the refill that would
-complete the 200th token lands exactly at the window's edge), and every later second emits
-at the rate. `TestSuccessLogGateHoldsTheBoundAtLoad` asserts `allowed <= 2*rps`; S6's
+complete the 200th token lands exactly at the window's edge), and a load that stays above
+the rate emits at the rate from the second second on.
+`TestSuccessLogGateHoldsTheBoundAtLoad` asserts `allowed <= 2*rps`; S6's
 review measured the real worker path at `SuccessLogRPS=1` over 12 successes and got exactly
 one line. A negative `PIGEON_SUCCESS_LOG_RPS` is the explicit "log every success" escape
 hatch, `0` takes the default, and failures and state transitions are never gated.
