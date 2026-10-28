@@ -1690,7 +1690,14 @@ func TestAC53HoldOnTheEndpointConcurrencyCap(t *testing.T) {
 		processCap  = 4
 		retryLane   = 2
 		endpointCap = 1
-		slotTTL     = 1500 * time.Millisecond
+		// holderTTL keeps the endpoint's one slot leased for the whole assertion
+		// phase, so the cap cannot free itself underneath a read: a short lease
+		// lapsing mid-test is what makes the worker attempt the delivery and end
+		// the hold episode the assertions below are reading. It is not an interval
+		// the test waits out - the cap is freed by the explicit Release at the end,
+		// not by this TTL expiring. The worker's own SlotTTL stays at the shipped
+		// 3 x timeout ratio.
+		holderTTL = 60 * time.Second
 	)
 
 	var served atomic.Int32
@@ -1710,11 +1717,9 @@ func TestAC53HoldOnTheEndpointConcurrencyCap(t *testing.T) {
 
 	// Put the endpoint AT its cap through the real limiter (FR-1307): one slot
 	// leased by a holder that is not this delivery, which is what another replica's
-	// in-flight attempt looks like in the shared slot set. The lease is short so the
-	// test does not have to wait a whole SlotTTL for the cap to free, and the
-	// worker's own SlotTTL stays at the shipped 3 x timeout ratio.
+	// in-flight attempt looks like in the shared slot set.
 	ctx := context.Background()
-	holder, ok, _, err := f.limits.Acquire(ctx, f.endpointID, endpointCap, slotTTL, "s11-test-holder")
+	holder, ok, _, err := f.limits.Acquire(ctx, f.endpointID, endpointCap, holderTTL, "s11-test-holder")
 	if err != nil {
 		t.Fatalf("lease the endpoint's slot: %v", err)
 	}
@@ -1797,9 +1802,17 @@ func TestAC53HoldOnTheEndpointConcurrencyCap(t *testing.T) {
 		t.Errorf("holding a delivery that does not exist = (%v, %v), want (false, nil) (FR-1304)", held, err)
 	}
 
-	// Free the cap, then let the hold lapse: the next attempt is the one the
-	// delivery already owed - attempt 1, with no attempt consumed by the hold.
+	// Free the cap and drop the claim gate with it: the next attempt is the one
+	// the delivery already owed - attempt 1, with no attempt consumed by the
+	// hold. The gate is the hold's own backoff (the wait the limiter reported,
+	// which is a whole holderTTL here), not part of FR-1304's requirement, so
+	// waiting it out would only make the test slower without asserting more.
 	holder.Release(ctx)
+	if _, err := f.admin.Exec(ctx,
+		`update deliveries set lease_expires_at = now(), next_attempt_at = now() where id = $1`,
+		deliveryID); err != nil {
+		t.Fatalf("release the hold's claim gate: %v", err)
+	}
 	if !waitFor(10*time.Second, func() bool { return readDelivery(t, f, deliveryID).firstAttemptAt.Valid }) {
 		t.Fatal("the delivery was never attempted after its endpoint's cap freed (FR-1304)")
 	}
