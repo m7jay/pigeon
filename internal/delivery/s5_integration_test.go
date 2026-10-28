@@ -174,6 +174,23 @@ func (f *s5Fixture) attemptCount(t *testing.T, deliveryID int64) int {
 	return n
 }
 
+// attemptsForType is the durable attempt count across every delivery of one event
+// type. The breadth rule counts SUBSCRIPTION windows (FR-1203), so the three
+// failures a subscription needs can be spread over three deliveries with one
+// attempt each - a per-delivery count cannot see them.
+func (f *s5Fixture) attemptsForType(t *testing.T, eventType string) int {
+	t.Helper()
+	var n int
+	if err := f.admin.QueryRow(context.Background(),
+		`select count(*) from attempts a
+		   join deliveries d on d.id = a.delivery_id
+		   join events e on e.id = d.event_id
+		  where e.event_type = $1`, eventType).Scan(&n); err != nil {
+		t.Fatalf("count attempts for %s: %v", eventType, err)
+	}
+	return n
+}
+
 func (f *s5Fixture) deliveryCount(t *testing.T) int {
 	t.Helper()
 	var n int
@@ -637,14 +654,23 @@ func TestEndpointBreadthPauseDoesNotTouchSubscriptions(t *testing.T) {
 
 	f := newS5Fixture(t, srv.URL, types...)
 	w := New(f.st, f.options(func(o *Options) {
-		// A failed delivery's next attempt is pushed past the rest of this test,
-		// so the worker cannot come back to a subscription it has already failed:
-		// the 3 x 3 the breadth rule counts (AC-44) is placed by the loop below -
-		// one fresh delivery per failure - rather than hoped for from a retry
-		// cadence, which under load can let one subscription race to its own depth
-		// of ten before the other two have three failures each.
-		o.BackoffBase = time.Second
-		o.BackoffMax = time.Second
+		// A failed delivery's next attempt is pushed past the rest of this test -
+		// an hour out - so the worker cannot come back to a subscription it has
+		// already failed: the 3 x 3 the breadth rule counts (AC-44) is placed by
+		// the loop below, one fresh delivery per failure, rather than hoped for
+		// from a retry cadence.
+		//
+		// A one-second cadence did not say that. FR-1209 counts EVERY failed
+		// attempt in its subscription's sliding hour, so on a busy box the 1 s
+		// lease expires while the placement loop below is still pumping; the claim
+		// takes the lowest id first, so the fresh delivery queues behind its
+		// predecessors' retries, three retries - one per subscription - cross the
+		// breadth floor of three, and the endpoint pauses (FR-1203) BEFORE the
+		// delivery this round is about has been attempted. That row then stays
+		// "pending" for any number of ProcessOne calls, because the claim holds
+		// every pending delivery of a paused endpoint (t_3218398e).
+		o.BackoffBase = time.Hour
+		o.BackoffMax = time.Hour
 	}))
 	ctx := context.Background()
 
@@ -658,8 +684,9 @@ func TestEndpointBreadthPauseDoesNotTouchSubscriptions(t *testing.T) {
 			_, id := f.publish(t, et, `{"id":"b1"}`)
 			held = append(held, id)
 			if !drive(t, w, 300, func() bool { return f.attemptCount(t, id) >= 1 }) {
-				t.Fatalf("the %s delivery of round %d was never attempted: status %q",
-					et, round+1, f.deliveryStatus(t, id))
+				status, reason := f.endpointStatus(t)
+				t.Fatalf("the %s delivery of round %d was never attempted (status %q, endpoint = (%q, %q))",
+					et, round+1, f.deliveryStatus(t, id), status, reason)
 			}
 			if status, _ := f.endpointStatus(t); status == "paused" {
 				paused = true
@@ -697,9 +724,17 @@ func TestEndpointBreadthPauseDoesNotTouchSubscriptions(t *testing.T) {
 		t.Errorf("breadth set = %v, want %v: the endpoint tripped on %d failing subscriptions",
 			members, sortedTypes, len(types))
 	}
-	for _, id := range held {
-		if n := f.attemptCount(t, id); n >= 10 {
-			t.Errorf("delivery %d has %d attempts; the endpoint should have tripped at breadth before any depth of ten", id, n)
+	for _, et := range types {
+		// The 3 x 3 came from the placements and nothing else (FR-1209 counts
+		// every failed attempt in its subscription's window): each subscription
+		// holds exactly the three failures the loop placed, so the endpoint tripped
+		// on breadth AT the floor of three rather than on the way to any
+		// subscription's own depth of ten (FR-1202, FR-1203). A per-delivery count
+		// cannot see a retry cadence reaching that floor on its own, which is
+		// exactly how this test used to race its own pause (t_3218398e).
+		if n := f.attemptsForType(t, et); n != len(types) {
+			t.Errorf("subscription %s has %d attempts, want exactly the %d the loop placed: the endpoint must trip on breadth at the floor, not on retries reaching it first",
+				et, n, len(types))
 		}
 	}
 
@@ -752,13 +787,18 @@ func TestEndpointBreadthPauseDoesNotTouchSubscriptions(t *testing.T) {
 		t.Errorf("endpoint after resume = (%q, %q), want (active, none)", status, reason)
 	}
 
-	// The held deliveries were never replayed, and they now deliver. The budget
-	// covers the 1 s the placement's backoff put on their schedule: the retry
-	// cadence lives in the lease (0013's requeue sets lease_expires_at to the
-	// next attempt), so the worker has to wait it out rather than be rushed.
+	// The held deliveries were never replayed, and they now deliver. Their
+	// schedule is where the placement's backoff left it - an hour out - so the test
+	// supplies the dueness itself, the way TestAC36RetryWindowEndsTheDelivery does:
+	// the retry cadence lives in the lease (0013's requeue sets lease_expires_at to
+	// the next attempt), and the property under test is that FR-1205 held these
+	// rows and FR-1207 kept their window - not that an hour can pass inside a test.
 	healthy.Store(true)
 	for _, id := range held {
-		if !drive(t, w, 2000, func() bool { return f.deliveryStatus(t, id) == "delivered" }) {
+		f.makeDue(t, id)
+	}
+	for _, id := range held {
+		if !drive(t, w, 200, func() bool { return f.deliveryStatus(t, id) == "delivered" }) {
 			t.Fatalf("delivery %d = %q after the resume, want delivered", id, f.deliveryStatus(t, id))
 		}
 	}
