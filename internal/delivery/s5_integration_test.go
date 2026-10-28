@@ -1352,22 +1352,32 @@ func TestFR1207EndpointResumeKeepsAStampedDeadline(t *testing.T) {
 	time.Sleep(paused)
 
 	resumer := pause.NewResumer(f.st, f.counters, 0)
-	if out, err := resumer.ResumeEndpoint(ctx, f.endpointID); err != nil {
+	// FR-1207's arithmetic is the period the platform RECORDED, not the period this
+	// test slept: the resumed deadline moves by now() - paused_at, which on a busy
+	// box overshoots a fixed sleep by seconds, so a bound derived from the constant
+	// above reddens CI for a box's throughput rather than for the code
+	// (t_3218398e). The resume reports the period it added back, which is the only
+	// value the assertion is entitled to compare against.
+	resumed, err := resumer.ResumeEndpoint(ctx, f.endpointID)
+	if err != nil {
 		t.Fatalf("ResumeEndpoint: %v", err)
-	} else if !out.Resumed {
+	}
+	if !resumed.Resumed {
 		t.Fatal("resume reported no transition on a paused endpoint (FR-1205)")
+	}
+	if resumed.PausedFor < paused {
+		t.Errorf("the resume reported a %s pause, want at least the %s the scope was paused for: the period it added back has to be the one it recorded",
+			resumed.PausedFor, paused)
 	}
 
 	// The stamped instant moves by exactly the paused period: not to
 	// created_at + the window (which would re-promise an hour that has already
-	// partly elapsed) and not to the resume itself (which would hand a delivery
-	// that has been failing for an hour a fresh window).
+	// partly elapsed), not to the resume itself (which would hand a delivery
+	// that has been failing for an hour a fresh window), and not by the pause
+	// twice.
 	delta := f.retryDeadline(t, deliveryID).Sub(stamped)
-	if delta < paused/2 {
-		t.Errorf("the stamped deadline moved %s, want the %s pause added once: a held delivery keeps the window it was promised (FR-1207)",
-			delta, paused)
-	}
-	if delta > paused+paused/2 {
-		t.Errorf("the stamped deadline moved %s, want the %s pause added once, not twice (FR-1207)", delta, paused)
+	if delta < resumed.PausedFor-2*time.Millisecond || delta > resumed.PausedFor+2*time.Millisecond {
+		t.Errorf("the stamped deadline moved %s, want the %s pause the resume recorded, added once (FR-1207)",
+			delta, resumed.PausedFor)
 	}
 }
