@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -133,6 +134,14 @@ type Config struct {
 	// cannot statfs the data directory: usage is then pigeon's own database size
 	// against this number, reported as source "database" in /v1/meta/usage.
 	DiskBytes uint64 // PIGEON_DISK_BYTES
+
+	// Deployment identity (FR-1007). EgressIPs is the allowlist GET
+	// /v1/meta/egress-ips publishes: the addresses this instance's deliveries
+	// come from, as the operator declared them. Empty means "read the host's own
+	// interfaces", which is correct only on a flat network - behind NAT, a load
+	// balancer or a container network the receiver sees a different address, and
+	// only the operator knows it. Each entry is an address or a CIDR block.
+	EgressIPs []string // PIGEON_EGRESS_IPS (comma-separated)
 
 	// Delivery worker (S4), the S5 limits, and sweeper. The timeout is capped at
 	// the FR-802 hard ceiling of 5 s in Load.
@@ -309,6 +318,9 @@ func Load() (Config, error) {
 	if c.DiskBytes, err = envBytes("PIGEON_DISK_BYTES", c.DiskBytes); err != nil {
 		return Config{}, err
 	}
+	// FR-1007: a comma-separated allowlist, empty entries dropped so a trailing
+	// comma is not a boot failure.
+	c.EgressIPs = splitList(env("PIGEON_EGRESS_IPS", ""))
 	if c.DeliveryWorkers, err = envInt("PIGEON_DELIVERY_WORKERS", c.DeliveryWorkers); err != nil {
 		return Config{}, err
 	}
@@ -519,6 +531,19 @@ func (c Config) Validate() error {
 	if c.DBReservedConns < 0 {
 		problems = append(problems, "PIGEON_DB_RESERVED_CONNS must be >= 0")
 	}
+	// FR-1007 publishes this list to receivers as an allowlist. A typo here is a
+	// delivery outage on the consumer's side, discovered days later, so it is
+	// refused at boot rather than served.
+	for _, entry := range c.EgressIPs {
+		if net.ParseIP(entry) != nil {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(entry); err == nil {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf(
+			"PIGEON_EGRESS_IPS entry %q is neither an IP address nor a CIDR block: FR-1007 publishes this list as the allowlist receivers configure", entry))
+	}
 	if c.DeliveryWorkers < 0 {
 		problems = append(problems, "PIGEON_DELIVERY_WORKERS must be >= 0 (0 disables the worker)")
 	}
@@ -672,6 +697,23 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// splitList parses OPS-3's comma-separated list form. Empty entries are dropped
+// so a trailing comma, which is what a hand-written .env file usually has, is not
+// a boot failure. Nothing is deduplicated: a repeated entry is harmless, and
+// silently rewriting what the operator declared would hide a copy-paste mistake.
+func splitList(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envInt32(key string, def int32) (int32, error) {

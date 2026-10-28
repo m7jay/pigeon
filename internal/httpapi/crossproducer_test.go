@@ -574,6 +574,7 @@ var notProducerScoped = map[string]string{
 	"GET /v1/admin/producers/{producerID}/audit":    "instance-admin surface: the audit log is not tenant data (MT-5)",
 	"GET /metrics":                                  "platform telemetry: aggregate non-delivery counters over every tenant, so it is operator (admin) telemetry, not tenant-scoped (FR-508)",
 	"GET /v1/meta/usage":                            "platform telemetry: reports the deployment's disk usage and table sizes, so it is operator (admin) telemetry, not tenant-scoped (SB-6)",
+	"GET /v1/meta/egress-ips":                       "deployment-wide network identity: the address list a receiver must allowlist is the same for every tenant, so there is no producer id to scope it by (FR-1007)",
 	"POST /v1/producers":                            "FR-102 self-registration: exists only when enabled, and by definition has no tenant yet",
 }
 

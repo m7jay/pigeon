@@ -160,6 +160,17 @@ type Deps struct {
 	// pressure, which is what the handler tests that do not exercise the write
 	// path want. *writeq.Queue implements it.
 	Writes WriteBudget
+
+	// EgressIPs is PIGEON_EGRESS_IPS: the addresses this instance's deliveries
+	// come from, as the operator declared them (FR-1007). Empty means "discover
+	// them from the host's interfaces", which is right on a flat network and
+	// wrong behind NAT - the discovered case says so in the response.
+	EgressIPs []string
+
+	// DiscoverEgress overrides interface discovery. Nil reads the host's own
+	// addresses; the tests set it so the answer does not depend on the machine
+	// the suite runs on.
+	DiscoverEgress func() []string
 }
 
 // WriteBudget is FR-818's admission half. Admitting is all the publish path
