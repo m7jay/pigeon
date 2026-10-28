@@ -22,7 +22,7 @@
 // What this does not do, and deliberately: key rotation. Rotating the key would
 // require re-sealing every stored value in the same transaction that swaps the
 // key, which is a migration and not a helper; a deployment that must rotate
-// re-seals through a migration. docs/custom-headers.md states that limitation
+// re-seals through a migration. docs/at-rest-encryption.md states that limitation
 // rather than leaving it to be discovered.
 package atrest
 
