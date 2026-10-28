@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/m7jay/pigeon/internal/apikey"
+	"github.com/m7jay/pigeon/internal/atrest"
 	"github.com/m7jay/pigeon/internal/db"
 )
 
@@ -119,6 +120,12 @@ type Store struct {
 	// so a miss here is the rare backlog case, not the common path.
 	ensureMu sync.Mutex
 	ensured  map[string]time.Time
+
+	// headersKey seals and opens endpoint custom header values (FR-1006). The
+	// zero Key is inert: a Store built without one refuses to store a header
+	// value rather than writing it in the clear, and every read is redacted
+	// regardless, because no read decrypts.
+	headersKey atrest.Key
 }
 
 // DefaultAttemptBodyCap is SB-4's default per-row cost control: the first 2 KB
@@ -133,6 +140,15 @@ type Option func(*Store)
 // so a row cannot exceed the cap even if a future caller forgets.
 func WithAttemptBodyCap(n int) Option {
 	return func(s *Store) { s.attemptBodyCap = n }
+}
+
+// WithHeadersKey sets the at-rest key that seals endpoint custom header values
+// (FR-1006). It is the only way a Store gets one: without it, a registration
+// that carries a header value is refused (nothing is written in the clear) while
+// everything else keeps working, which is what makes the key a boot-time
+// requirement (config.Validate) rather than a runtime surprise.
+func WithHeadersKey(k atrest.Key) Option {
+	return func(s *Store) { s.headersKey = k }
 }
 
 // New wraps a pool. A nil pool is a programming error, not a runtime condition.

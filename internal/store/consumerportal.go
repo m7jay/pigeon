@@ -53,6 +53,11 @@ type NewConsumerEndpoint struct {
 	Name              string
 	URL               string
 	NotificationEmail string // optional; "" leaves it unset
+	// CustomHeaders are FR-405's custom headers, on the consumer's own
+	// registration path. They are validated and sealed by the same code the
+	// producer-facing path uses, so a forbidden name is refused here too and
+	// there is no way to reach the column around FR-405.
+	CustomHeaders []CustomHeader
 }
 
 // ConsumerEndpointPatch is a PATCH to one of the caller's own endpoints (UI-13):
@@ -106,26 +111,38 @@ func (s *Store) CreateConsumerEndpoint(ctx context.Context, sc Scope, consumerID
 	if err := ssrf.CheckEndpointURL(url, sc.Env, false); err != nil {
 		return EndpointCreated{}, err
 	}
+	// FR-405: the same rejection list the producer-facing path applies. A
+	// consumer is not a weaker caller than a producer member here - the column is
+	// one column, so the rule has to hold on both writes.
+	if err := validateCustomHeaders(in.CustomHeaders); err != nil {
+		return EndpointCreated{}, err
+	}
 
 	secret, hint, err := createEndpointSecret()
 	if err != nil {
 		return EndpointCreated{}, err
 	}
 	token := id.New("vrf") // high-entropy challenge, shown once
+	// Minted before the insert because it is the AAD the values are sealed under
+	// (FR-1006).
+	endpointID := id.New("end")
+	sealed, err := s.sealHeaders(endpointID, in.CustomHeaders)
+	if err != nil {
+		return EndpointCreated{}, err
+	}
 	var ep Endpoint
 	err = s.scoped(ctx, sc, func(tx pgx.Tx) error {
-		scanErr := tx.QueryRow(ctx, `
+		row := tx.QueryRow(ctx, `
 			insert into endpoints
-				(id, producer_id, env, consumer_id, name, url, notification_email, internal,
+				(id, producer_id, env, consumer_id, name, url, notification_email, internal, custom_headers,
 				 verification_token_hash, verification_hint, signing_secret, signing_secret_hint)
-			values ($1,$2,$3,$4,$5,$6,$7,false, $8, $9, $10, $11)
-			returning id, consumer_id, name, url, notification_email, internal, status,
-				verified_at is not null, coalesce(verified_at, now()),
-				coalesce(paused_at, now()), coalesce(deleted_at, now()), created_at`,
-			id.New("end"), sc.ProducerID, sc.Env, consumerID, name, url, email,
+			values ($1,$2,$3,$4,$5,$6,$7,false,$8, $9, $10, $11, $12)
+			returning `+endpointSelectCols,
+			endpointID, sc.ProducerID, sc.Env, consumerID, name, url, email, sealed,
 			tokenHash(token), token[:8], secret, hint,
-		).Scan(&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
-			&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt)
+		)
+		var scanErr error
+		ep, scanErr = scanEndpoint(row)
 		return mapPgError(scanErr, ErrConflict, ErrNotFound)
 	})
 	if err != nil {
@@ -146,12 +163,11 @@ func (s *Store) CreateConsumerEndpoint(ctx context.Context, sc Scope, consumerID
 func (s *Store) GetConsumerEndpoint(ctx context.Context, sc Scope, consumerID, endpointID string) (Endpoint, error) {
 	var ep Endpoint
 	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx, `select `+endpointSelectCols+`
+		var err error
+		ep, err = scanEndpoint(tx.QueryRow(ctx, `select `+endpointSelectCols+`
 			from endpoints
 			where producer_id = $1 and env = $2 and consumer_id = $3 and id = $4 and status <> 'deleted'`,
-			sc.ProducerID, sc.Env, consumerID, endpointID).Scan(
-			&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
-			&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt)
+			sc.ProducerID, sc.Env, consumerID, endpointID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -262,11 +278,11 @@ func (s *Store) UpdateConsumerEndpoint(ctx context.Context, sc Scope, consumerID
 		if res.RowsAffected() == 0 {
 			return ErrNotFound
 		}
-		return tx.QueryRow(ctx, `select `+endpointSelectCols+`
+		var scanErr error
+		ep, scanErr = scanEndpoint(tx.QueryRow(ctx, `select `+endpointSelectCols+`
 			from endpoints where producer_id = $1 and env = $2 and consumer_id = $3 and id = $4`,
-			sc.ProducerID, sc.Env, consumerID, endpointID).Scan(
-			&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
-			&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt)
+			sc.ProducerID, sc.Env, consumerID, endpointID))
+		return scanErr
 	})
 	if err != nil {
 		return Endpoint{}, err

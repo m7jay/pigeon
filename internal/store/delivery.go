@@ -69,6 +69,22 @@ type LeasedDelivery struct {
 	// moment an attempt starts, and this is what tells it whether there is one
 	// to clear - so ordinary traffic pays nothing for the hold existing.
 	HeldBack bool
+
+	// --- FR-405 custom headers ----------------------------------------------
+	//
+	// CustomHeaders are the endpoint's custom headers with their values
+	// DECRYPTED, for the one request this attempt is about to send. This is the
+	// only read path in the store that produces a plaintext header value
+	// (FR-1006): everything that reads an endpoint row gets CustomHeaderView,
+	// whose value is the mask. Nothing here may be logged or written to an
+	// attempt row.
+	CustomHeaders []CustomHeader
+	// DroppedCustomHeaders names the headers whose ciphertext did NOT
+	// authenticate - sealed for another endpoint, tampered with, or sealed under
+	// a key this process does not have. They are dropped rather than sent, and
+	// the delivery still goes out: a value nobody can authenticate must never
+	// reach a receiver, and one bad entry must not wedge a delivery.
+	DroppedCustomHeaders []string
 }
 
 // AttemptClass is FR-1303's attempt class: which lane a delivery belongs to. It
@@ -161,25 +177,35 @@ func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow tim
 	var d LeasedDelivery
 	var backoffBaseS, backoffMaxS, retryWindowS float64
 	var timeoutMS int
+	var sealedHeaders []byte
 	err := s.pool.QueryRow(ctx, `select delivery_id, event_id, producer_id, env, endpoint_id,
 		endpoint_url, signing_secret, event_type, payload_version, coalesce(consumer_ref, ''),
 		occurred_at, payload, prior_attempts, row_attempts, first_attempt_at,
 		next_attempt_at, retry_deadline,
 		max_retries, retry_backoff_base_s, retry_backoff_max_s, retry_window_s,
-		delivery_timeout_ms, max_concurrency, max_rps, held_back
+		delivery_timeout_ms, max_concurrency, max_rps, held_back, custom_headers
 		from pigeon_claim_delivery($1, $2, $3)`, lease, defaultRetryWindow, string(class),
 	).Scan(&d.DeliveryID, &d.EventID, &d.ProducerID, &d.Env, &d.EndpointID,
 		&d.EndpointURL, &d.SigningSecret, &d.EventType, &d.PayloadVersion,
 		&d.ConsumerRef, &d.OccurredAt, &d.Payload, &d.PriorAttempts, &d.RowAttempts, &d.FirstAttemptAt,
 		&d.NextAttemptAt, &d.RetryDeadline,
 		&d.Endpoint.MaxRetries, &backoffBaseS, &backoffMaxS, &retryWindowS,
-		&timeoutMS, &d.Endpoint.MaxConcurrency, &d.Endpoint.MaxRPS, &d.HeldBack)
+		&timeoutMS, &d.Endpoint.MaxConcurrency, &d.Endpoint.MaxRPS, &d.HeldBack, &sealedHeaders)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return d, false, nil
 	}
 	if err != nil {
 		return d, false, fmt.Errorf("claim delivery: %w", err)
 	}
+	// FR-405/FR-1006: the header values are sealed in the column, so the claim
+	// decrypts them here - under the endpoint id the row's AAD was built from -
+	// and hands the worker the request-ready pair. An entry that does not
+	// authenticate is reported by name, never sent.
+	headers, dropped, err := s.openSealedHeaders(d.EndpointID, sealedHeaders)
+	if err != nil {
+		return d, false, fmt.Errorf("claim delivery: %w", err)
+	}
+	d.CustomHeaders, d.DroppedCustomHeaders = headers, dropped
 	// The policy's durations arrive as epoch seconds (0013 casts them), so the
 	// whole per-endpoint policy is a value the worker can use directly.
 	d.Endpoint.BackoffBase = seconds(backoffBaseS)
