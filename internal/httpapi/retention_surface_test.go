@@ -196,7 +196,10 @@ func TestDedupeAnswerSurvivesTheSweep(t *testing.T) {
 	// ended (the drop primitive refuses today).
 	eventID := e.publishFor(t, fx, fx.Ref)
 	day := time.Now().UTC().AddDate(0, 0, -1)
-	at := day.Add(12 * time.Hour)
+	// Midnight UTC of that day, then noon on it: `day` still carries the wall
+	// clock, so `day.Add(12 * time.Hour)` lands in TODAY's partition whenever
+	// this runs at or after 12:00 UTC and the drop below then empties nothing.
+	at := time.Date(day.Year(), day.Month(), day.Day(), 12, 0, 0, 0, time.UTC)
 	leaf, err := e.st.EnsurePartition(ctx(), "deliveries", day)
 	if err != nil {
 		t.Fatalf("EnsurePartition: %v", err)
