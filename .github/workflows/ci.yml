@@ -93,6 +93,11 @@ jobs:
           # (AC-15) and that the route table is fully covered (AC-20). Each name
           # below is an acceptance criterion, so a rename without a CI update
           # fails loudly instead of quietly dropping the assertion.
+          #
+          # S4 (AC-04..07, AC-21, AC-28) and D-6/D-7, and S6 (AC-29, AC-33,
+          # D-1..D-3, FR-815/SB-4), registered theirs only after their PRs
+          # merged; their names are the tail of the list. Keep the list in the
+          # order the criteria were registered.
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -130,7 +135,20 @@ jobs:
             TestConsumerPortalSelfService \
             TestConsumerPortalForeignResourcesAreNotFound \
             TestConsumerPortalSubscribableGate \
-            TestCoreDoesNotDependOnThePortal
+            TestCoreDoesNotDependOnThePortal \
+            TestRetryThenDelivered \
+            TestTerminalFailureOn404 \
+            TestTimeoutRecordedAndRetried \
+            TestLeaseExpiryReclaimsWithoutDuplicateAttempts \
+            TestShutdownLeavesInFlightDeliveryPending \
+            TestSuccessfulDeliveryWritesNoAttemptRow \
+            TestSweeperRequeuesExpiredLease \
+            TestSweeperLeadershipLockIsExclusive \
+            TestEvidenceAndControlTxAreDistinguishableInPgStatActivity \
+            TestSuccessLogGateHoldsTheBoundAtLoad \
+            TestBufferedAttemptsFlowFromWorkerThroughRedisToPostgres \
+            TestBatchedEvidenceInsertIsOneIdempotentStatement \
+            TestRunDrainsOnCancellation
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
