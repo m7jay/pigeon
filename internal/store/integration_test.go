@@ -324,6 +324,12 @@ func TestAuditLogIsAppendOnly(t *testing.T) {
 			return err
 		})
 	}
+	// The audit row carries a fixed id, and the disposable test database is reused
+	// across local runs: clear it so the row under test is this run's, not a
+	// previous run's leftover.
+	if _, err := admin.Exec(ctx, `delete from admin_audit_log where id = 'aud_t1'`); err != nil {
+		t.Fatalf("reset aud_t1: %v", err)
+	}
 	if err := insert(); err != nil {
 		t.Fatalf("admin path could not write an audit row: %v", err)
 	}
@@ -361,6 +367,12 @@ func TestAuthLookupReportsSuspension(t *testing.T) {
 	ctx := context.Background()
 
 	producerID, key := seedProducer(t, admin, "suspendedco")
+	// seedProducer inserts with `on conflict do nothing`, so a previous run against
+	// this same database left the producer suspended. The assertion below is about a
+	// fresh producer, so clear that state rather than inherit it.
+	if _, err := admin.Exec(ctx, `update producers set suspended_at = null where id = $1`, producerID); err != nil {
+		t.Fatalf("reset suspension of %s: %v", producerID, err)
+	}
 
 	p, err := LookupAPIKey(ctx, app, key)
 	if err != nil {
