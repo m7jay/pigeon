@@ -14,7 +14,7 @@
 //     (FR-1201).
 //
 // It is a system worker like the relay: no producer scope, reaching the tenant
-// tables only through the SECURITY DEFINER functions in 0008 and 0009.
+// tables only through the SECURITY DEFINER functions in 0008 and 0013.
 //
 // Concurrency (FR-816, FR-1302, FR-1307). "Workers" is the number of CLAIM loops;
 // each claimed delivery runs its attempt in its own goroutine. Two bounds apply

@@ -329,7 +329,7 @@ func TestTerminalFailureOn404(t *testing.T) {
 
 	status, dbAttempts, attemptRows, deliveredAt, _ := deliveryState(t, admin, deliveryID)
 	if status != "failed_terminal" {
-		// 0009 renames the terminal status to failed_terminal: I-4's vocabulary
+		// 0013 renames the terminal status to failed_terminal: I-4's vocabulary
 		// ("terminal only in delivered, failed_terminal, cancelled") and AC-36
 		// both name that value, and 0007's `failed` was the only other spelling.
 		t.Fatalf("delivery status = %q, want failed_terminal (AC-05, I-4)", status)

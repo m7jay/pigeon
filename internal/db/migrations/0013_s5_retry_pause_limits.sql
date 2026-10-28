@@ -1,5 +1,13 @@
--- 0009_s5_retry_pause_limits.sql — S5: the retry window, per-endpoint limits,
+-- 0013_s5_retry_pause_limits.sql — S5: the retry window, per-endpoint limits,
 -- the threshold pauses, and the terminal-state vocabulary.
+--
+-- The number is 0013, not 0009: this slice was cut when 0008 was the last
+-- migration and has been renumbered three times as other slices landed ahead of
+-- it (0009 consumer portal, 0010 attempt buffer/S6, 0011 inspect+replay/S7, and
+-- 0012 partitioning/S8, which is in flight). `internal/db/migrate_test.go`
+-- enforces unique ascending versions, so the number has to be free on every
+-- landable branch, not just on the base. Nothing here depends on a number
+-- between 0009 and itself.
 --
 -- Four things land here, each with the requirement that forces it:
 --
