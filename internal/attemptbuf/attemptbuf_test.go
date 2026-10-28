@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -342,6 +343,90 @@ func pendingCount(t *testing.T, b *Buffer) int64 {
 		t.Fatalf("XPENDING: %v", err)
 	}
 	return sum.Count
+}
+
+// hungListener accepts connections and never answers a byte: what a Redis that is
+// up but wedged looks like to a client (the dial succeeds, the command hangs).
+func hungListener(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	// The accepted connections are held open and dropped when the test ends, so
+	// a client that is still waiting cannot leak a goroutine past the run.
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return ln
+}
+
+// TestAckDeadlineBoundsAHungRedis: the client the package builds honours the
+// caller's context deadline, so the deadline is a bound and not a wish. Without
+// ContextTimeoutEnabled go-redis ignores the context entirely and rides its own
+// 3 s ReadTimeout (measured: a 200 ms deadline returned after 3.001 s), which is
+// exactly the shape of the bound D-9 puts on a retirement.
+func TestAckDeadlineBoundsAHungRedis(t *testing.T) {
+	addr := hungListener(t).Addr().String()
+
+	// Both branches of clientFromURL: a bare host:port is the documented
+	// fallback, and a bound that only exists on one of them is not a bound.
+	for _, raw := range []string{"redis://" + addr + "/0", addr} {
+		c, err := clientFromURL(raw)
+		if err != nil {
+			t.Fatalf("clientFromURL(%q): %v", raw, err)
+		}
+		enabled := c.Options().ContextTimeoutEnabled
+		_ = c.Close()
+		if !enabled {
+			t.Fatalf("clientFromURL(%q) left ContextTimeoutEnabled false; a context deadline is then not a bound", raw)
+		}
+	}
+
+	rdb, err := clientFromURL("redis://" + addr + "/0")
+	if err != nil {
+		t.Fatalf("clientFromURL: %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	b, err := New(rdb, Options{Consumer: "test-flusher"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = b.Ack(ctx, []string{"1-0"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Ack reported success against a Redis that never answers")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Ack returned %v, want a deadline error", err)
+	}
+	// The client's read timeout is what this pins: a bound that is not the bound
+	// reads as "the flusher is slow", not as "the deadline was ignored".
+	if elapsed >= time.Second {
+		t.Fatalf("Ack with a 200 ms deadline returned after %v; the client rode its own read timeout instead", elapsed)
+	}
 }
 
 // TestAckIsOneTransaction: the retirement is ONE transaction - multi, xack, xdel,

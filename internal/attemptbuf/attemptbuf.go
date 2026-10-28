@@ -195,15 +195,22 @@ func NewFromClient(rdb *redis.Client, opts Options) (*Buffer, error) {
 }
 
 // clientFromURL accepts both the documented URL form and a bare host:port.
+//
+// Both branches set ContextTimeoutEnabled, because without it go-redis ignores
+// the caller's context deadline and rides the client's own ReadTimeout instead:
+// measured, a 200 ms deadline against a socket that accepts and never answers
+// returned after 3.001 s, the read timeout. A Push, or the flusher's bounded
+// retirement (AckTimeout), would then be waiting on a bound nobody set (D-9).
 func clientFromURL(raw string) (*redis.Client, error) {
 	if strings.Contains(raw, "://") {
 		o, err := redis.ParseURL(raw)
 		if err != nil {
 			return nil, fmt.Errorf("parse PIGEON_REDIS_URL: %w", err)
 		}
+		o.ContextTimeoutEnabled = true
 		return redis.NewClient(o), nil
 	}
-	return redis.NewClient(&redis.Options{Addr: raw}), nil
+	return redis.NewClient(&redis.Options{Addr: raw, ContextTimeoutEnabled: true}), nil
 }
 
 // Close releases the buffer's connection.
