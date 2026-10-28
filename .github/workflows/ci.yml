@@ -47,6 +47,11 @@ jobs:
       # whole point of CI is that it must not skip.
       PIGEON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/pigeon_test?sslmode=disable
       PIGEON_TEST_REDIS_URL: redis://localhost:6379/0
+      # FR-1006's at-rest key for endpoint custom header values. config.Load
+      # refuses to boot without a 32-byte base64 key, and internal/delivery's
+      # AC-41 test reads the shipped configuration through it. A test-only value:
+      # it protects nothing and is not a deployment secret.
+      PIGEON_HEADERS_KEY: /mxm1i7pxOA1RGvIcQHGx1EPyWXCuUTPrG9l0DtCza4=
 
     steps:
       - uses: actions/checkout@v4

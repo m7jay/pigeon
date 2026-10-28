@@ -1,11 +1,27 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/m7jay/pigeon/internal/atrest"
 )
+
+// testHeadersKey is a throwaway 32-byte key for FR-1006's at-rest encryption. It
+// is generated rather than written as a literal so it can never be mistaken for
+// the deployment's own key, and it protects nothing.
+var testHeadersKey = mustGenerateHeadersKey()
+
+func mustGenerateHeadersKey() string {
+	_, encoded, err := atrest.GenerateKey()
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
 
 func valid() Config {
 	return Config{
@@ -48,6 +64,9 @@ func valid() Config {
 		// to be here: a hand-built reference config that leaves it zero is refused
 		// by the same SB-5 rule that refuses a zero deliveries window.
 		RetentionDedupe: 30 * 24 * time.Hour,
+		// FR-1006's at-rest key, required like the database URL: without it there
+		// is nowhere safe to put a custom header value.
+		HeadersKey: testHeadersKey,
 	}
 }
 
@@ -154,6 +173,7 @@ func TestLoadFromEnvironment(t *testing.T) {
 	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
 	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0") // S6's default mode is buffered (D-1)
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+	t.Setenv("PIGEON_HEADERS_KEY", testHeadersKey)
 	t.Setenv("PIGEON_LOG_LEVEL", "debug")
 	t.Setenv("PIGEON_DB_MAX_CONNS", "20")
 	t.Setenv("PIGEON_SESSION_TTL", "2h")
@@ -204,9 +224,41 @@ func TestDeliveryRetryConcurrencyHasAShippedDefault(t *testing.T) {
 func TestLoadRejectsGarbage(t *testing.T) {
 	t.Setenv("PIGEON_DATABASE_URL", "postgres://x/y")
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+	t.Setenv("PIGEON_HEADERS_KEY", testHeadersKey)
 	t.Setenv("PIGEON_DB_MAX_CONNS", "lots")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load accepted a non-numeric PIGEON_DB_MAX_CONNS")
+	}
+}
+
+// TestLoadRequiresTheAtRestKey is FR-1006 at boot. The key that encrypts endpoint
+// custom header values is a startup requirement, not something discovered by the
+// first registration: absent is a refusal, and so is a key of the wrong length
+// (the realistic mistake is a 16-byte AES-128 key or a passphrase).
+func TestLoadRequiresTheAtRestKey(t *testing.T) {
+	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
+	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0")
+	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+
+	t.Setenv("PIGEON_HEADERS_KEY", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted a configuration with no PIGEON_HEADERS_KEY")
+	} else if !strings.Contains(err.Error(), "PIGEON_HEADERS_KEY") {
+		t.Fatalf("the refusal does not name the variable: %v", err)
+	}
+
+	t.Setenv("PIGEON_HEADERS_KEY", base64.StdEncoding.EncodeToString([]byte("sixteen-bytes!!!")))
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted a 16-byte PIGEON_HEADERS_KEY; FR-1006 requires AES-256")
+	}
+
+	t.Setenv("PIGEON_HEADERS_KEY", testHeadersKey)
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load with a well-formed key: %v", err)
+	}
+	if c.HeadersKey != testHeadersKey {
+		t.Fatalf("HeadersKey = %q, want the configured key", c.HeadersKey)
 	}
 }
 
@@ -218,6 +270,7 @@ func TestLoadClampsTheSweeperInterval(t *testing.T) {
 	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
 	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0") // S6's default mode is buffered (D-1)
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+	t.Setenv("PIGEON_HEADERS_KEY", testHeadersKey)
 	t.Setenv("PIGEON_SWEEPER_INTERVAL", "2m")
 	c, err := Load()
 	if err != nil {
@@ -260,6 +313,7 @@ func TestLoadClampsTheAttemptFlushInterval(t *testing.T) {
 	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
 	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0")
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+	t.Setenv("PIGEON_HEADERS_KEY", testHeadersKey)
 	t.Setenv("PIGEON_ATTEMPT_FLUSH_INTERVAL", "30s")
 	c, err := Load()
 	if err != nil {
@@ -286,6 +340,7 @@ func TestLoadRaisesTheFlushBatchToTheFloor(t *testing.T) {
 	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
 	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0")
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+	t.Setenv("PIGEON_HEADERS_KEY", testHeadersKey)
 	t.Setenv("PIGEON_ATTEMPT_FLUSH_BATCH", "10")
 	c, err := Load()
 	if err != nil {

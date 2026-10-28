@@ -71,6 +71,11 @@ services:
       PIGEON_DATABASE_URL: postgres://pigeon_app:${PIGEON_APP_PASSWORD:?PIGEON_APP_PASSWORD must be set}@postgres:5432/pigeon?sslmode=disable
       PIGEON_MIGRATE_DATABASE_URL: postgres://pigeon_migrator:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/pigeon?sslmode=disable
       PIGEON_REDIS_URL: redis://redis:6379/0
+      # FR-1006: the at-rest key for endpoint custom header values. No default on
+      # purpose, like the two passwords above: `docker compose up` refuses to
+      # start until a real 32-byte base64 key is supplied (`openssl rand -base64
+      # 32`), so a deployment cannot ship the placeholder from .env.example.
+      PIGEON_HEADERS_KEY: ${PIGEON_HEADERS_KEY:?PIGEON_HEADERS_KEY must be set to 32 bytes of base64 (openssl rand -base64 32)}
     ports:
       - "8080:8080"
     depends_on:

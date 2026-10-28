@@ -22,6 +22,8 @@ func TestMigratorRoleMustDifferFromTheRuntimeRole(t *testing.T) {
 	safe.DatabaseURL = "postgres://pigeon_app:secret@db:5432/pigeon?sslmode=disable"
 	safe.MigrateDatabaseURL = "postgres://pigeon_migrator:secret@db:5432/pigeon?sslmode=disable"
 	safe.InstanceAdminPassword = "long-enough-admin-password"
+	// FR-1006's at-rest key is required like the database URL.
+	safe.HeadersKey = testHeadersKey
 
 	if err := safe.Validate(); err != nil {
 		t.Fatalf("a split-role configuration was refused: %v", err)

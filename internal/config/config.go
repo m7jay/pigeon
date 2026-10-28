@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/m7jay/pigeon/internal/atrest"
 )
 
 // maxSweeperInterval is D-6's ceiling on the sweep cadence: a lease that has
@@ -145,6 +147,14 @@ type Config struct {
 	// Observability
 	LogLevel slog.Level // PIGEON_LOG_LEVEL
 	LogJSON  bool       // PIGEON_LOG_JSON
+
+	// HeadersKey is the at-rest encryption key for endpoint custom header values
+	// (FR-1006): 32 bytes, base64, under PIGEON_HEADERS_KEY. It is required, and
+	// Validate refuses a missing or mis-sized one, because the alternative is a
+	// platform that accepts a header value and then has nowhere safe to put it -
+	// and because a key that is only noticed at the first registration is a
+	// misconfiguration discovered by a customer.
+	HeadersKey string // PIGEON_HEADERS_KEY
 }
 
 // Defaults are the values the reference deployment runs with (§2.1).
@@ -292,6 +302,7 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	c.DeliveryUserAgent = env("PIGEON_DELIVERY_USER_AGENT", c.DeliveryUserAgent)
+	c.HeadersKey = strings.TrimSpace(env("PIGEON_HEADERS_KEY", c.HeadersKey))
 	if c.SweeperInterval, err = envDuration("PIGEON_SWEEPER_INTERVAL", c.SweeperInterval); err != nil {
 		return Config{}, err
 	}
@@ -400,6 +411,18 @@ func (c Config) Validate() error {
 		problems = append(problems, "PIGEON_INSTANCE_ADMIN_PASSWORD is required: first run has no other credential (FR-101)")
 	} else if isWeakPassword(c.InstanceAdminPassword) {
 		problems = append(problems, "PIGEON_INSTANCE_ADMIN_PASSWORD is a known-weak default; choose another (OPS-7)")
+	}
+	// FR-1006: the at-rest key for endpoint custom header values. It is required
+	// rather than optional, and the shape is checked here rather than at the first
+	// registration, so a deployment with a wrong-sized key (or none) is a boot
+	// refusal with one actionable line instead of a 500 discovered by a customer.
+	// The parse is the same code the store and the delivery path use, so the
+	// refusal and the runtime cannot disagree about what a key is.
+	if _, err := atrest.ParseKey(c.HeadersKey); err != nil {
+		problems = append(problems, fmt.Sprintf(
+			"%s is required and must be %d bytes of base64 (FR-1006 encrypts endpoint custom header values with it): %v; "+
+				"generate one with `openssl rand -base64 32`",
+			atrest.KeyEnv, atrest.KeyBytes, err))
 	}
 	if c.DBMaxConns < 2 {
 		problems = append(problems, "PIGEON_DB_MAX_CONNS must be >= 2")

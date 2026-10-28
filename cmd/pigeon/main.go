@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/m7jay/pigeon/internal/atrest"
 	"github.com/m7jay/pigeon/internal/attemptbuf"
 	"github.com/m7jay/pigeon/internal/broker"
 	"github.com/m7jay/pigeon/internal/config"
@@ -85,7 +86,16 @@ func run() error {
 	if err := cfg.ValidateBudget(serverMaxConns); err != nil {
 		return err
 	}
-	st := store.New(pool, store.WithAttemptBodyCap(cfg.DeliveryMaxBodyBytes))
+	// FR-1006: the at-rest key that seals endpoint custom header values. Validate
+	// already refused a missing or mis-sized one, so a parse failure here is
+	// unreachable; it is still handled rather than ignored, because "the key that
+	// protects customer values" is not a place for a panic (or for a Store that
+	// silently refuses to store what the API accepted).
+	headersKey, err := atrest.ParseKey(cfg.HeadersKey)
+	if err != nil {
+		return err
+	}
+	st := store.New(pool, store.WithAttemptBodyCap(cfg.DeliveryMaxBodyBytes), store.WithHeadersKey(headersKey))
 
 	if cfg.MigrationsOn {
 		// Migrations run as the role that owns the schema, because CREATE TABLE
