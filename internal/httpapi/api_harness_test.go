@@ -301,7 +301,9 @@ func (e *env) doNoBody(method, path, token string, body any) int {
 // sessionResponse mirrors the login payload.
 type sessionPayload struct {
 	Token string `json:"token"`
-	User  struct {
+	// ExpiresAt is what a portal turns into its cookie's Max-Age (AC-51).
+	ExpiresAt string `json:"expires_at"`
+	User      struct {
 		ID                 string `json:"id"`
 		Email              string `json:"email"`
 		MustChangePassword bool   `json:"must_change_password"`

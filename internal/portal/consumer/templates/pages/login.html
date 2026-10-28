@@ -3,6 +3,7 @@
   <h1>Log in</h1>
   <p class="page-sub">Sign in with the email and password you set when you accepted an invitation.</p>
   <form method="post" action="/login">
+    {{template "csrf_field" .}}
     <div class="form-row"><label for="email">Email</label><input id="email" type="email" name="email" required autofocus></div>
     <div class="form-row"><label for="password">Password</label><input id="password" type="password" name="password" required></div>
     <button class="btn" type="submit">Log in</button>
