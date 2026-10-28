@@ -37,10 +37,10 @@ import (
 
 // --- view models -----------------------------------------------------------
 
-// deliveryRow is one line of the log (UI-15).
+// deliveryRow is one line of the log (UI-15). It carries exactly what the log
+// renders; a field nothing renders belongs on the detail page instead.
 type deliveryRow struct {
 	ID             int64
-	EventID        string
 	EventType      string
 	EndpointID     string
 	Status         string
@@ -185,7 +185,6 @@ type deliveryDetailView struct {
 type listDeliveriesResponse struct {
 	Deliveries []struct {
 		ID                 int64   `json:"id"`
-		EventID            string  `json:"event_id"`
 		EventType          string  `json:"event_type"`
 		EndpointID         string  `json:"endpoint_id"`
 		Status             string  `json:"status"`
@@ -293,7 +292,7 @@ func (h *Handler) renderDeliveryLog(w http.ResponseWriter, r *http.Request, stat
 		_ = json.Unmarshal(resp.Body, &page)
 		for _, d := range page.Deliveries {
 			base.Deliveries = append(base.Deliveries, deliveryRow{
-				ID: d.ID, EventID: d.EventID, EventType: d.EventType, EndpointID: d.EndpointID,
+				ID: d.ID, EventType: d.EventType, EndpointID: d.EndpointID,
 				Status: d.Status, Attempts: d.Attempts,
 				FirstAttemptAt: strOr(d.FirstAttemptAt, "-"), DeliveredAt: strOr(d.DeliveredAt, "-"),
 				Duration: msOr(d.DurationMs), ReplayOf: idOr(d.ReplayOfDeliveryID),
@@ -440,7 +439,10 @@ func (h *Handler) deliveryDetailView(d deliveryDetailResponse) deliveryDetailVie
 		view.Trail = append(view.Trail, trailRow{
 			Attempt: d.EffectiveAttempt.Attempt, OccurredAt: d.EffectiveAttempt.OccurredAt,
 			Duration: msOr(d.EffectiveAttempt.DurationMs), ResponseStatus: "-",
-			ResponseBody: "(no attempt row: FR-811 records this attempt on the delivery)",
+			// No body was recorded, because no attempt row exists (§7.11 FR-811 /
+			// FR-1110). The row is marked synthesized, and the template says why in
+			// the attempt column, so an empty body cell cannot read as a body.
+			ResponseBody: "-",
 			ErrorClass:   "-", Outcome: d.EffectiveAttempt.Outcome, NextRetryAt: "-",
 			Synthesized: true,
 		})
