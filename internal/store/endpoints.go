@@ -38,6 +38,11 @@ type Endpoint struct {
 	PausedAt          time.Time
 	DeletedAt         time.Time
 	CreatedAt         time.Time
+	// CustomHeaders are FR-405's per-endpoint headers as a READ renders them:
+	// names in the clear, values masked (FR-1006). No read in this package can
+	// produce a plaintext value; the delivery claim is the one exception and it
+	// returns LeasedDelivery, not this type.
+	CustomHeaders []CustomHeaderView
 }
 
 // NewEndpoint is a POST to register an endpoint. Internal is FR-402's escape hatch
@@ -47,6 +52,11 @@ type NewEndpoint struct {
 	URL        string
 	ConsumerID string
 	Internal   bool
+	// CustomHeaders are FR-405's custom headers. Their values are sealed at rest
+	// (FR-1006) and their names are validated against FR-405's rejection list
+	// before any row is written, so a forbidden name is a 422 rather than a
+	// silently dropped header.
+	CustomHeaders []CustomHeader
 }
 
 // EndpointSecret is the plaintext signing secret, returned once at creation and
@@ -104,9 +114,15 @@ func tokenHash(token string) []byte {
 
 // CreateEndpoint registers an endpoint for a consumer (FR-401). It rejects a
 // non-https live URL or an internal-range address before any row is written
-// (FR-402, AC-19), generates the endpoint's own signing secret (FR-404) and an
-// ownership-challenge token (FR-403), and returns the plaintext secret exactly
-// once. An unknown consumer id is ErrNotFound (FR-108), enforced by the FK.
+// (FR-402, AC-19), applies FR-405 to the custom headers it was given, generates
+// the endpoint's own signing secret (FR-404) and an ownership-challenge token
+// (FR-403), and returns the plaintext secret exactly once. An unknown consumer id
+// is ErrNotFound (FR-108), enforced by the FK.
+//
+// The header values are sealed before the insert, under an AAD built from the
+// endpoint id this row is about to get (FR-1006), so the ciphertext is bound to
+// the row from the first write. The response carries the headers back REDACTED:
+// a value travels out of the platform exactly once, in the request that set it.
 func (s *Store) CreateEndpoint(ctx context.Context, sc Scope, in NewEndpoint) (EndpointCreated, error) {
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
@@ -121,26 +137,38 @@ func (s *Store) CreateEndpoint(ctx context.Context, sc Scope, in NewEndpoint) (E
 	if err := ssrf.CheckEndpointURL(in.URL, sc.Env, in.Internal); err != nil {
 		return EndpointCreated{}, err
 	}
+	// FR-405: reject a forbidden, malformed or over-count header before the row
+	// exists, so nothing is ever silently dropped.
+	if err := validateCustomHeaders(in.CustomHeaders); err != nil {
+		return EndpointCreated{}, err
+	}
 
 	secret, hint, err := createEndpointSecret()
 	if err != nil {
 		return EndpointCreated{}, err
 	}
 	token := id.New("vrf") // high-entropy challenge, shown once
+	// The row id is minted here rather than in the INSERT because it is the AAD
+	// the values are sealed under: the endpoint must know its own id before it
+	// can encrypt anything.
+	endpointID := id.New("end")
+	sealed, err := s.sealHeaders(endpointID, in.CustomHeaders)
+	if err != nil {
+		return EndpointCreated{}, err
+	}
 	var ep Endpoint
 	err = s.scoped(ctx, sc, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx, `
+		row := tx.QueryRow(ctx, `
 			insert into endpoints
-				(id, producer_id, env, consumer_id, name, url, internal,
+				(id, producer_id, env, consumer_id, name, url, internal, custom_headers,
 				 verification_token_hash, verification_hint, signing_secret, signing_secret_hint)
-			values ($1,$2,$3,$4,$5,$6,$7, $8, $9, $10, $11)
-			returning id, consumer_id, name, url, notification_email, internal, status,
-				verified_at is not null, coalesce(verified_at, now()),
-				coalesce(paused_at, now()), coalesce(deleted_at, now()), created_at`,
-			id.New("end"), sc.ProducerID, sc.Env, in.ConsumerID, in.Name, in.URL, in.Internal,
+			values ($1,$2,$3,$4,$5,$6,$7,$8, $9, $10, $11, $12)
+			returning `+endpointSelectCols,
+			endpointID, sc.ProducerID, sc.Env, in.ConsumerID, in.Name, in.URL, in.Internal, sealed,
 			tokenHash(token), token[:8], secret, hint,
-		).Scan(&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
-			&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt)
+		)
+		var err error
+		ep, err = scanEndpoint(row)
 		return mapPgError(err, ErrConflict, ErrNotFound)
 	})
 	if err != nil {
@@ -155,20 +183,45 @@ func (s *Store) CreateEndpoint(ctx context.Context, sc Scope, in NewEndpoint) (E
 	}, nil
 }
 
+// endpointSelectCols is the read shape of one endpoint row, shared by every
+// endpoint read so a new column cannot be added to one of them and forgotten in
+// the others. custom_headers travels as the raw jsonb and is turned into the
+// redacted view by scanEndpoint (FR-1006).
 const endpointSelectCols = `id, consumer_id, name, url, notification_email, internal, status,
 	verified_at is not null as verified, verified_at,
-	coalesce(paused_at, now()) as paused_at, coalesce(deleted_at, now()) as deleted_at, created_at`
+	coalesce(paused_at, now()) as paused_at, coalesce(deleted_at, now()) as deleted_at, created_at,
+	custom_headers`
+
+// rowScanner is the little of pgx.Row and pgx.Rows that scanEndpoint needs, so
+// one scan covers the single-row and the list reads.
+type rowScanner interface{ Scan(dest ...any) error }
+
+// scanEndpoint reads the shared select into an Endpoint, masking the custom
+// header values (FR-1006). Every endpoint read goes through it.
+func scanEndpoint(row rowScanner) (Endpoint, error) {
+	var ep Endpoint
+	var rawHeaders []byte
+	if err := row.Scan(&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
+		&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt, &rawHeaders); err != nil {
+		return Endpoint{}, err
+	}
+	headers, err := summariseHeaders(rawHeaders)
+	if err != nil {
+		return Endpoint{}, err
+	}
+	ep.CustomHeaders = headers
+	return ep, nil
+}
 
 // GetEndpoint reads one endpoint in the caller's scope. A foreign or
 // cross-environment id is ErrNotFound (FR-108 + FR-103).
 func (s *Store) GetEndpoint(ctx context.Context, sc Scope, endpointID string) (Endpoint, error) {
 	var ep Endpoint
 	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx, `select `+endpointSelectCols+`
+		var err error
+		ep, err = scanEndpoint(tx.QueryRow(ctx, `select `+endpointSelectCols+`
 			from endpoints where producer_id = $1 and env = $2 and id = $3 and status <> 'deleted'`,
-			sc.ProducerID, sc.Env, endpointID).Scan(
-			&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
-			&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt)
+			sc.ProducerID, sc.Env, endpointID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -195,9 +248,8 @@ func (s *Store) ListEndpointsForConsumer(ctx context.Context, sc Scope, consumer
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var ep Endpoint
-			if err := rows.Scan(&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
-				&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt); err != nil {
+			ep, err := scanEndpoint(rows)
+			if err != nil {
 				return err
 			}
 			out = append(out, ep)
@@ -250,11 +302,10 @@ func (s *Store) setEndpointStatus(ctx context.Context, sc Scope, endpointID, sta
 		if res.RowsAffected() == 0 {
 			return ErrNotFound
 		}
-		return tx.QueryRow(ctx, `select `+endpointSelectCols+`
+		ep, err = scanEndpoint(tx.QueryRow(ctx, `select `+endpointSelectCols+`
 			from endpoints where producer_id = $1 and env = $2 and id = $3`,
-			sc.ProducerID, sc.Env, endpointID).Scan(
-			&ep.ID, &ep.ConsumerID, &ep.Name, &ep.URL, &ep.NotificationEmail, &ep.Internal, &ep.Status,
-			&ep.Verified, &ep.VerifiedAt, &ep.PausedAt, &ep.DeletedAt, &ep.CreatedAt)
+			sc.ProducerID, sc.Env, endpointID))
+		return err
 	})
 	if err != nil {
 		return Endpoint{}, err
