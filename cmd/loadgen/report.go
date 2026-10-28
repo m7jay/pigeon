@@ -88,6 +88,15 @@ func redactErr(err error) string {
 	return strings.SplitN(err.Error(), " (", 2)[0]
 }
 
+// emptyIf appends the "not observable" note when the criteria window held no
+// samples, so an ungraded criterion never reads as a passed one.
+func emptyIf(empty bool, note string) string {
+	if empty {
+		return note
+	}
+	return ""
+}
+
 // judge turns a run into the card's acceptance criteria.
 //
 // Only the criteria a single run can decide are decided here. AC-31's "the ceiling
@@ -96,6 +105,15 @@ func redactErr(err error) string {
 // the data does not support.
 func judge(r *report, c config) []verdict {
 	var out []verdict
+
+	// An empty criteria window is not a pass. Before this guard the verdicts were
+	// computed from a window that could contain no samples at all (a pacer that
+	// fell behind wall clock filed every late sample under an earlier phase), and
+	// the arithmetic then read "0 errors, 0 shed, p99 0.0 ms" as a clean run and
+	// reported AC-30 PASS on no evidence. A criterion with nothing to measure is
+	// stated as such.
+	empty := r.Evaluated.Attempted == 0
+	emptyNote := "; the criteria window holds no samples, so this criterion was not observable in this run"
 
 	// AC-30: past the ceiling, publish sheds with 429 and latency does not drift.
 	//
@@ -113,12 +131,17 @@ func judge(r *report, c config) []verdict {
 	stable := growth <= 1.5 || r.FirstEval.P99MS == 0
 	out = append(out, verdict{
 		AC: "AC-30",
-		OK: shedClean && stable,
+		// shedding is part of the criterion, not a footnote: "past the ceiling"
+		// cannot be graded by a run that never reached it.
+		OK: !empty && shedClean && stable && shedding,
 		Detail: fmt.Sprintf("refusals were 429 only: %v (errors %d); p99 %.1f ms -> %.1f ms (%.2fx) over the run; shed %.1f/s",
 			shedClean, r.Evaluated.Errors, r.FirstEval.P99MS, r.Evaluated.P99MS, growth, r.Evaluated.ShedRate),
 	})
 	if !shedding {
 		out[len(out)-1].Detail += "; no load was shed, so this run did not reach the ceiling"
+	}
+	if empty {
+		out[len(out)-1].Detail += emptyNote
 	}
 
 	// AC-31: the rated load is accepted, and the delivery unit is reported.
@@ -132,9 +155,9 @@ func judge(r *report, c config) []verdict {
 	p99OK := r.Evaluated.P99MS <= 100
 	out = append(out, verdict{
 		AC: "AC-31",
-		OK: ratio >= 0.98 && p99OK,
+		OK: !empty && ratio >= 0.98 && p99OK,
 		Detail: fmt.Sprintf("accepted %.1f of %.0f events/s (%.1f%%) with p99 %.1f ms (NFR-1 ceiling 100 ms); %.1f deliveries/s at %d subscription(s) per event",
-			r.Evaluated.AcceptRate, c.Rate, ratio*100, r.Evaluated.P99MS, r.Reconcile.DeliveriesPS, c.Subs),
+			r.Evaluated.AcceptRate, c.Rate, ratio*100, r.Evaluated.P99MS, r.Reconcile.DeliveriesPS, c.Subs) + emptyIf(empty, emptyNote),
 	})
 
 	// AC-34: the attempt fan-out is bounded, not the ingest rate. A run at a high
@@ -145,9 +168,9 @@ func judge(r *report, c config) []verdict {
 	// process; this run records the load that test is sized against.
 	out = append(out, verdict{
 		AC: "AC-34",
-		OK: r.Evaluated.Errors == 0 && r.Evaluated.P99MS <= 500,
+		OK: !empty && r.Evaluated.Errors == 0 && r.Evaluated.P99MS <= 500,
 		Detail: fmt.Sprintf("under a sustained %.0f events/s the ingest path reported %d errors and p99 %.1f ms; the attempt census itself is TestAttemptFanOutIsBounded",
-			r.Evaluated.AcceptRate, r.Evaluated.Errors, r.Evaluated.P99MS),
+			r.Evaluated.AcceptRate, r.Evaluated.Errors, r.Evaluated.P99MS) + emptyIf(empty, emptyNote),
 	})
 
 	// §16: the accepted count reconciled against the database.
