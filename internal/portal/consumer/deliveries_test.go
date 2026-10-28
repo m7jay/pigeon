@@ -30,13 +30,13 @@ func seedDeliveryLog(core *fakeCore, deliveries string, status int) {
 func TestConsumerDeliveryLogListsItsOwnConsumer(t *testing.T) {
 	core := newFakeCore(t)
 	seedDeliveryLog(core, `{"deliveries":[`+
-		`{"id":41,"event_id":"evt_1","event_type":"order.shipped","endpoint_id":"end1","status":"failed",`+
+		`{"id":41,"event_id":"evt_1","event_type":"order.shipped","endpoint_id":"end1","status":"failed_terminal",`+
 		`"attempts":2,"created_at":"2026-01-01T00:00:00Z","first_attempt_at":"2026-01-01T00:00:01Z",`+
 		`"delivered_at":null,"duration_ms":3210,"replay_of_delivery_id":null}],`+
 		`"next_cursor":"40"}`, http.StatusOK)
 	h := testHandlerAt(t, core.srv.URL)
 
-	rec := signedIn(t, h, http.MethodGet, "/deliveries?status=failed", nil)
+	rec := signedIn(t, h, http.MethodGet, "/deliveries?status=failed_terminal", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /deliveries status = %d, want 200", rec.Code)
 	}
@@ -59,7 +59,7 @@ func TestConsumerDeliveryLogListsItsOwnConsumer(t *testing.T) {
 	}
 
 	sent := core.lastRequest(http.MethodGet, "/v1/consumer/deliveries")
-	if !strings.Contains(sent.URI, "status=failed") {
+	if !strings.Contains(sent.URI, "status=failed_terminal") {
 		t.Fatalf("the portal did not forward the API's own status filter: %s", sent.URI)
 	}
 	// The read is made with the caller's own scoped session, which is what makes
@@ -107,12 +107,12 @@ func TestConsumerDeliveryLogNeverNamesAConsumer(t *testing.T) {
 	seedDeliveryLog(core, `{"deliveries":[],"next_cursor":""}`, http.StatusOK)
 	h := testHandlerAt(t, core.srv.URL)
 
-	signedIn(t, h, http.MethodGet, "/deliveries?consumer_id=con_someone_else&status=failed", nil)
+	signedIn(t, h, http.MethodGet, "/deliveries?consumer_id=con_someone_else&status=failed_terminal", nil)
 	read := core.lastRequest(http.MethodGet, "/v1/consumer/deliveries")
 	if strings.Contains(read.URI, "consumer_id") {
 		t.Fatalf("the log read named a consumer: %s", read.URI)
 	}
-	if !strings.Contains(read.URI, "status=failed") {
+	if !strings.Contains(read.URI, "status=failed_terminal") {
 		t.Fatalf("the API's own filter was dropped along with the consumer id: %s", read.URI)
 	}
 
@@ -122,12 +122,12 @@ func TestConsumerDeliveryLogNeverNamesAConsumer(t *testing.T) {
 		`{"matched":0,"created":0,"delivery_ids":[],"repeated":false,"release_per_second":50,"dry_run":false}`,
 		http.StatusOK)
 	signedIn(t, h, http.MethodPost, "/deliveries/replay",
-		url.Values{"consumer_id": {"con_someone_else"}, "status": {"failed"}, "idempotency_key": {"k1"}})
+		url.Values{"consumer_id": {"con_someone_else"}, "status": {"failed_terminal"}, "idempotency_key": {"k1"}})
 	write := core.lastRequest(http.MethodPost, "/v1/consumer/deliveries/replay")
 	if strings.Contains(write.Body, "consumer_id") {
 		t.Fatalf("the replay named a consumer: %s", write.Body)
 	}
-	if !strings.Contains(write.Body, `"status":"failed"`) {
+	if !strings.Contains(write.Body, `"status":"failed_terminal"`) {
 		t.Fatalf("the replay dropped the API's own filter: %s", write.Body)
 	}
 }
@@ -139,7 +139,7 @@ func TestConsumerDeliveryLogNeverNamesAConsumer(t *testing.T) {
 func TestConsumerDeliveryDetailShowsResponseBodies(t *testing.T) {
 	core := newFakeCore(t)
 	core.on(http.MethodGet, "/v1/consumer/deliveries/41",
-		`{"id":41,"event_id":"evt_1","event_type":"order.shipped","endpoint_id":"end1","status":"failed",`+
+		`{"id":41,"event_id":"evt_1","event_type":"order.shipped","endpoint_id":"end1","status":"failed_terminal",`+
 			`"attempts":2,"created_at":"2026-01-01T00:00:00Z","first_attempt_at":"2026-01-01T00:00:01Z",`+
 			`"delivered_at":null,"duration_ms":3210,"attempts_rows":[`+
 			`{"attempt":1,"occurred_at":"2026-01-01T00:00:01Z","duration_ms":1000,"response_status":500,`+
@@ -247,7 +247,7 @@ func TestConsumerReplayIsConfirmedByTheAPIsOwnCountAndRate(t *testing.T) {
 	// A plain post gets the log page with the confirmation in place - not a
 	// redirect, which would drop the confirmed selection and mint a new key.
 	rec := signedIn(t, h, http.MethodPost, "/deliveries/replay/confirm",
-		url.Values{"status": {"failed"}, "idempotency_key": {"key-abc"}})
+		url.Values{"status": {"failed_terminal"}, "idempotency_key": {"key-abc"}})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("confirm: status = %d, want the log page carrying the confirmation", rec.Code)
 	}
@@ -257,7 +257,7 @@ func TestConsumerReplayIsConfirmedByTheAPIsOwnCountAndRate(t *testing.T) {
 		"<strong>37/s</strong>",                  // the API's rate, not a portal constant
 		`action="/deliveries/replay"`,            // and the step that commits it
 		`name="idempotency_key" value="key-abc"`, // the same request key, so a double submit is one replay
-		`name="status" value="failed"`,           // the same selection the log was showing
+		`name="status" value="failed_terminal"`,  // the same selection the log was showing
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("the replay confirmation is missing %s:\n%s", want, body)
@@ -271,7 +271,7 @@ func TestConsumerReplayIsConfirmedByTheAPIsOwnCountAndRate(t *testing.T) {
 	if !strings.Contains(sent.Body, `"dry_run":true`) {
 		t.Fatalf("the confirmation did not ask the API first (dry_run): %s", sent.Body)
 	}
-	if !strings.Contains(sent.Body, `"status":"failed"`) {
+	if !strings.Contains(sent.Body, `"status":"failed_terminal"`) {
 		t.Fatalf("the confirmation was not about the selection the log was showing: %s", sent.Body)
 	}
 }
@@ -293,7 +293,7 @@ func TestConsumerReplayShowsTheAPIsBoundWhereTheUserActed(t *testing.T) {
 	// htmx: the refusal lands in the panel the user pressed, and it is a fragment
 	// (no layout) so it can replace that panel in place.
 	frag := signedInHtmx(t, h, http.MethodPost, "/deliveries/replay",
-		url.Values{"status": {"failed"}, "idempotency_key": {"key-1"}})
+		url.Values{"status": {"failed_terminal"}, "idempotency_key": {"key-1"}})
 	if frag.Code != http.StatusOK {
 		t.Fatalf("htmx replay: status = %d, want 200 carrying the panel", frag.Code)
 	}
@@ -311,11 +311,11 @@ func TestConsumerReplayShowsTheAPIsBoundWhereTheUserActed(t *testing.T) {
 	// A plain post of the same step gets a 303 back to the log with the reason,
 	// which is the page the panel lives on: the user reads it where they acted.
 	plain := signedIn(t, h, http.MethodPost, "/deliveries/replay",
-		url.Values{"status": {"failed"}, "idempotency_key": {"key-1"}})
+		url.Values{"status": {"failed_terminal"}, "idempotency_key": {"key-1"}})
 	if plain.Code != http.StatusSeeOther {
 		t.Fatalf("plain replay: status = %d, want a 303 back to the log", plain.Code)
 	}
-	if loc := plain.Header().Get("Location"); loc != "/deliveries?status=failed" {
+	if loc := plain.Header().Get("Location"); loc != "/deliveries?status=failed_terminal" {
 		t.Fatalf("plain replay redirected to %q, want the same filtered log", loc)
 	}
 	var flashed string
