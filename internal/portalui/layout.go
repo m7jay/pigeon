@@ -19,6 +19,12 @@ type Page struct {
 	FlashKind string // "success" | "error" | "info"
 	Email     string // current user, shown in the top-right box
 	Data      any    // page payload, read by the content template
+	// CSRFToken is FR-1009's token for this request, rendered into every form by
+	// the shared "csrf_field" component. It lives on Page (and on each fragment
+	// view that renders a form) rather than being minted per template, so adding a
+	// form cannot silently omit it: a form without a token is refused by the
+	// portal's middleware with a 403.
+	CSRFToken string
 }
 
 // Table is the payload for the shared "table" component: a header row plus

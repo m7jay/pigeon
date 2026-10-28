@@ -137,6 +137,8 @@ type replayView struct {
 	Error string
 	// Hidden are the filter fields both steps carry.
 	Hidden []hiddenField
+	// CSRFToken is FR-1009's token for the two POST forms (confirm and commit).
+	CSRFToken string
 }
 
 // trailRow is one entry of the attempt trail: an attempt row, or the synthesized
@@ -310,7 +312,7 @@ func (h *Handler) renderDeliveryLog(w http.ResponseWriter, r *http.Request, stat
 		// empty log would read as "you have no deliveries".
 		base.Error = coreErrorMessage(resp)
 	}
-	base.Replay = h.replayPanel(base.Filter, base.Replay)
+	base.Replay = h.replayPanel(r, base.Filter, base.Replay)
 	h.renderPageStatus(w, r, status, "deliveries", "Delivery log", "deliveries", base)
 }
 
@@ -487,7 +489,7 @@ func (h *Handler) deliveryReplayConfirm(w http.ResponseWriter, r *http.Request) 
 		panel.Error = coreErrorMessage(resp)
 	}
 	if wantsFragment(r) {
-		h.r.Fragment(w, http.StatusOK, "frag:replay/panel", h.replayPanel(f, panel))
+		h.r.Fragment(w, http.StatusOK, "frag:replay/panel", h.replayPanel(r, f, panel))
 		return
 	}
 	// A plain post gets the log page with the confirmation in place. It is
@@ -524,7 +526,7 @@ func (h *Handler) deliveryReplay(w http.ResponseWriter, r *http.Request) {
 		panel.Error = coreErrorMessage(resp)
 	}
 	if wantsFragment(r) {
-		h.r.Fragment(w, http.StatusOK, "frag:replay/panel", h.replayPanel(f, panel))
+		h.r.Fragment(w, http.StatusOK, "frag:replay/panel", h.replayPanel(r, f, panel))
 		return
 	}
 	if panel.Error != "" {
@@ -569,14 +571,16 @@ func replayKeyHeader(key string) map[string]string {
 	return map[string]string{"Idempotency-Key": key}
 }
 
-// replayPanel completes a replay view from the filter set it acts on, so the
-// page and the htmx fragment always render the same hidden fields.
-func (h *Handler) replayPanel(f deliveryFilterView, v replayView) replayView {
+// replayPanel completes a replay view from the filter set it acts on and the
+// request's CSRF token, so the page and the htmx fragment always render the same
+// hidden fields and the same token.
+func (h *Handler) replayPanel(r *http.Request, f deliveryFilterView, v replayView) replayView {
 	if v.Key == "" {
 		v.Key = newRequestKey()
 	}
 	v.Selection = selectionWords(f)
 	v.Hidden = replayHidden(f, v.Key)
+	v.CSRFToken = h.csrfToken(r)
 	return v
 }
 

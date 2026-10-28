@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/m7jay/pigeon/internal/portal"
 	"github.com/m7jay/pigeon/internal/portalui"
@@ -143,7 +144,13 @@ func (h *Handler) Handler() http.Handler {
 	// browser history and shared links.
 	mux.HandleFunc("GET /snippet", h.requireLogin(h.snippetForm))
 	mux.HandleFunc("POST /snippet", h.requireLogin(h.snippetSubmit))
-	return mux
+	// FR-1009/AC-50: every state-changing request in this portal carries a CSRF
+	// token bound to the session cookie and verified in constant time, and the
+	// anonymous /login and /invite are not exceptions - a cross-site login logs a
+	// victim into the attacker's account. The middleware is the outermost layer,
+	// so a refused request never reaches a handler at all: the "no state change"
+	// half of AC-50 is structural rather than a promise each handler keeps.
+	return portal.CSRFMiddleware(h.cfg.CookieSecret, h.cfg.CookieName, mux)
 }
 
 // root sends a logged-in visitor to their endpoints and everyone else to login.
@@ -186,11 +193,29 @@ func (h *Handler) tokenFromCookie(r *http.Request) string {
 	return tok
 }
 
-// setTokenCookie encrypts the token into the session cookie.
-func (h *Handler) setTokenCookie(w http.ResponseWriter, token string) error {
+// csrfToken is the token CSRFMiddleware minted or validated for this request. The
+// middleware owns the lifecycle, so a handler only ever renders it.
+func (h *Handler) csrfToken(r *http.Request) string { return portal.TokenFromRequest(r) }
+
+// setTokenCookie encrypts the token into the session cookie and gives the cookie
+// the lifetime the CORE issued (AC-51): expiresAt is the login response's
+// expires_at, so the cookie expires exactly when the session token does. There is
+// deliberately no portal-side TTL constant and no fallback: a hardcoded 12 h
+// outlived the core session and was the defect FR-1009 closes.
+//
+// Max-Age is integral seconds, so the value is truncated rather than rounded -
+// rounding up would let the cookie outlive the token it carries by up to a
+// second. A core expiry already in the past (a clock-skewed core, or a very slow
+// round trip) collapses to the 1 s floor, which is still a cookie that a browser
+// will not persist past the first request.
+func (h *Handler) setTokenCookie(w http.ResponseWriter, token string, expiresAt time.Time) error {
 	enc, err := h.cookie.Encode(token)
 	if err != nil {
 		return err
+	}
+	maxAge := int(time.Until(expiresAt).Seconds())
+	if maxAge < 1 {
+		maxAge = 1
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     h.cfg.CookieName,
@@ -199,7 +224,7 @@ func (h *Handler) setTokenCookie(w http.ResponseWriter, token string) error {
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		Secure:   true,
-		MaxAge:   12 * 3600, // 12h
+		MaxAge:   maxAge,
 	})
 	return nil
 }
@@ -220,9 +245,17 @@ func (h *Handler) clearTokenCookie(w http.ResponseWriter) {
 // flash is a one-shot message carried across a redirect in a short-lived cookie.
 const flashCookie = "pigeon_flash"
 
+// setFlash writes the one-shot message cookie. AC-49 does not exempt it: a
+// one-shot cookie is still a cookie a portal emits, so it carries all three
+// flags. SameSite is Lax rather than Strict because the flash legitimately
+// arrives on the redirect the user just made - Strict would drop it on the first
+// cross-site navigation and the message would silently disappear.
 func (h *Handler) setFlash(w http.ResponseWriter, kind, msg string) {
 	val := kind + "|" + msg
-	http.SetCookie(w, &http.Cookie{Name: flashCookie, Value: val, Path: "/", MaxAge: 60, HttpOnly: true, Secure: true})
+	http.SetCookie(w, &http.Cookie{
+		Name: flashCookie, Value: val, Path: "/", MaxAge: 60,
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+	})
 }
 
 func pullFlash(r *http.Request) (kind, msg string) {
@@ -257,6 +290,9 @@ func (h *Handler) page(r *http.Request, title, active string, data any) portalui
 		Title:     title,
 		ActiveNav: active,
 		Data:      data,
+		// FR-1009: every form the page renders carries the token the middleware
+		// minted for this request, so no handler has to remember to mint one.
+		CSRFToken: h.csrfToken(r),
 	}
 	if r != nil {
 		if k, m := pullFlash(r); m != "" {
