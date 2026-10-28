@@ -99,23 +99,24 @@ type Config struct {
 
 	// Delivery worker (S4), the S5 limits, and sweeper. The timeout is capped at
 	// the FR-802 hard ceiling of 5 s in Load.
-	DeliveryWorkers         int           // PIGEON_DELIVERY_WORKERS (0 disables the worker)
-	DeliveryLease           time.Duration // PIGEON_DELIVERY_LEASE
-	DeliveryTimeout         time.Duration // PIGEON_DELIVERY_TIMEOUT (<= 5 s, FR-802)
-	DeliveryMaxBodyBytes    int           // PIGEON_DELIVERY_MAX_BODY_BYTES (FR-804)
-	DeliveryBackoffBase     time.Duration // PIGEON_DELIVERY_BACKOFF_BASE
-	DeliveryBackoffMax      time.Duration // PIGEON_DELIVERY_BACKOFF_MAX (<= 12 h, §9)
-	DeliveryMaxRetries      int           // PIGEON_DELIVERY_MAX_RETRIES (§9: 15 retries, not attempts)
-	DeliveryRetryWindow     time.Duration // PIGEON_DELIVERY_RETRY_WINDOW (1 h - 7 d, §9; default 72 h)
-	DeliveryJitter          float64       // PIGEON_DELIVERY_JITTER (§9: 0.2 = ±20%)
-	DeliveryConcurrency     int           // PIGEON_DELIVERY_CONCURRENCY (FR-816 per-process cap)
-	DeliverySlotTTL         time.Duration // PIGEON_DELIVERY_SLOT_TTL (FR-1302; 0 = 3x timeout)
-	DeliveryMaxConnsPerHost int           // PIGEON_DELIVERY_MAX_CONNS_PER_HOST (FR-817, FR-1302's default cap: 10)
-	DeliveryPollInterval    time.Duration // PIGEON_DELIVERY_POLL_INTERVAL
-	DeliveryUserAgent       string        // PIGEON_DELIVERY_USER_AGENT (FR-810)
-	SweeperInterval         time.Duration // PIGEON_SWEEPER_INTERVAL (<= 10 s, D-6; clamped in Load)
-	SweeperLockURL          string        // PIGEON_SWEEPER_LOCK_URL (defaults to DatabaseURL)
-	SweeperLockWait         time.Duration // PIGEON_SWEEPER_LOCK_WAIT (how long to compete before logging "standing by"; the replica keeps competing)
+	DeliveryWorkers          int           // PIGEON_DELIVERY_WORKERS (0 disables the worker)
+	DeliveryLease            time.Duration // PIGEON_DELIVERY_LEASE
+	DeliveryTimeout          time.Duration // PIGEON_DELIVERY_TIMEOUT (<= 5 s, FR-802)
+	DeliveryMaxBodyBytes     int           // PIGEON_DELIVERY_MAX_BODY_BYTES (FR-804)
+	DeliveryBackoffBase      time.Duration // PIGEON_DELIVERY_BACKOFF_BASE
+	DeliveryBackoffMax       time.Duration // PIGEON_DELIVERY_BACKOFF_MAX (<= 12 h, §9)
+	DeliveryMaxRetries       int           // PIGEON_DELIVERY_MAX_RETRIES (§9: 15 retries, not attempts)
+	DeliveryRetryWindow      time.Duration // PIGEON_DELIVERY_RETRY_WINDOW (1 h - 7 d, §9; default 72 h)
+	DeliveryJitter           float64       // PIGEON_DELIVERY_JITTER (§9: 0.2 = ±20%)
+	DeliveryConcurrency      int           // PIGEON_DELIVERY_CONCURRENCY (FR-816 per-process cap)
+	DeliveryRetryConcurrency int           // PIGEON_DELIVERY_RETRY_CONCURRENCY (FR-1303 retry lane; partitioned out of DeliveryConcurrency)
+	DeliverySlotTTL          time.Duration // PIGEON_DELIVERY_SLOT_TTL (FR-1302; 0 = 3x timeout)
+	DeliveryMaxConnsPerHost  int           // PIGEON_DELIVERY_MAX_CONNS_PER_HOST (FR-817, FR-1302's default cap: 10)
+	DeliveryPollInterval     time.Duration // PIGEON_DELIVERY_POLL_INTERVAL
+	DeliveryUserAgent        string        // PIGEON_DELIVERY_USER_AGENT (FR-810)
+	SweeperInterval          time.Duration // PIGEON_SWEEPER_INTERVAL (<= 10 s, D-6; clamped in Load)
+	SweeperLockURL           string        // PIGEON_SWEEPER_LOCK_URL (defaults to DatabaseURL)
+	SweeperLockWait          time.Duration // PIGEON_SWEEPER_LOCK_WAIT (how long to compete before logging "standing by"; the replica keeps competing)
 
 	// Attempt evidence buffering (S6). D-1: attempts are buffered in Redis and
 	// never in worker process memory; D-2: the mode is configurable; FR-812/815:
@@ -177,6 +178,7 @@ func defaults() Config {
 		DeliveryRetryWindow:       72 * time.Hour,
 		DeliveryJitter:            0.2,
 		DeliveryConcurrency:       64,
+		DeliveryRetryConcurrency:  16,
 		DeliveryMaxConnsPerHost:   10,
 		DeliveryPollInterval:      time.Second,
 		SweeperInterval:           5 * time.Second,
@@ -275,6 +277,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if c.DeliveryConcurrency, err = envInt("PIGEON_DELIVERY_CONCURRENCY", c.DeliveryConcurrency); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryRetryConcurrency, err = envInt("PIGEON_DELIVERY_RETRY_CONCURRENCY", c.DeliveryRetryConcurrency); err != nil {
 		return Config{}, err
 	}
 	if c.DeliverySlotTTL, err = envDuration("PIGEON_DELIVERY_SLOT_TTL", c.DeliverySlotTTL); err != nil {
@@ -428,6 +433,14 @@ func (c Config) Validate() error {
 	}
 	if c.DeliveryConcurrency < 1 {
 		problems = append(problems, "PIGEON_DELIVERY_CONCURRENCY must be >= 1 (FR-816)")
+	}
+	// FR-1303: the retry lane's allowance is validated exactly as C is, so a
+	// configured 0 is refused rather than accepted as a mode an operator can pick
+	// - a zero retry allowance reads as "stop retrying", which FR-1201 forbids.
+	// The partition itself (R = clamp(configured, 0, C-1), so the first-attempt
+	// lane keeps at least one slot) is the worker's: it needs the effective C.
+	if c.DeliveryRetryConcurrency < 1 {
+		problems = append(problems, "PIGEON_DELIVERY_RETRY_CONCURRENCY must be >= 1 (FR-1303: the retry lane's allowance; 0 would stop retrying, which FR-1201 forbids)")
 	}
 	if c.DeliverySlotTTL < 0 {
 		problems = append(problems, "PIGEON_DELIVERY_SLOT_TTL must be >= 0 (0 = three times the attempt timeout)")

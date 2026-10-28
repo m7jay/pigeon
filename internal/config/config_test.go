@@ -32,16 +32,17 @@ func valid() Config {
 		// keeps SB-5's default retention windows. The buffered mode is only valid
 		// with a Redis URL, so a "valid config" must carry both; S8's storage
 		// budget must be a real percentage (SB-3), so it is set here too.
-		RedisURL:             "redis://localhost:6379/0",
-		AttemptLogMode:       AttemptLogBuffered,
-		AttemptFlushBatch:    MinFlushBatch,
-		AttemptFlushInterval: time.Second,
-		AttemptFlushStale:    30 * time.Second,
-		SuccessLogRPS:        100,
-		RetentionMaxDiskPct:  80,
-		RetentionDeliveries:  14 * 24 * time.Hour,
-		RetentionAttempts:    7 * 24 * time.Hour,
-		RetentionEvents:      14 * 24 * time.Hour,
+		RedisURL:                 "redis://localhost:6379/0",
+		DeliveryRetryConcurrency: 16,
+		AttemptLogMode:           AttemptLogBuffered,
+		AttemptFlushBatch:        MinFlushBatch,
+		AttemptFlushInterval:     time.Second,
+		AttemptFlushStale:        30 * time.Second,
+		SuccessLogRPS:            100,
+		RetentionMaxDiskPct:      80,
+		RetentionDeliveries:      14 * 24 * time.Hour,
+		RetentionAttempts:        7 * 24 * time.Hour,
+		RetentionEvents:          14 * 24 * time.Hour,
 		// FR-905's archive window. It answers the dedupe question between the
 		// deliveries window and this one, so it is the longest of the four and has
 		// to be here: a hand-built reference config that leaves it zero is refused
@@ -70,6 +71,10 @@ func TestValidateRefusesUnsafeConfigurations(t *testing.T) {
 		"window over seven days": func(c *Config) { c.DeliveryRetryWindow = 8 * 24 * time.Hour },
 		"jitter over 100%":       func(c *Config) { c.DeliveryJitter = 1.5 },
 		"zero concurrency":       func(c *Config) { c.DeliveryConcurrency = 0 },
+		// FR-1303: a zero retry allowance reads as "stop retrying" (FR-1201), so it
+		// is refused at load rather than accepted as a mode an operator can pick.
+		"zero retry concurrency":     func(c *Config) { c.DeliveryRetryConcurrency = 0 },
+		"negative retry concurrency": func(c *Config) { c.DeliveryRetryConcurrency = -1 },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -157,6 +162,8 @@ func TestLoadFromEnvironment(t *testing.T) {
 	t.Setenv("PIGEON_DELIVERY_RETRY_WINDOW", "24h")
 	t.Setenv("PIGEON_DELIVERY_JITTER", "0.1")
 	t.Setenv("PIGEON_DELIVERY_CONCURRENCY", "16")
+	// FR-1303: the retry lane's allowance is its own knob, read like the others.
+	t.Setenv("PIGEON_DELIVERY_RETRY_CONCURRENCY", "8")
 
 	c, err := Load()
 	if err != nil {
@@ -166,8 +173,31 @@ func TestLoadFromEnvironment(t *testing.T) {
 		t.Fatalf("unexpected values: %+v", c)
 	}
 	if c.DeliveryMaxRetries != 7 || c.DeliveryRetryWindow != 24*time.Hour ||
-		c.DeliveryJitter != 0.1 || c.DeliveryConcurrency != 16 {
+		c.DeliveryJitter != 0.1 || c.DeliveryConcurrency != 16 ||
+		c.DeliveryRetryConcurrency != 8 {
 		t.Fatalf("S5 delivery settings not read from the environment: %+v", c)
+	}
+}
+
+// TestDeliveryRetryConcurrencyHasAShippedDefault pins FR-1303's default: the retry
+// lane takes 16 of the process's 64 attempt slots, and the first-attempt lane keeps
+// the rest. A default of zero would read as "stop retrying" (FR-1201) and one at or
+// above C would empty the first-attempt lane, so both numbers are load-bearing.
+func TestDeliveryRetryConcurrencyHasAShippedDefault(t *testing.T) {
+	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
+	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0")
+	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.DeliveryRetryConcurrency != 16 {
+		t.Errorf("PIGEON_DELIVERY_RETRY_CONCURRENCY defaults to %d, want 16 (FR-1303)", c.DeliveryRetryConcurrency)
+	}
+	if c.DeliveryConcurrency-c.DeliveryRetryConcurrency < 1 {
+		t.Errorf("the defaults leave the first-attempt lane %d slots: C=%d, R=%d (FR-1303)",
+			c.DeliveryConcurrency-c.DeliveryRetryConcurrency, c.DeliveryConcurrency, c.DeliveryRetryConcurrency)
 	}
 }
 

@@ -298,23 +298,27 @@ func run() error {
 			limits = limit.NewLocal()
 		}
 		dw := delivery.New(st, delivery.Options{
-			Workers:         cfg.DeliveryWorkers,
-			Concurrency:     cfg.DeliveryConcurrency,
-			Lease:           cfg.DeliveryLease,
-			Timeout:         cfg.DeliveryTimeout,
-			SlotTTL:         cfg.DeliverySlotTTL,
-			MaxBodyBytes:    cfg.DeliveryMaxBodyBytes,
-			BackoffBase:     cfg.DeliveryBackoffBase,
-			BackoffMax:      cfg.DeliveryBackoffMax,
-			MaxRetries:      cfg.DeliveryMaxRetries,
-			RetryWindow:     cfg.DeliveryRetryWindow,
-			Jitter:          cfg.DeliveryJitter,
-			MaxConnsPerHost: cfg.DeliveryMaxConnsPerHost,
-			PollInterval:    cfg.DeliveryPollInterval,
-			UserAgent:       "pigeon/" + version,
-			Limits:          limits,
-			Pauses:          tracker,
-			Logger:          log,
+			Workers:     cfg.DeliveryWorkers,
+			Concurrency: cfg.DeliveryConcurrency,
+			// FR-1303: the retry lane's allowance, partitioned out of
+			// Concurrency by the worker (R = clamp(configured, 0, C-1), so the
+			// first-attempt lane always keeps at least one slot).
+			RetryConcurrency: cfg.DeliveryRetryConcurrency,
+			Lease:            cfg.DeliveryLease,
+			Timeout:          cfg.DeliveryTimeout,
+			SlotTTL:          cfg.DeliverySlotTTL,
+			MaxBodyBytes:     cfg.DeliveryMaxBodyBytes,
+			BackoffBase:      cfg.DeliveryBackoffBase,
+			BackoffMax:       cfg.DeliveryBackoffMax,
+			MaxRetries:       cfg.DeliveryMaxRetries,
+			RetryWindow:      cfg.DeliveryRetryWindow,
+			Jitter:           cfg.DeliveryJitter,
+			MaxConnsPerHost:  cfg.DeliveryMaxConnsPerHost,
+			PollInterval:     cfg.DeliveryPollInterval,
+			UserAgent:        "pigeon/" + version,
+			Limits:           limits,
+			Pauses:           tracker,
+			Logger:           log,
 			// S6: evidence goes to the Redis buffer in buffered mode (D-1) or is
 			// written inline in sync mode (D-2). The counters and the log gate
 			// carry the volume LOG-2 forbids in the log stream.

@@ -16,15 +16,24 @@
 // It is a system worker like the relay: no producer scope, reaching the tenant
 // tables only through the SECURITY DEFINER functions in 0008 and 0013.
 //
-// Concurrency (FR-816, FR-1302, FR-1307). "Workers" is the number of CLAIM loops;
-// each claimed delivery runs its attempt in its own goroutine. Two bounds apply
-// and they are not interchangeable:
+// Concurrency (FR-816, FR-1302, FR-1303, FR-1307). "Workers" is the number of
+// CLAIM loops; each claimed delivery runs its attempt in its own goroutine. Three
+// bounds apply and they are not interchangeable:
 //
 //   - the per-endpoint concurrency cap and RPS are leased in Redis, so they hold
 //     across replicas and adding a replica does not raise them (FR-1307, AC-41);
-//   - the per-process semaphore plus the endpoint's transport cap bound this
-//     process's goroutines and connections. They are backpressure, never the
-//     authority: the number they bound is not the endpoint's promise.
+//   - the process's attempt budget is PARTITIONED into two attempt-class lanes
+//     (FR-1303): a first-attempt lane (`deliveries.attempts = 0`) and a retry lane
+//     (`> 0`), holding `C - R` and `R` slots, so retry work cannot consume the
+//     allowance a first attempt draws on while attempts in flight for one process
+//     still total at most `C = PIGEON_DELIVERY_CONCURRENCY`;
+//   - the endpoint's transport cap bounds this process's connections. It is
+//     backpressure, never the authority: the number it bounds is not the
+//     endpoint's promise.
+//
+// An endpoint that cannot admit a request does not park this path (FR-1304): the
+// delivery is rescheduled at the wait the limiter reports, the hold is recorded
+// on the delivery row, and the loop moves on to the next claim.
 package delivery
 
 import (
@@ -65,11 +74,25 @@ const (
 	// able to saturate several endpoints' caps without a separate process per
 	// endpoint, and it is not what bounds any single endpoint.
 	defaultProcessConcurrency = 64
+	// defaultRetryConcurrency is FR-1303's R: the retry lane's share of the
+	// process's attempt budget. 16 of 64, so a retry storm can use a quarter of
+	// this process's attempt slots while 48 stay with first attempts.
+	defaultRetryConcurrency = 16
 	// maxAttemptTimeout is FR-802's hard ceiling, absolute: no attempt outlives
 	// five seconds, whatever the endpoint or the deployment asks for.
 	maxAttemptTimeout = 5 * time.Second
 	// defaultAttemptTimeout is what a caller that configured nothing gets.
 	defaultAttemptTimeout = 5 * time.Second
+)
+
+// The two reasons FR-1304 records on a held delivery, named after the limiter
+// that refused to admit it: the endpoint's cluster-wide concurrency cap (FR-1302)
+// or its rate bucket (FR-1306). They travel to the producer through the delivery
+// view, so they are a wire-facing vocabulary; `held_back_reason` also accepts
+// nothing else today.
+const (
+	HoldReasonConcurrency = "endpoint_concurrency_cap"
+	HoldReasonRate        = "endpoint_rps"
 )
 
 // Options configures a Worker. Zero values take their documented defaults, with
@@ -82,7 +105,21 @@ type Options struct {
 	Workers int
 	// Concurrency is the per-process cap on concurrent attempts (FR-816) — the
 	// backpressure bound, not the endpoint's promise. Defaults to 64.
+	//
+	// FR-1303 partitions it rather than adding to it: the retry lane takes
+	// RetryConcurrency slots and the first-attempt lane keeps the rest.
 	Concurrency int
+	// RetryConcurrency is FR-1303's R, the retry lane's allowance, partitioned
+	// out of Concurrency. Defaults to 16 (48 first-attempt slots at the default
+	// C = 64).
+	//
+	// It is clamped into [0, Concurrency-1] so the first-attempt lane can never
+	// be configured to zero; a zero here means "unset" and takes the default,
+	// because config.Validate refuses a configured 0 (an allowance of zero reads
+	// as "stop retrying", which FR-1201 forbids). R = 0 can therefore only be
+	// reached by the clamp, at Concurrency = 1, where one lane serves both
+	// classes.
+	RetryConcurrency int
 	// Lease is how long a claimed delivery is held before it is claimable again.
 	// A crashed worker lets it lapse and the row is retried (D-6, FR-809).
 	// Defaults to 40 s.
@@ -198,16 +235,70 @@ type Worker struct {
 	pauses   *pause.Tracker
 	notifier pause.Notifier
 
-	// sem is the per-process concurrency budget (FR-816). It is backpressure:
-	// holding one is permission to run an attempt in this process, never
-	// permission to exceed the endpoint's cap.
-	sem chan struct{}
+	// lanes are FR-1303's attempt-class lanes. Each holds its own allowance and
+	// claims only its own class; together they are the per-process attempt budget
+	// FR-816 caps, partitioned rather than raised: the sum of their allowances is
+	// exactly opts.Concurrency. One lane (R = 0, reached only at C = 1) serves
+	// both classes.
+	lanes []*attemptLane
+	// laneCursor rotates which lane a dispatch pass tries first, so a lane that
+	// always has work cannot starve the other one. It is the reason a single
+	// claim loop with a retry backlog still starts first attempts.
+	laneCursor atomic.Uint64
 	// inflight tracks attempt goroutines so Run does not return while one is
 	// still unwinding (AC-21 uses the same guarantee through the parent ctx).
 	inflight sync.WaitGroup
 	// holder identifies this process in the concurrency set, so a release frees
 	// only its own slot.
 	holder string
+}
+
+// attemptLane is one attempt-class lane (FR-1303): the class it claims and the
+// allowance it holds.
+type attemptLane struct {
+	class store.AttemptClass
+	name  string
+	sem   chan struct{}
+}
+
+// laneAllowance partitions a process's attempt budget into the two lanes
+// (FR-1303). R is clamped into [0, C-1] so the first-attempt lane keeps at least
+// one slot at every accepted C (config refuses C < 1), and a configured value
+// above C-1 is clamped rather than refused, because the result still leaves the
+// first-attempt lane one slot.
+//
+// R = 0 is a defined state rather than an error, and only this clamp reaches it,
+// at C = 1: one lane serves both classes and FR-1303's isolation is not
+// claimed for that process. Retries still run there, because a degenerate
+// partition MUST NOT starve FR-1201's retry policy.
+func laneAllowance(process, retry int) (first, retries int) {
+	if process < 1 {
+		process = 1
+	}
+	if retry < 0 {
+		retry = 0
+	}
+	if retry > process-1 {
+		retry = process - 1
+	}
+	return process - retry, retry
+}
+
+// newLanes builds a process's lanes: the shared lane when R = 0, the partition
+// otherwise. The allowances sum to the process cap either way.
+func newLanes(process, retry int) []*attemptLane {
+	first, retries := laneAllowance(process, retry)
+	if retries == 0 {
+		return []*attemptLane{{
+			class: store.AttemptClassAny,
+			name:  "shared",
+			sem:   make(chan struct{}, first+retries),
+		}}
+	}
+	return []*attemptLane{
+		{class: store.AttemptClassFirst, name: "first", sem: make(chan struct{}, first)},
+		{class: store.AttemptClassRetry, name: "retry", sem: make(chan struct{}, retries)},
+	}
 }
 
 // New builds a Worker. A nil logger is replaced rather than panicked on.
@@ -217,6 +308,12 @@ func New(st *store.Store, opts Options) *Worker {
 	}
 	if opts.Concurrency <= 0 {
 		opts.Concurrency = defaultProcessConcurrency
+	}
+	// FR-1303: the retry lane's allowance. A zero or negative value here is
+	// "unset" and takes the default - config.Validate refuses a configured 0, so
+	// the only way to reach R = 0 is the clamp below, at C = 1.
+	if opts.RetryConcurrency <= 0 {
+		opts.RetryConcurrency = defaultRetryConcurrency
 	}
 	if opts.Lease <= 0 {
 		opts.Lease = 40 * time.Second
@@ -278,8 +375,20 @@ func New(st *store.Store, opts Options) *Worker {
 		limits:   opts.Limits,
 		pauses:   opts.Pauses,
 		notifier: opts.Notifier,
-		sem:      make(chan struct{}, opts.Concurrency),
+		lanes:    newLanes(opts.Concurrency, opts.RetryConcurrency),
 		holder:   holderName(),
+	}
+	// FR-1303: a configured retry allowance above C-1 is clamped rather than
+	// refused (the result still leaves the first-attempt lane a slot), and an
+	// operator reading "retry lane = 16" in the environment must not have to
+	// guess why the process is running a different one.
+	if opts.RetryConcurrency > 0 {
+		first, retries := laneAllowance(opts.Concurrency, opts.RetryConcurrency)
+		if retries != opts.RetryConcurrency {
+			w.log.Warn("delivery: the retry lane's allowance was clamped so the first-attempt lane keeps a slot (FR-1303)",
+				"configured", opts.RetryConcurrency, "process_cap", opts.Concurrency,
+				"retry_lane", retries, "first_attempt_lane", first)
+		}
 	}
 	// LOG-2's gate. A negative SuccessLogRPS is the explicit "log every success"
 	// escape hatch (only sensible below a few hundred deliveries a second); 0
@@ -429,41 +538,67 @@ func (w *Worker) loop(ctx context.Context) {
 	}
 }
 
-// dispatch claims one delivery, takes its endpoint's slots and runs the attempt
-// in its own goroutine. It returns whether it did any work; the caller sleeps
-// when it did not.
+// dispatch claims one delivery into whichever lane can serve it, takes that
+// lane's allowance and the endpoint's limits, and runs the attempt in its own
+// goroutine. It returns whether it did any work; the caller sleeps when it did
+// not.
 //
-// The per-process budget is taken BEFORE the claim, so a process never claims
-// work it has no room to run — an unclaimed row is simply due later, while a
+// A lane's allowance is taken BEFORE the claim, so a process never claims work it
+// has no room to run - an unclaimed row is simply due later, while a
 // claimed-but-unrunnable one holds a lease the sweeper then has to recover.
+//
+// The lanes are tried in a rotation and a lane that cannot serve this pass hands
+// over to the next one. Both halves matter: the rotation is what stops a lane
+// that always has work (a capped endpoint's retry backlog) from starving the
+// other one, and handing over is what stops an idle lane from costing the busy
+// one a whole poll interval.
 func (w *Worker) dispatch(ctx context.Context) (bool, error) {
+	start := int(w.laneCursor.Add(1)-1) % len(w.lanes)
+	for k := range w.lanes {
+		lane := w.lanes[(start+k)%len(w.lanes)]
+		did, err := w.dispatchLane(ctx, lane)
+		if err != nil {
+			return false, err
+		}
+		if did {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// dispatchLane runs one pass for one lane: take its allowance, claim one
+// delivery of its class, and either start the attempt or record FR-1304's hold.
+// It returns false when this lane could not serve the pass - at its allowance, or
+// nothing due in its class - which is the caller's cue to try the other lane.
+func (w *Worker) dispatchLane(ctx context.Context, lane *attemptLane) (bool, error) {
 	select {
-	case w.sem <- struct{}{}:
+	case lane.sem <- struct{}{}:
 	case <-ctx.Done():
 		return false, nil
 	default:
-		// At the process cap: backpressure. Sleep rather than block, so a
-		// shutdown is immediate.
+		// At this lane's allowance: backpressure. Return rather than block, so
+		// a shutdown is immediate and the other lane still gets its turn.
 		return false, nil
 	}
-	releaseLocal := func() { <-w.sem }
+	releaseLane := func() { <-lane.sem }
 
-	d, got, err := w.store.ClaimDelivery(ctx, w.opts.Lease, w.opts.RetryWindow)
+	d, got, err := w.store.ClaimDelivery(ctx, w.opts.Lease, w.opts.RetryWindow, lane.class)
 	if err != nil {
-		releaseLocal()
+		releaseLane()
 		return false, err
 	}
 	if !got {
-		releaseLocal()
+		releaseLane()
 		return false, nil
 	}
 
-	releaseEndpoint, err := w.acquireEndpointLimits(ctx, d)
+	res, err := w.admit(ctx, d)
 	if err != nil {
 		if ctx.Err() != nil {
-			// Shutting down while waiting for a slot: the delivery stays pending
-			// under its lease and is retried after restart (AC-21).
-			releaseLocal()
+			// Shutting down: the delivery stays pending under its lease and is
+			// retried after restart (AC-21).
+			releaseLane()
 			return false, nil
 		}
 		// The limiter is unreachable (a Redis outage). Attempt without it rather
@@ -472,97 +607,172 @@ func (w *Worker) dispatch(ctx context.Context) (bool, error) {
 		// for. Logged at error because FR-1302 is P0 and this is unprotected.
 		w.log.Error("delivery: per-endpoint limits unavailable; attempting unprotected (FR-1302)",
 			"endpoint_id", d.EndpointID, "error", err)
-		releaseEndpoint = func() {}
+		res = admitResult{release: func() {}}
 	}
+	if res.reason != "" {
+		// FR-1304: the endpoint cannot admit this request. Nothing is attempted,
+		// neither a claim nor a lane slot is held while it waits, and the
+		// delivery is rescheduled at the wait the limiter reported.
+		releaseLane()
+		res.release()
+		w.recordHold(ctx, d, res)
+		return true, nil
+	}
+
+	w.clearHoldIfHeld(ctx, d)
 
 	w.inflight.Add(1)
 	go func() {
 		defer w.inflight.Done()
-		defer releaseEndpoint()
-		defer releaseLocal()
+		defer res.release()
+		defer releaseLane()
 		w.handle(ctx, d)
 	}()
 	return true, nil
 }
 
-// acquireEndpointLimits takes this endpoint's concurrency slot (FR-1302) and then
-// one rate token (FR-1306), waiting for either to free up. The slot comes first
+// admitResult is FR-1304's answer to "may this endpoint take this request now?".
+type admitResult struct {
+	// release frees the concurrency slot this request took. It is a no-op when
+	// no slot was taken, so a caller can always defer it.
+	release func()
+	// reason names the limiter that refused admission, and is empty when the
+	// request was admitted. It is what held_back_reason stores and what the
+	// producer reads.
+	reason string
+	// wait is how long the limiter says to wait before asking again. It is only
+	// meaningful when reason is set.
+	wait time.Duration
+}
+
+// admit asks the endpoint's limits for permission to start this delivery's
+// request, and does NOT wait for it (FR-1304): the slot comes first (FR-1302) and
+// then one rate token (FR-1306), each taken at most once, and a refusal is
+// reported as a hold with the wait the limiter returned. The slot comes first
 // because a token must be spent on a request that actually starts: taking the
 // token first would charge the endpoint's rate for work that then blocked on
 // concurrency, and FR-1306 is explicit that a slow request is still one request.
 //
-// The returned release frees the slot. It is idempotent, so a cancelled wait that
-// has not yet taken a slot returns a no-op.
-func (w *Worker) acquireEndpointLimits(ctx context.Context, d store.LeasedDelivery) (func(), error) {
+// The old shape waited here, inside the dispatch path and holding both the claim
+// and the process's allowance, which is the thing that parked a whole process
+// behind one capped endpoint (SPEC.md A-10).
+func (w *Worker) admit(ctx context.Context, d store.LeasedDelivery) (admitResult, error) {
 	if w.limits == nil {
-		return func() {}, nil
+		return admitResult{release: func() {}}, nil
 	}
 	concCap := w.effectiveConcurrency(d)
-	var slot limit.Lease
-	for {
-		lease, ok, wait, err := w.limits.Acquire(ctx, d.EndpointID, concCap, w.opts.SlotTTL, w.holder)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			slot = lease
-			break
-		}
-		if !sleep(ctx, wait) {
-			return nil, ctx.Err()
-		}
+	lease, ok, wait, err := w.limits.Acquire(ctx, d.EndpointID, concCap, w.opts.SlotTTL, w.holder)
+	if err != nil {
+		return admitResult{}, err
 	}
-	release := func() { slot.Release(context.Background()) }
+	if !ok {
+		return admitResult{release: func() {}, reason: HoldReasonConcurrency, wait: wait}, nil
+	}
+	release := func() { lease.Release(context.Background()) }
 
 	rps := float64(d.Endpoint.MaxRPS)
 	if d.Endpoint.MaxRPS <= 0 {
 		rps = defaultMaxRPS
 	}
-	for {
-		ok, wait, err := w.limits.Allow(ctx, d.EndpointID, rps, int(rps))
-		if err != nil {
-			release()
-			return nil, err
-		}
-		if ok {
-			return release, nil
-		}
-		if !sleep(ctx, wait) {
-			release()
-			return nil, ctx.Err()
-		}
+	ok, wait, err = w.limits.Allow(ctx, d.EndpointID, rps, int(rps))
+	if err != nil {
+		// A Redis fault between the slot and the token: give the slot back and
+		// let the caller attempt unprotected, exactly as it does when the slot
+		// itself cannot be leased.
+		release()
+		return admitResult{}, err
 	}
+	if !ok {
+		// FR-1304: the request never starts, so the slot it would have held goes
+		// back in the same breath.
+		release()
+		return admitResult{release: func() {}, reason: HoldReasonRate, wait: wait}, nil
+	}
+	return admitResult{release: release}, nil
 }
 
-// sleep waits for d, or until ctx is done, reporting whether the wait completed.
-// A zero or negative wait still yields the run queue, so a saturated limiter
-// cannot spin a core.
-func sleep(ctx context.Context, d time.Duration) bool {
-	if d <= 0 {
-		d = time.Millisecond
+// recordHold writes FR-1304's hold on the delivery row and counts it (OBS-13).
+//
+// The wait is the limiter's own, floored in the durable write
+// (pigeon_hold_delivery) so a zero wait cannot make the row claimable in the same
+// instant. Nothing else about the delivery moves: no attempt is consumed, and the
+// retry deadline is untouched, because a hold is neither an attempt nor a pause
+// (FR-1207's extension is for a pause).
+//
+// A failed write is logged at error rather than retried here: the delivery keeps
+// its lease and the sweeper re-queues it (D-6), so the cost of the failure is a
+// delayed attempt, never a lost one. The counter advances either way, because the
+// hold - the endpoint refusing work - is what it measures, whatever the durable
+// write managed to do.
+func (w *Worker) recordHold(ctx context.Context, d store.LeasedDelivery, res admitResult) {
+	held, err := w.store.HoldDelivery(ctx, d.DeliveryID, res.reason, w.now().Add(res.wait))
+	switch {
+	case err != nil:
+		w.log.Error("delivery: recording the held-back state failed; the delivery stays leased for the sweeper (D-6, FR-1304)",
+			"delivery_id", d.DeliveryID, "endpoint_id", d.EndpointID, "reason", res.reason, "error", err)
+	case !held:
+		// The row was no longer pending: another worker finished it while this
+		// one was refused admission. Nothing was held and nothing is wrong.
+		return
 	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
+	w.metrics.RecordHeldBack(d.EndpointID, res.wait)
+	w.log.Debug("delivery held back by its endpoint's limits (FR-1304)",
+		"delivery_id", d.DeliveryID, "endpoint_id", d.EndpointID,
+		"reason", res.reason, "wait_ms", res.wait.Milliseconds())
+}
+
+// clearHoldIfHeld ends the hold episode when the attempt it was waiting for
+// actually starts, so the producer's view says "held" only while nothing is being
+// attempted. The claim reports whether there is one, so ordinary traffic pays no
+// round trip for this existing: a delivery is held, is re-claimed when the hold
+// lapses, and the flag it arrived with is the signal.
+//
+// A failure is logged and not fatal: the attempt runs either way, and a stale
+// held_back_since is a wrong field on one delivery rather than a lost attempt.
+func (w *Worker) clearHoldIfHeld(ctx context.Context, d store.LeasedDelivery) {
+	if !d.HeldBack {
+		return
+	}
+	if err := w.store.ClearDeliveryHold(ctx, d.DeliveryID); err != nil {
+		w.log.Warn("delivery: clearing the held-back state failed; the attempt runs anyway (FR-1304)",
+			"delivery_id", d.DeliveryID, "endpoint_id", d.EndpointID, "error", err)
 	}
 }
 
 // ProcessOne leases and handles one delivery inline, returning whether it did any
 // work. It is the single-unit entry point tests drive deterministically; Run uses
 // dispatch, which runs the attempt in its own goroutine under the endpoint's
-// limits.
+// limits and the process's lanes.
+//
+// It claims either attempt class (AttemptClassAny - there are no lanes here) but
+// it does respect the endpoint's limits, and it holds rather than attempts a
+// delivery the endpoint cannot admit (FR-1304): "MUST NOT be attempted" has no
+// test-only exception, and a driver that skipped admission would be exercising a
+// path production does not have.
 func (w *Worker) ProcessOne(ctx context.Context) (bool, error) {
-	d, got, err := w.store.ClaimDelivery(ctx, w.opts.Lease, w.opts.RetryWindow)
+	d, got, err := w.store.ClaimDelivery(ctx, w.opts.Lease, w.opts.RetryWindow, store.AttemptClassAny)
 	if err != nil {
 		return false, err
 	}
 	if !got {
 		return false, nil
 	}
+	res, err := w.admit(ctx, d)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, nil
+		}
+		w.log.Error("delivery: per-endpoint limits unavailable; attempting unprotected (FR-1302)",
+			"endpoint_id", d.EndpointID, "error", err)
+		res = admitResult{release: func() {}}
+	}
+	if res.reason != "" {
+		res.release()
+		w.recordHold(ctx, d, res)
+		return true, nil
+	}
+	defer res.release()
+	w.clearHoldIfHeld(ctx, d)
 	w.handle(ctx, d)
 	return true, nil
 }
