@@ -13,7 +13,7 @@
 //
 //	loadgen run   -base http://127.0.0.1:8080 -key "$KEY" -event-type order.created \
 //	              -rate 250 -subs 10 -db "$DSN" -label 2vCPU-4GB -out report.json
-//	loadgen compare -label-a 1-replica.json -label-b 2-replica.json -label-c 4-replica.json
+//	loadgen compare -label 1-replica.json -label 2-replica.json -label 4-replica.json
 //
 // `run` prints a human report and, with -out, the same report as JSON. `compare`
 // reads three or more reports and applies AC-43: throughput must scale at least 80%
@@ -107,7 +107,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `loadgen - Pigeon load generator (§16 load protocol)
 
   loadgen run     -base URL -key KEY -event-type NAME -rate N [-subs N] [-db DSN] [-out FILE]
-  loadgen compare -label-a FILE -label-b FILE [-label-c FILE ...]
+  loadgen compare -label FILE -label FILE [-label FILE ...]
 
 run flags:
   -base            instance base URL (default http://127.0.0.1:8080)
