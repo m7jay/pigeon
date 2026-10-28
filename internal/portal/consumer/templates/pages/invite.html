@@ -3,6 +3,7 @@
   <h1>Redeem an invitation</h1>
   <p class="page-sub">A producer invited you by email. Enter the invitation token they sent, choose a password, and we'll create your account bound to your consumer.</p>
   <form method="post" action="/invite">
+    {{template "csrf_field" .}}
     <div class="form-row"><label for="token">Invitation token</label><input id="token" type="text" name="token" required autofocus class="mono" placeholder="pgni_…"></div>
     <div class="form-row"><label for="email">Email</label><input id="email" type="email" name="email" required></div>
     <div class="form-row"><label for="password">Choose a password</label><input id="password" type="password" name="password" required minlength="8"></div>

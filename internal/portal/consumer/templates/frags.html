@@ -29,10 +29,12 @@
              work and changes nothing. */}}
         <form method="post" action="/endpoints/{{.ID}}/{{if .Paused}}resume{{else}}pause{{end}}"
               hx-post="/endpoints/{{.ID}}/{{if .Paused}}resume{{else}}pause{{end}}" hx-target="#endpoints-list" hx-swap="outerHTML">
+          {{template "csrf_field" $}}
           <button class="btn btn-sm" type="submit">{{if .Paused}}Resume{{else}}Pause{{end}}</button>
         </form>
         <form method="post" action="/endpoints/{{.ID}}/delete"
               hx-post="/endpoints/{{.ID}}/delete" hx-target="#endpoints-list" hx-swap="outerHTML" hx-confirm="Delete this endpoint?">
+          {{template "csrf_field" $}}
           <button class="btn btn-sm btn-danger" type="submit">Delete</button>
         </form>
       </td>
@@ -60,6 +62,7 @@
       <td>
         <form method="post" action="/endpoints/{{.EndpointID}}/subscriptions/{{.EventType}}/delete"
               hx-post="/endpoints/{{.EndpointID}}/subscriptions/{{.EventType}}/delete" hx-target="#subs-list" hx-swap="outerHTML">
+          {{template "csrf_field" $}}
           <button class="btn btn-sm btn-danger" type="submit">Opt out</button>
         </form>
       </td>
@@ -85,12 +88,14 @@
 {{if .Confirmed}}
 <p class="page-sub">The API matched <strong>{{.Matched}}</strong> {{if eq .Matched 1}}delivery{{else}}deliveries{{end}} for {{.Selection}} and would release them at <strong>{{.Rate}}/s</strong> per endpoint. Nothing has been created yet - committing is the step that writes.</p>
 <form method="post" action="/deliveries/replay" hx-post="/deliveries/replay" hx-target="#replay-panel" hx-swap="outerHTML">
+  {{template "csrf_field" .}}
   {{range .Hidden}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">{{end}}
   <button class="btn btn-sm" type="submit">Replay {{.Matched}} {{if eq .Matched 1}}delivery{{else}}deliveries{{end}}</button>
 </form>
 {{else}}
 <p class="page-sub">Replaying {{.Selection}} creates new deliveries linked to the ones they came from; it never changes the history you already have (FR-1106). The API's own bound applies (FR-1107), and the count and rate below are the API's answer, not a portal-side limit.</p>
 <form method="post" action="/deliveries/replay/confirm" hx-post="/deliveries/replay/confirm" hx-target="#replay-panel" hx-swap="outerHTML">
+  {{template "csrf_field" .}}
   {{range .Hidden}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">{{end}}
   <button class="btn btn-sm" type="submit">Review this replay</button>
 </form>

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/m7jay/pigeon/internal/portal"
 )
@@ -78,6 +79,10 @@ func parseCustomHeaders(text string) ([]customHeaderInput, error) {
 type endpointsView struct {
 	Endpoints []endpointRow
 	Created   *createdView
+	// CSRFToken is FR-1009's token. This view renders two POST forms (pause/resume
+	// and delete) per row inside an htmx fragment, so it carries the token the same
+	// way a Page does.
+	CSRFToken string
 }
 
 type subRow struct {
@@ -93,6 +98,8 @@ type subRow struct {
 type subsView struct {
 	Subscriptions []subRow
 	Error         string
+	// CSRFToken is FR-1009's token, for the "opt out" POST each row renders.
+	CSRFToken string
 }
 
 type endpointDetail struct {
@@ -204,6 +211,12 @@ func (h *Handler) loginForm(w http.ResponseWriter, r *http.Request) {
 
 // loginSubmit authenticates against the core API, stores the scoped session
 // token in the encrypted cookie, and sends the visitor to where they were headed.
+//
+// The cookie's lifetime comes from the core's own `expires_at` (AC-51): the portal
+// no longer invents a TTL, so the cookie cannot outlive the session token it
+// carries. A 201 whose body has no parsable expires_at is a broken core, not a
+// reason to fall back to a constant - that fallback is precisely the defect
+// FR-1009 closes - so the login fails with 502 instead.
 func (h *Handler) loginSubmit(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -225,12 +238,7 @@ func (h *Handler) loginSubmit(w http.ResponseWriter, r *http.Request) {
 		h.renderPage(w, r, "login", "Log in", "", nil) // the page flashes the reason
 		return
 	}
-	var sess struct {
-		Token string `json:"token"`
-	}
-	_ = json.Unmarshal(resp.Body, &sess)
-	if err := h.setTokenCookie(w, sess.Token); err != nil {
-		http.Error(w, "cannot start session", http.StatusInternalServerError)
+	if !h.applyCoreSession(w, resp.Body) {
 		return
 	}
 	next := r.FormValue("next")
@@ -246,6 +254,33 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	h.clearTokenCookie(w)
 	h.setFlash(w, "info", "You have been logged out.")
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// applyCoreSession decodes a 201 from the core's POST /v1/session and starts the
+// portal session from it: the token goes into the encrypted cookie and the
+// cookie's Max-Age comes from the core's own `expires_at` (AC-51). It reports
+// whether the session was started, having already written the error response when
+// it was not.
+//
+// Both entry points that start a session - the login form and invitation
+// acceptance, which logs in the account it just created - go through this one
+// function, so neither can drift back to a portal-side TTL. A body the portal
+// cannot read a session out of is a 502: the core promised a session and did not
+// deliver one, and inventing a lifetime for it is the defect this closes.
+func (h *Handler) applyCoreSession(w http.ResponseWriter, body []byte) bool {
+	var sess struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	if err := json.Unmarshal(body, &sess); err != nil || sess.Token == "" || sess.ExpiresAt.IsZero() {
+		http.Error(w, "the API did not return a usable session", http.StatusBadGateway)
+		return false
+	}
+	if err := h.setTokenCookie(w, sess.Token, sess.ExpiresAt); err != nil {
+		http.Error(w, "cannot start session", http.StatusInternalServerError)
+		return false
+	}
+	return true
 }
 
 // inviteForm renders the invitation-redeem form.
@@ -290,12 +325,7 @@ func (h *Handler) inviteSubmit(w http.ResponseWriter, r *http.Request) {
 			h.renderPage(w, r, "invite", "Redeem an invitation", "", nil)
 			return
 		}
-		var sess struct {
-			Token string `json:"token"`
-		}
-		_ = json.Unmarshal(login.Body, &sess)
-		if err := h.setTokenCookie(w, sess.Token); err != nil {
-			http.Error(w, "cannot start session", http.StatusInternalServerError)
+		if !h.applyCoreSession(w, login.Body) {
 			return
 		}
 		http.Redirect(w, r, "/endpoints", http.StatusSeeOther)
@@ -340,6 +370,7 @@ func (h *Handler) endpointsList(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
+	view.CSRFToken = h.csrfToken(r)
 	h.renderPage(w, r, "endpoints", "Your endpoints", "endpoints", view)
 }
 
@@ -353,7 +384,8 @@ func (h *Handler) endpointCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	name, url := strings.TrimSpace(r.FormValue("name")), strings.TrimSpace(r.FormValue("url"))
 	if name == "" || url == "" {
-		h.renderPage(w, r, "endpoints", "Your endpoints", "endpoints", endpointsView{})
+		h.renderPage(w, r, "endpoints", "Your endpoints", "endpoints",
+			endpointsView{CSRFToken: h.csrfToken(r)})
 		return
 	}
 	// FR-405: the headers field is parsed here and validated by the API, which
@@ -384,9 +416,12 @@ func (h *Handler) endpointCreate(w http.ResponseWriter, r *http.Request) {
 			VerificationToken string `json:"verification_token"`
 		}
 		_ = json.Unmarshal(resp.Body, &created)
-		view := endpointsView{Created: &createdView{
-			ID: created.ID, Secret: created.SigningSecret, VerificationToken: created.VerificationToken,
-		}}
+		view := endpointsView{
+			Created: &createdView{
+				ID: created.ID, Secret: created.SigningSecret, VerificationToken: created.VerificationToken,
+			},
+			CSRFToken: h.csrfToken(r),
+		}
 		h.renderPageStatus(w, r, http.StatusOK, "endpoints", "Your endpoints", "endpoints", view)
 	default:
 		// 422 (an SSRF-blocked URL, or FR-405's refusal of a header name), 409, etc.
@@ -446,7 +481,7 @@ func (h *Handler) endpointDetailView(w http.ResponseWriter, r *http.Request, id 
 	// The endpoint's subscriptions for the panel, and the types the subscribe
 	// control may offer (UI-14). Both are plain API reads: the portal decides
 	// nothing here that the API does not already answer.
-	detail.Subs = subsView{Subscriptions: h.endpointSubscriptions(r, id)}
+	detail.Subs = subsView{Subscriptions: h.endpointSubscriptions(r, id), CSRFToken: h.csrfToken(r)}
 	detail.AvailableTypes = h.subscribableTypes(r)
 	return detail, true
 }
@@ -703,7 +738,7 @@ func (h *Handler) fragEndpoints(w http.ResponseWriter, r *http.Request) {
 	if notAuthed(resp, err, w, r, h) {
 		return
 	}
-	view := endpointsView{}
+	view := endpointsView{CSRFToken: h.csrfToken(r)}
 	if resp.Status == http.StatusOK {
 		var le listEndpointsResponse
 		_ = json.Unmarshal(resp.Body, &le)
@@ -720,7 +755,8 @@ func (h *Handler) fragEndpoints(w http.ResponseWriter, r *http.Request) {
 // renderSubsFragment fetches an endpoint's subscriptions and renders the subs
 // fragment for the htmx swap.
 func (h *Handler) renderSubsFragment(w http.ResponseWriter, r *http.Request, id string) {
-	h.r.Fragment(w, http.StatusOK, "frag:subs/list", subsView{Subscriptions: h.endpointSubscriptions(r, id)})
+	h.r.Fragment(w, http.StatusOK, "frag:subs/list",
+		subsView{Subscriptions: h.endpointSubscriptions(r, id), CSRFToken: h.csrfToken(r)})
 }
 
 // notAuthed handles the "no valid session" case shared by every data handler: a
