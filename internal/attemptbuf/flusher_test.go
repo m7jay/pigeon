@@ -647,6 +647,61 @@ func (s failingSink) RecordAttempts(context.Context, []store.AttemptRecord) (int
 	return 0, s.err
 }
 
+// trimGaugeHook records the AttemptBufferPending gauge's value at the moment an
+// XTRIM is issued. That is the only seam at which "the gauge followed the trim"
+// is observable from outside the flusher: the flusher records the depth itself,
+// so the value the gauge holds while the destructive command is on its way out
+// is the pair the claim is about - what the skew was, and whether a trim that
+// removed something recorded the depth again. XTRIM is not pipelined by the
+// sweep, but the pipeline hook is implemented too, because that is a property of
+// the caller and not of the command.
+type trimGaugeHook struct {
+	mu     sync.Mutex
+	gauges []int64
+	// read returns the gauge's current value. It is set before the hook is
+	// added and never written afterwards.
+	read func() int64
+}
+
+func (h *trimGaugeHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *trimGaugeHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xtrim" {
+			h.record()
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *trimGaugeHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		for _, c := range cmds {
+			if c.Name() == "xtrim" {
+				h.record()
+			}
+		}
+		return next(ctx, cmds)
+	}
+}
+
+// record appends the gauge's value at the moment the XTRIM is issued.
+func (h *trimGaugeHook) record() {
+	v := h.read()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.gauges = append(h.gauges, v)
+}
+
+// snapshot copies the recorded values, so a test reads them without holding the
+// hook's lock. It is called after Run has returned, so nothing is appended
+// concurrently.
+func (h *trimGaugeHook) snapshot() []int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]int64(nil), h.gauges...)
+}
+
 // TestStrandAboveTheBoundIsRetiredByALaterSweep is D-9's residual, closed: a
 // strand the startup sweep cannot reach must be retired by the process that is
 // already running, not by a later start.
@@ -669,9 +724,23 @@ func (s failingSink) RecordAttempts(context.Context, []store.AttemptRecord) (int
 // sweep's other bound - the group's last delivery, +1 - reaches the strand, so
 // the cadence sweep that follows is the one that retires it. StaleAfter is the
 // cadence, so this needs no new knob.
+//
+// The gauge is asserted alongside the stream state, and separately from it:
+// AttemptBufferPending is OBS-9's queue_depth, so it is the observable NFR-6's
+// ten-minute return to baseline is written against, and it moves only where the
+// flusher records a depth. Retiring the strand without recording the depth would
+// clean the stream and leave the operator's alert standing, which is why the
+// test reads what the gauge held at each trim (trimGaugeHook) instead of trusting
+// that a trim that moved XLEN moved the gauge.
 func TestStrandAboveTheBoundIsRetiredByALaterSweep(t *testing.T) {
 	ctx := context.Background()
+	// m is the gauge the payoff claim is about: AttemptBufferPending is OBS-9's
+	// queue_depth, so "the sweep corrects the gauge it skewed" is a statement
+	// about m, and XLEN is only its input.
+	m := metrics.New()
 	buf, _ := newTestBuffer(t)
+	hook := &trimGaugeHook{read: func() int64 { return m.Counter(metrics.AttemptBufferPending) }}
+	buf.rdb.AddHook(hook)
 
 	for i := 1; i <= 4; i++ {
 		if err := buf.Push(ctx, rec(int64(i), 1)); err != nil {
@@ -704,7 +773,7 @@ func TestStrandAboveTheBoundIsRetiredByALaterSweep(t *testing.T) {
 		StaleAfter:  50 * time.Millisecond, // also the sweep's cadence
 		FailBackoff: 5 * time.Millisecond,
 		DrainGrace:  2 * time.Second,
-		Metrics:     metrics.New(),
+		Metrics:     m,
 	})
 	if err != nil {
 		t.Fatalf("NewFlusher: %v", err)
@@ -717,13 +786,20 @@ func TestStrandAboveTheBoundIsRetiredByALaterSweep(t *testing.T) {
 	// startup sweep returns 0 (its bound is the still-pending oldest entry), the
 	// retry then retires it and the read takes the two unread entries, and XLEN
 	// stays 1 - the strand - until the process ends.
+	//
+	// The gauge is the other half of the same claim and it is not the same
+	// observable: only a recorded depth moves it, and the trim has no insert
+	// behind it, so a sweep that retires a strand has to record the depth it
+	// left. Without that the operator alert this card exists to clear still
+	// never clears (OBS-9, NFR-6) even though the stream is clean.
 	if !waitFor(5*time.Second, func() bool {
 		depth, err := buf.Depth(ctx)
-		return err == nil && depth == 0 && pendingCount(t, buf) == 0
+		return err == nil && depth == 0 && pendingCount(t, buf) == 0 &&
+			m.Counter(metrics.AttemptBufferPending) == 0
 	}) {
 		depth, _ := buf.Depth(ctx)
-		t.Fatalf("the strand was not retired while the run was live: XLEN=%d pending=%d (the sweep must be issued on a cadence, not only at startup)",
-			depth, pendingCount(t, buf))
+		t.Fatalf("the strand was not retired while the run was live: XLEN=%d pending=%d %s=%d (the sweep must be issued on a cadence, not only at startup, and must record the depth it retired)",
+			depth, pendingCount(t, buf), metrics.AttemptBufferPending, m.Counter(metrics.AttemptBufferPending))
 	}
 
 	cancel()
@@ -742,6 +818,25 @@ func TestStrandAboveTheBoundIsRetiredByALaterSweep(t *testing.T) {
 	}
 	if got := pendingCount(t, buf); got != 0 {
 		t.Fatalf("pending after Run returned = %d, want 0", got)
+	}
+	// The gauge too, and it has to have been moved by the trim rather than by
+	// the next insert: the XTRIM that retired the strand is the seam. The value
+	// the gauge held while that command was issued is the skew itself - what the
+	// last committed batch recorded while the strand was still counted - and the
+	// first XTRIM is the startup sweep's, which runs before any batch has
+	// committed.
+	if got := m.Counter(metrics.AttemptBufferPending); got != 0 {
+		t.Fatalf("%s after Run returned = %d, want 0: the gauge must follow the trim (OBS-9, NFR-6), not wait for the next insert", metrics.AttemptBufferPending, got)
+	}
+	trims := hook.snapshot()
+	if len(trims) < 2 {
+		t.Fatalf("the run issued %d XTRIM command(s), want at least 2 (the startup sweep's and the cadence's): a trim that never happened cannot have recorded the gauge", len(trims))
+	}
+	if trims[0] != 0 {
+		t.Fatalf("the gauge read %d when the startup sweep's XTRIM was issued, want 0: no batch has committed at that point", trims[0])
+	}
+	if last := trims[len(trims)-1]; last == 0 {
+		t.Fatalf("the gauge read 0 when the XTRIM that retired the strand was issued, want the skewed non-zero depth (the strand was still in the stream): without the sweep's own depth read this test would assert a proxy again")
 	}
 	// Each record this process owns was inserted exactly once - the retry carries
 	// the batch the failed insert left in the retry slot, and the two unread
