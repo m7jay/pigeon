@@ -928,20 +928,35 @@ behaviour: `Flusher.insert` acknowledged on the pass's own context - the one `Ru
   `AckTimeout` is not the bound it reads as. Measured against a listener that accepts and never
   answers: `XACK` with a 200 ms deadline returns in **3 s** with the options the package builds today
   (the client's `ReadTimeout`; context deadlines are off by default) and in **200 ms** with
-  `ContextTimeoutEnabled`. The same flag is what makes the delivery path's `Push` honour the request
-  context it is handed: a write applied but not confirmed returns an error, which `internal/delivery`
-  already handles by writing the row inline, and the unique `(delivery_id, attempt)` key makes the
-  duplicate a no-op.
+  `ContextTimeoutEnabled`. The flag's wider effect is on the delivery path's `Push`, which from then
+  on honours the request context it is handed: the command whose reply is lost mid-flight fails
+  instead of holding a worker for the client's 3 s. `internal/delivery` already answers for that
+  error class, by branch. A `Push` that fails on a live context falls back to writing the row inline
+  (`delivery.go:423-430`), where the unique `(delivery_id, attempt)` key makes the duplicate a
+  no-op. A `Push` that fails on a revoked context returns before the fallback on purpose
+  (`delivery.go:415-421` - the attempt was aborted, so there is nothing to record), and an `XADD`
+  applied before the revoke is an unread entry the next read flushes. So the delta the flag buys is
+  the mid-flight reply, not the cancelled-before-send case: a context already cancelled at call time
+  fails `Push` today as well, flag off and on (`buffer attempt 1/1: context canceled`, `XLEN 0`).
 - `Buffer.SweepStranded` runs once at `Run`'s startup, after the startup `reclaim(0)`. It compares
   `XLEN` with the group's pending count (`XINFO GROUPS`) and, only when the former is larger, issues
   `XTRIM <key> MINID <bound>`, where the bound is the smallest pending id (`XPENDING`'s summary
   `Lower`) if anything is pending, else the group's `LastDeliveredID` incremented by one. The bound
-  is the entire safety argument, because `XTRIM` does not consult the pending list - a pending entry
-  is trimmed like any other if the bound sits above it (measured). Every entry below the bound has
-  been delivered (`last-delivered-id` only moves forward, and only a read or a claim moves it) and is
-  not pending, so it has already been acknowledged; entries at or above it are pending or not yet
-  read, and are kept. A strand is an anomaly - it means a retirement was torn - so what the sweep
-  removes is logged at warn, with the count.
+  is the entire safety argument, because `XTRIM` does not consult the pending list: redis.io's
+  `XTRIM` reference has the default `KEEPREF` removing entries "regardless of whether they are
+  referenced by any consumer groups" while preserving "existing references to these entries in all
+  consumer groups' PEL", and the `ACKED` option that would spare a referenced entry exists only since
+  Redis 8.2, while `compose.yaml` pins `redis:7-alpine`. Measured on the CI `redis:7` service
+  container (7.4.12), against a stream holding one pending entry and one acked-but-untrimmed strand,
+  a bound one id above the pending entry - the smallest off-by-one the sweep can make - removed it:
+  `removed = 1`, `XLEN` 4 → 3, `XRANGE` at its id empty, and `Reclaim(min-idle 0)` then returned
+  nothing to re-insert. A bound too high is therefore not a larger trim but silent evidence loss, and
+  the id it takes stays in the PEL as a dangling reference (`XPENDING` counts an entry `XRANGE` can
+  no longer return) until a reclaim scan clears the reference without recovering a record. Every entry
+  below the bound has been delivered (`last-delivered-id` only moves forward, and only a read or a
+  claim moves it) and is not pending, so it has already been acknowledged; entries at or above it are
+  pending or not yet read, and are kept. A strand is an anomaly - it means a retirement was torn - so
+  what the sweep removes is logged at warn, with the count.
 - The three failure shapes are each closed: a graceful SIGTERM can no longer revoke a retirement (the
   bounded context); a hard kill or a dropped connection mid-retirement cannot leave half of one (the
   transaction); and a Redis-side tear that splits the transaction anyway - a SIGKILL between the two
@@ -960,15 +975,15 @@ the pass's context was the other candidate, with `StaleAfter`'s reclaim as the r
 start: measured to work, and still costs up to 30 s in which the depth gauge is wrong, plus a
 duplicate insert, a conflict bump and a warn line at the next boot for a batch whose rows are already
 durable.
-A two-round-trip cleanup of a committed row is cheaper than explaining that gauge. Two alternatives
-are rejected outright. Retaining the batch in `f.stuck` after a failed acknowledgement would let one
-unackable batch stall the whole evidence path: `readBatch` returns the retry slot first, so nothing
-new is read while Redis is unhappy, every retry re-inserts a committed batch and bumps the conflict
-counter, and the stream grows behind it. `XTRIM`/`MAXLEN` on `Push` as a bound on the stream is
-worse: trimming does not consult the pending list, so it drops entries nobody has read - the evidence
-loss that `XADD` → read → commit exists to prevent. What the sweep accepts is the one shape left: a
-strand created after startup waits for the next start, where the operator sees it as a warn line
-rather than never.
+
+Two alternatives are rejected outright. Retaining the batch in `f.stuck` after a failed
+acknowledgement would let one unackable batch stall the whole evidence path: `readBatch` returns the
+retry slot first, so nothing new is read while Redis is unhappy, every retry re-inserts a committed
+batch and bumps the conflict counter, and the stream grows behind it. `XTRIM`/`MAXLEN` on `Push` as a
+bound on the stream is worse: trimming does not consult the pending list, so it drops entries nobody
+has read - the evidence loss that `XADD` → read → commit exists to prevent. What the sweep accepts is
+the one shape left: a strand created after startup waits for the next start, where the operator sees
+it as a warn line rather than never.
 
 **Encoded by.** D-9 (added), §6's attempt-evidence row (the acknowledgement after the commit is one
 transaction and is not revocable by the cancellation that ends a pass), §19's decision row;
