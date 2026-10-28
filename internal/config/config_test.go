@@ -25,15 +25,17 @@ func valid() Config {
 		DeliveryWorkers:           1,
 		DeliveryMaxAttempts:       15,
 		DeliveryMaxConnsPerHost:   1,
-		// S6: the reference deployment buffers attempt evidence in Redis (D-1)
-		// and keeps SB-5's default retention windows. The buffered default is
-		// only valid with a Redis URL, so a "valid config" must carry both.
+		// The reference deployment buffers attempt evidence in Redis (D-1) and
+		// keeps SB-5's default retention windows. The buffered mode is only valid
+		// with a Redis URL, so a "valid config" must carry both; S8's storage
+		// budget must be a real percentage (SB-3), so it is set here too.
 		RedisURL:             "redis://localhost:6379/0",
 		AttemptLogMode:       AttemptLogBuffered,
 		AttemptFlushBatch:    MinFlushBatch,
 		AttemptFlushInterval: time.Second,
 		AttemptFlushStale:    30 * time.Second,
 		SuccessLogRPS:        100,
+		RetentionMaxDiskPct:  80,
 		RetentionDeliveries:  14 * 24 * time.Hour,
 		RetentionAttempts:    7 * 24 * time.Hour,
 		RetentionEvents:      14 * 24 * time.Hour,
