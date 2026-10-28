@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TestEvidenceAndControlTxAreDistinguishableInPgStatActivity is AC-29's proof.
@@ -20,6 +21,16 @@ import (
 // connection while both are in flight. It asserts each class is visible under
 // its own marker simultaneously, and that the marker reverts when the
 // transaction ends (the setting is transaction-local, not pooled).
+//
+// The marker is not the setting. db.go stamps the marker from a literal that
+// is independent of the value it hands to set_config for the GUC, so a split
+// broken at that set_config call leaves the marker - and the operator reading
+// it out of pg_stat_activity - naming a durability class the backend is not
+// running. Each class therefore reads current_setting('synchronous_commit')
+// back from INSIDE its own transaction and is required to be running the value
+// FR-812 pins, and, once both commit, the setting is read back on the pooled
+// connection itself to show it did not outlive its transaction (see
+// assertSyncCommitDoesNotLeakPastTheClassTransaction).
 //
 // pg_stat_activity is CLUSTER-wide, and every read here is scoped twice: to
 // the database this pool is connected to, and to the pids this pool's own two
@@ -48,45 +59,80 @@ func TestEvidenceAndControlTxAreDistinguishableInPgStatActivity(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
 	start := make(chan struct{})
-	// ownPids is filled from INSIDE the two transactions: the backend each
-	// pooled connection is running on. Those pids - not whoever else happens to
-	// be connected to this database - are the backends AC-29's leak claim is
-	// about, and the only ones this test may accuse.
-	ownPids := make(chan int32, 2)
 
-	run := func(tx func(context.Context, func(tx pgx.Tx) error) error) {
+	// live is filled from INSIDE the two transactions: the backend each pooled
+	// connection is running on, and the synchronous_commit that backend has in
+	// force. Those pids - not whoever else happens to be connected to this
+	// database - are the backends AC-29's leak claim is about, and the only
+	// ones this test may accuse.
+	type liveTx struct {
+		class string
+		pid   int32
+		guc   string
+	}
+	live := make(chan liveTx, 2)
+
+	run := func(class string, tx func(context.Context, func(tx pgx.Tx) error) error) {
 		defer wg.Done()
 		<-start
 		errs <- tx(ctx, func(tx pgx.Tx) error {
-			var pid int32
-			if err := tx.QueryRow(ctx, "select pg_backend_pid()").Scan(&pid); err != nil {
+			sample := liveTx{class: class}
+			if err := tx.QueryRow(ctx, "select pg_backend_pid()").Scan(&sample.pid); err != nil {
 				return err
 			}
-			ownPids <- pid
+			// The GUC this transaction is actually running with, read from
+			// inside it. set_config has already applied it - db.go sets both
+			// the setting and the marker before fn runs.
+			if err := tx.QueryRow(ctx, "select current_setting('synchronous_commit')").Scan(&sample.guc); err != nil {
+				return err
+			}
+			live <- sample
 			_, err := tx.Exec(ctx, "select pg_sleep($1)", hold.Seconds())
 			return err
 		})
 	}
 
 	wg.Add(2)
-	go run(func(c context.Context, fn func(pgx.Tx) error) error {
+	go run(TxClassEvidence, func(c context.Context, fn func(pgx.Tx) error) error {
 		return EvidenceTx(c, pool, fn)
 	})
-	go run(func(c context.Context, fn func(pgx.Tx) error) error {
+	go run(TxClassControl, func(c context.Context, fn func(pgx.Tx) error) error {
 		return ControlTx(c, pool, fn)
 	})
 	close(start)
 
 	own := map[int32]bool{}
+	inForce := map[string]string{}
 	for len(own) < 2 {
 		select {
-		case pid, ok := <-ownPids:
+		case sample, ok := <-live:
 			if !ok {
 				t.Fatalf("both transactions must report the backend they run on; got %d pid(s)", len(own))
 			}
-			own[pid] = true
+			own[sample.pid] = true
+			inForce[sample.class] = sample.guc
 		case <-time.After(3 * time.Second):
 			t.Fatalf("both transactions must report the backend they run on; got %d pid(s)", len(own))
+		}
+	}
+
+	// FR-812's split, asserted against the SETTING and not the label db.go
+	// writes next to it: inside its own transaction the evidence class must be
+	// running synchronous_commit=off and the control class on. The marker
+	// constants spell the same two values out, but nothing in db.go couples
+	// them - the marker comes from the `class` argument and the GUC from the
+	// `syncCommit` argument - so only a read of the GUC can see a split broken
+	// at the set_config call. Measured before this assertion existed: flipping
+	// EvidenceTx's argument from "off" to "on" left this test green, and left
+	// pg_stat_activity reporting `synchronous_commit=off` for a backend that
+	// had been running `on`.
+	for _, want := range []struct{ class, guc string }{
+		{TxClassEvidence, "off"},
+		{TxClassControl, "on"},
+	} {
+		if got := inForce[want.class]; got != want.guc {
+			t.Errorf("in-flight %q transaction ran with synchronous_commit=%q, want %q: the durability split FR-812 pins is broken (the class marker still reads %q, so pg_stat_activity names a class this backend is not running)",
+				want.class, got, want.guc, want.class)
 		}
 	}
 
@@ -207,5 +253,94 @@ func TestEvidenceAndControlTxAreDistinguishableInPgStatActivity(t *testing.T) {
 		// holds which marker costs the reviewer an hour of archaeology.
 		t.Errorf("%d backend(s) still carry a class marker %s after the transactions committed; the setting leaked: %s",
 			lingering, settle, survivors)
+	}
+
+	// The assertions above read the marker; the setting it names is pinned
+	// here, including the one property the marker cannot witness at all -
+	// set_config's third argument. application_name is applied with `true` and
+	// reverts even when synchronous_commit is applied with `false` and does not.
+	assertSyncCommitDoesNotLeakPastTheClassTransaction(t, ctx, dsn)
+}
+
+// assertSyncCommitDoesNotLeakPastTheClassTransaction pins the half of FR-812
+// the class marker cannot see.
+//
+// txWith applies the setting with set_config('synchronous_commit', $1, true):
+// transaction-local, so the value dies with the commit and the next borrower of
+// that pooled connection gets the session's own value back. Only the third
+// argument decides that, and it is invisible from inside the transaction -
+// `false`, the session-level form, would leave the connection running
+// synchronous_commit=off (or on) for the rest of its life, which is exactly
+// what FR-812 forbids. The marker assertion cannot catch it: application_name
+// is applied by its own transaction-local set_config and reverts even when the
+// GUC does not.
+//
+// The readback has to land on the backend the class transaction ran on, so each
+// case runs against a pool capped at ONE connection: the class transaction and
+// the readback before and after it are then the same session by construction
+// rather than by luck of the pool's idle list. The session's own value is
+// pinned to the class's opposite first, so a cluster default that happens to
+// equal the class value (postgres:16's is `on`, which would quietly excuse an
+// evidence-class leak) cannot satisfy the assertion either.
+func assertSyncCommitDoesNotLeakPastTheClassTransaction(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	// Either direction of a session-level leak has to be visible, so each case
+	// pins the session value to the class's OPPOSITE before running it: on a
+	// cluster whose default is `on` the evidence case is the one a leak shows
+	// up in, on a cluster defaulting to `off` it is the control case.
+	for _, tc := range []struct {
+		class    string
+		want     string // the synchronous_commit FR-812 pins for this class
+		baseline string // the session value pinned first, deliberately the other one
+		run      func(context.Context, *pgxpool.Pool, func(pgx.Tx) error) error
+	}{
+		{class: TxClassEvidence, want: "off", baseline: "on", run: EvidenceTx},
+		{class: TxClassControl, want: "on", baseline: "off", run: ControlTx},
+	} {
+		t.Run(tc.class, func(t *testing.T) {
+			pool, err := Connect(ctx, dsn, 1)
+			if err != nil {
+				t.Fatalf("Connect (single-connection pool): %v", err)
+			}
+			defer pool.Close()
+
+			// One round trip that both pins the session-level value and names
+			// the backend this readback is about.
+			var pid int32
+			var pinned string
+			if err := pool.QueryRow(ctx,
+				"select pg_backend_pid(), set_config('synchronous_commit', $1, false)", tc.baseline,
+			).Scan(&pid, &pinned); err != nil {
+				t.Fatalf("pin the session-level synchronous_commit=%s: %v", tc.baseline, err)
+			}
+			if pinned != tc.baseline {
+				t.Fatalf("pinned the session-level setting to %q but the server reports %q", tc.baseline, pinned)
+			}
+
+			var before string
+			if err := pool.QueryRow(ctx, "select current_setting('synchronous_commit')").Scan(&before); err != nil {
+				t.Fatalf("read the pinned session-level setting back: %v", err)
+			}
+
+			// The class transaction on that same connection.
+			var inTx string
+			if err := tc.run(ctx, pool, func(tx pgx.Tx) error {
+				return tx.QueryRow(ctx, "select current_setting('synchronous_commit')").Scan(&inTx)
+			}); err != nil {
+				t.Fatalf("%s transaction on the single-connection pool: %v", tc.class, err)
+			}
+			if inTx != tc.want {
+				t.Errorf("in-flight %q transaction ran with synchronous_commit=%q, want %q", tc.class, inTx, tc.want)
+			}
+
+			var after string
+			if err := pool.QueryRow(ctx, "select current_setting('synchronous_commit')").Scan(&after); err != nil {
+				t.Fatalf("read the setting back after the class transaction committed: %v", err)
+			}
+			if after != before {
+				t.Errorf("pid %d still reports synchronous_commit=%q after the %q class transaction committed on it, but the session value pinned before that transaction was %q: the setting escaped its transaction (set_config(..., false) instead of true), so the next borrower of this pooled connection inherits it, which FR-812 forbids",
+					pid, after, tc.class, before)
+			}
+		})
 	}
 }
