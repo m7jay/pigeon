@@ -325,7 +325,7 @@ func run() error {
 			Jitter:           cfg.DeliveryJitter,
 			MaxConnsPerHost:  cfg.DeliveryMaxConnsPerHost,
 			PollInterval:     cfg.DeliveryPollInterval,
-			UserAgent:        "pigeon/" + version,
+			UserAgent:        userAgent(cfg, version),
 			Limits:           limits,
 			Pauses:           tracker,
 			Logger:           log,
@@ -434,4 +434,17 @@ func newLogger(cfg config.Config) *slog.Logger {
 		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
 	}
 	return slog.New(slog.NewTextHandler(os.Stdout, opts))
+}
+
+// userAgent is FR-810's User-Agent header for every attempt: the operator's
+// PIGEON_DELIVERY_USER_AGENT when they set one, otherwise the platform and the
+// version this binary was built from. config.Load read that knob and main never
+// passed it to the worker, so the header was hard-coded and the setting
+// documented in .env.example had no effect on the wire; OPS-3's promise that a
+// documented setting is a configurable one is what this closes.
+func userAgent(cfg config.Config, version string) string {
+	if ua := cfg.DeliveryUserAgent; ua != "" {
+		return ua
+	}
+	return "pigeon/" + version
 }
