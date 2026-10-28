@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/m7jay/pigeon/internal/retention"
 )
 
 // These tests exercise the SQL side of retention (SB-1/SB-2, D-7's "no drop runs
@@ -55,7 +57,7 @@ func TestPartitionCatalogueAndDropGuard(t *testing.T) {
 
 	// The rail: a partition whose day has not ended is never droppable, whatever
 	// the disk pressure. The primitive refuses loudly; the manager never asks.
-	if _, err := st.DropPartition(ctx, "deliveries", name); err == nil {
+	if _, err := st.DropPartition(ctx, "deliveries", name, retention.DropByAge); err == nil {
 		t.Fatalf("DropPartition(%s) accepted today's partition, want a refusal", name)
 	}
 
@@ -65,7 +67,7 @@ func TestPartitionCatalogueAndDropGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsurePartition(past): %v", err)
 	}
-	dropped, err := st.DropPartition(ctx, "deliveries", pastName)
+	dropped, err := st.DropPartition(ctx, "deliveries", pastName, retention.DropByAge)
 	if err != nil {
 		t.Fatalf("DropPartition(%s): %v", pastName, err)
 	}
@@ -84,19 +86,19 @@ func TestPartitionCatalogueAndDropGuard(t *testing.T) {
 
 	// Already gone is a no-op, not an error: a retry after a successful drop (or a
 	// race between two replicas) must not fail the tick.
-	if got, err := st.DropPartition(ctx, "deliveries", pastName); err != nil || got {
+	if got, err := st.DropPartition(ctx, "deliveries", pastName, retention.DropByAge); err != nil || got {
 		t.Fatalf("second DropPartition(%s) = (%v, %v), want (false, nil)", pastName, got, err)
 	}
 
 	// A name from another parent, and an unmanaged table, are both refused before
 	// any DDL is built.
-	if _, err := st.DropPartition(ctx, "deliveries", "attempts_20260101"); err == nil {
+	if _, err := st.DropPartition(ctx, "deliveries", "attempts_20260101", retention.DropByAge); err == nil {
 		t.Fatal("DropPartition accepted a partition of another table")
 	}
 	if _, err := st.ListPartitions(ctx, "api_keys"); err == nil {
 		t.Fatal("ListPartitions accepted an unmanaged table")
 	}
-	if _, err := st.DropPartition(ctx, "api_keys", "api_keys_20260101"); err == nil {
+	if _, err := st.DropPartition(ctx, "api_keys", "api_keys_20260101", retention.DropByAge); err == nil {
 		t.Fatal("DropPartition accepted an unmanaged table")
 	}
 }
@@ -128,7 +130,7 @@ func TestDropPartitionSerialisesWithAConcurrentDrop(t *testing.T) {
 	}
 
 	start := time.Now()
-	dropped, err := st.DropPartition(ctx, "attempts", name)
+	dropped, err := st.DropPartition(ctx, "attempts", name, retention.DropByAge)
 	if err != nil {
 		_ = holder.Rollback(ctx)
 		t.Fatalf("DropPartition under contention: %v", err)
@@ -147,7 +149,7 @@ func TestDropPartitionSerialisesWithAConcurrentDrop(t *testing.T) {
 
 	// The lock is free: the same drop now succeeds, so the refusal above was
 	// contention rather than a broken primitive.
-	dropped, err = st.DropPartition(ctx, "attempts", name)
+	dropped, err = st.DropPartition(ctx, "attempts", name, retention.DropByAge)
 	if err != nil {
 		t.Fatalf("DropPartition after release: %v", err)
 	}
