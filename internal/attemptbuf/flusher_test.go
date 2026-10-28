@@ -637,6 +637,212 @@ func TestStrandedEntriesAreSweptAtStartup(t *testing.T) {
 	}
 }
 
+// failingSink fails every insert, which is what a database that is down looks
+// like to the flusher: the batch stays in Redis and in the flusher's retry slot,
+// so XLEN and the group's pending count stay equal for as long as the outage
+// lasts.
+type failingSink struct{ err error }
+
+func (s failingSink) RecordAttempts(context.Context, []store.AttemptRecord) (int, error) {
+	return 0, s.err
+}
+
+// TestStrandAboveTheBoundIsRetiredByALaterSweep is D-9's residual, closed: a
+// strand the startup sweep cannot reach must be retired by the process that is
+// already running, not by a later start.
+//
+// The state is the one a single sweep cannot touch, built exactly as the
+// round-2 probe built it (t_af54d465's zz_r2_probe_test.go, direction B): four
+// entries pushed, the two oldest delivered, and the second - one id above the
+// oldest - acknowledged without being removed. So the oldest entry is still
+// pending and is the sweep's bound, the strand sits *above* that bound, and the
+// two newest entries are unread. A sweep in that state returns 0, XLEN keeps
+// counting the strand, and AttemptBufferPending (OBS-9's queue_depth) stays one
+// count high for the life of the process - so NFR-6's "queue depth MUST return to
+// baseline within 10 minutes" cannot hold, and an operator alerting on a non-zero
+// depth alerts forever. Measured before this change: the live process reads
+// XLEN=1, pending=0, Reclaim(min-idle 0)=0 entries, Read(">")=0 entries.
+//
+// The sink fails the first insert, which is what leaves the older entry pending
+// while the startup sweep runs (a Redis or Postgres hiccup at boot, in one line).
+// The retry retires it a moment later, the pending set is then empty, and the
+// sweep's other bound - the group's last delivery, +1 - reaches the strand, so
+// the cadence sweep that follows is the one that retires it. StaleAfter is the
+// cadence, so this needs no new knob.
+func TestStrandAboveTheBoundIsRetiredByALaterSweep(t *testing.T) {
+	ctx := context.Background()
+	buf, _ := newTestBuffer(t)
+
+	for i := 1; i <= 4; i++ {
+		if err := buf.Push(ctx, rec(int64(i), 1)); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+	entries, err := buf.Read(ctx, 2)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("Read = %d entries, %v; want 2", len(entries), err)
+	}
+	if err := buf.rdb.XAck(ctx, buf.Key(), buf.group, entries[1].ID).Err(); err != nil {
+		t.Fatalf("XAck: %v", err)
+	}
+	// The starting state, asserted so a failure below is about the cadence and
+	// not about a differently built stream: the oldest entry is pending (the
+	// bound), the strand has left the pending list, and two entries are unread.
+	if depth, err := buf.Depth(ctx); err != nil || depth != 4 {
+		t.Fatalf("XLEN before the run = %d, %v; want 4", depth, err)
+	}
+	if got := pendingCount(t, buf); got != 1 {
+		t.Fatalf("pending before the run = %d, want 1 (the oldest entry; the strand must have left the pending list)", got)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sink := &fakeSink{failNext: errors.New("transient")}
+	fl, err := NewFlusher(buf, sink, FlusherOptions{
+		Batch:       10,
+		Interval:    10 * time.Millisecond,
+		StaleAfter:  50 * time.Millisecond, // also the sweep's cadence
+		FailBackoff: 5 * time.Millisecond,
+		DrainGrace:  2 * time.Second,
+		Metrics:     metrics.New(),
+	})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- fl.Run(runCtx) }()
+
+	// While the run is live. Without the cadence this is RED and stays RED: the
+	// startup sweep returns 0 (its bound is the still-pending oldest entry), the
+	// retry then retires it and the read takes the two unread entries, and XLEN
+	// stays 1 - the strand - until the process ends.
+	if !waitFor(5*time.Second, func() bool {
+		depth, err := buf.Depth(ctx)
+		return err == nil && depth == 0 && pendingCount(t, buf) == 0
+	}) {
+		depth, _ := buf.Depth(ctx)
+		t.Fatalf("the strand was not retired while the run was live: XLEN=%d pending=%d (the sweep must be issued on a cadence, not only at startup)",
+			depth, pendingCount(t, buf))
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	// And it stays retired once the run has settled.
+	if depth, err := buf.Depth(ctx); err != nil || depth != 0 {
+		t.Fatalf("buffer depth after Run returned = %d, %v; want 0", depth, err)
+	}
+	if got := pendingCount(t, buf); got != 0 {
+		t.Fatalf("pending after Run returned = %d, want 0", got)
+	}
+	// Each record this process owns was inserted exactly once - the retry carries
+	// the batch the failed insert left in the retry slot, and the two unread
+	// entries are read once - and the stranded entry's record is not inserted at
+	// all: it belongs to the process whose retirement was torn, and it is neither
+	// pending nor unread, which is exactly why it needed a sweep.
+	if got := sink.rowCount(); got != 3 {
+		t.Fatalf("the sink inserted %d rows, want 3 (the oldest entry and the two unread ones, once each)", got)
+	}
+	if got := sink.batchCount(); got != 3 {
+		t.Fatalf("the sink was called %d times, want 3 (the failed insert, its retry, and the read of the unread entries)", got)
+	}
+	if !sameRecords(sink.batches[0], sink.batches[1]) {
+		t.Fatalf("the retry did not carry the failed batch: first %+v, retry %+v", sink.batches[0], sink.batches[1])
+	}
+	inserted := map[int64]int{}
+	for _, batch := range sink.batches[1:] {
+		for _, r := range batch {
+			inserted[r.DeliveryID]++
+		}
+	}
+	for _, id := range []int64{1, 3, 4} {
+		if inserted[id] != 1 {
+			t.Fatalf("the successful inserts carried records %v, want delivery %d exactly once", inserted, id)
+		}
+	}
+	if n, ok := inserted[2]; ok {
+		t.Fatalf("the stranded entry's record was inserted %d time(s); it belongs to a previous process and is neither pending nor unread", n)
+	}
+}
+
+// TestCadencedSweepIsNotDestructiveInSteadyState pins the other half of the
+// cadence: repeating the sweep must not turn it into a destructive command on a
+// healthy buffer. The gate is Buffer.SweepStranded's own (XLEN <= pending means
+// neither an unread entry nor a strand), and this is what proves the loop cannot
+// route around it: with every entry pending - a database outage, every insert
+// failing - the cadence sweeps again and again and issues no XTRIM.
+//
+// The count of XINFO commands is what keeps this from being vacuous: the startup
+// sweep issues one, and a second one can only come from a sweep the loop issued,
+// which is the cadence firing. Without the cadence the count stays at 1 and this
+// fails, so the assertion is about the loop rather than about the gate alone.
+func TestCadencedSweepIsNotDestructiveInSteadyState(t *testing.T) {
+	ctx := context.Background()
+	buf, _ := newTestBuffer(t)
+	hook := &ackPipelineHook{}
+	buf.rdb.AddHook(hook)
+
+	for i := 1; i <= 4; i++ {
+		if err := buf.Push(ctx, rec(int64(i), 1)); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+	// Delivered but never acknowledged: every entry is pending, so the sweep must
+	// keep its hands off the stream however often it runs.
+	if entries, err := buf.Read(ctx, 10); err != nil || len(entries) != 4 {
+		t.Fatalf("Read = %d entries, %v; want 4", len(entries), err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	fl, err := NewFlusher(buf, failingSink{err: errors.New("database is down")}, FlusherOptions{
+		Batch:       10,
+		Interval:    5 * time.Millisecond,
+		StaleAfter:  30 * time.Millisecond, // also the sweep's cadence
+		FailBackoff: 5 * time.Millisecond,
+		DrainGrace:  time.Second,
+		Metrics:     metrics.New(),
+	})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- fl.Run(runCtx) }()
+
+	// The startup sweep is the first XINFO; the second is a sweep from the loop.
+	if !waitFor(5*time.Second, func() bool { return hook.count("xinfo") >= 2 }) {
+		t.Fatalf("the loop never issued a second sweep: XINFO GROUPS count = %d, want at least 2", hook.count("xinfo"))
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	if got := hook.count("xtrim"); got != 0 {
+		t.Fatalf("the cadenced sweep issued %d XTRIM command(s) with every entry pending; the gate (XLEN <= pending) must hold on every sweep", got)
+	}
+	if depth, err := buf.Depth(ctx); err != nil || depth != 4 {
+		t.Fatalf("buffer depth after the run = %d, %v; want 4 (nothing may be removed while every entry is pending)", depth, err)
+	}
+	if got := pendingCount(t, buf); got != 4 {
+		t.Fatalf("pending after the run = %d, want 4", got)
+	}
+}
+
 // TestNewFlusherDefaultsTheAckTimeout: the retirement's bound defaults to 2 s and
 // lives on FlusherOptions rather than on a PIGEON_ knob, which is FailBackoff's
 // status too - an operator has no business tuning it.

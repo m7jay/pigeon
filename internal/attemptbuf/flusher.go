@@ -73,6 +73,11 @@ type Flusher struct {
 	// Batch, so a database that is down applies backpressure rather than
 	// accumulating memory (FR-818).
 	stuck []Entry
+
+	// lastSweep is when the stranded-entry sweep last ran, which is what bounds
+	// the next one to StaleAfter of wall time (see sweepIfDue). It is written
+	// and read only by Run's goroutine.
+	lastSweep time.Time
 }
 
 // NewFlusher builds a Flusher. A nil sink is rejected: there is nothing to
@@ -117,7 +122,8 @@ func NewFlusher(buf *Buffer, sink Sink, opts FlusherOptions) (*Flusher, error) {
 // finds are exactly the ones a process that died mid-flush left pending: on a
 // restart they belong to nobody else (D-1's "0 lost on worker crash"). It then
 // sweeps the entries a peer acknowledged but never removed, which no reclaim can
-// reach (D-9).
+// reach (D-9), and issues that same sweep again at most once per StaleAfter for
+// as long as it runs.
 func (f *Flusher) Run(ctx context.Context) error {
 	if n, err := f.reclaim(ctx, 0); err != nil {
 		if ctx.Err() == nil {
@@ -132,23 +138,23 @@ func (f *Flusher) Run(ctx context.Context) error {
 	// pending entry (or below the group's last delivery when nothing is pending),
 	// i.e. entries that have been delivered, are not pending, and so are already
 	// acknowledged: a retirement that was torn.
-	if n, err := f.buf.SweepStranded(ctx); err != nil {
-		if ctx.Err() == nil {
-			f.log.Warn("flusher: could not sweep entries a peer acknowledged but never removed from the stream", "error", err)
-		}
-	} else if n > 0 {
-		// A strand means a retirement was torn - a hard kill inside the
-		// acknowledgement transaction, or a replay that stopped after the XACK.
-		// They had left the pending list, so this is the only path that could
-		// ever have retired them, and XLEN counted them until now (OBS-9).
-		f.log.Warn("flusher: swept entries a peer acknowledged but never removed from the stream; a retirement was torn and they had left the pending list",
-			"entries", n)
-	}
+	//
+	// Repeating it is as safe as running it once, which is what lets the loop do
+	// it: the bound is derived from the group's own bookkeeping on the same live
+	// connection, every in-flight entry is pending, so it anchors the bound below
+	// itself, and everything below the bound has been delivered and acknowledged.
+	// A single sweep cannot retire a strand that sits *above* the oldest pending
+	// entry - the bound is that entry's id - so a start in that state would leave
+	// it (and the depth gauge it skews) for the process's whole life; the cadence
+	// is what retires it once the entries holding the bound down are themselves
+	// retired.
+	f.sweep(ctx)
 
 	for {
 		if ctx.Err() != nil {
 			break
 		}
+		f.sweepIfDue(ctx)
 		n, err := f.pass(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -180,6 +186,50 @@ func (f *Flusher) Run(ctx context.Context) error {
 		f.log.Info("flusher: drained the attempt buffer on shutdown (D-3)", "rows", n)
 	}
 	return ctx.Err()
+}
+
+// sweep retires the entries a peer acknowledged but never removed, and records
+// when it ran, which is what bounds the next one to StaleAfter. It is
+// Buffer.SweepStranded unchanged and keeps every property that function has: the
+// XLEN <= pending gate, the bound, and a warn line only when it removed
+// something.
+func (f *Flusher) sweep(ctx context.Context) {
+	f.lastSweep = time.Now()
+	n, err := f.buf.SweepStranded(ctx)
+	switch {
+	case err != nil:
+		if ctx.Err() == nil {
+			f.log.Warn("flusher: could not sweep entries a peer acknowledged but never removed from the stream", "error", err)
+		}
+	case n > 0:
+		// A strand means a retirement was torn - a hard kill inside the
+		// acknowledgement transaction, or a replay that stopped after the XACK.
+		// They had left the pending list, so no reclaim can reach them and
+		// Read(">") never returns them: this sweep is the only mechanism in the
+		// package that retires them, and XLEN counted them until now (OBS-9).
+		// What it cannot do is retire a strand above its own bound - the oldest
+		// pending entry holds that bound down - so such a strand may take a
+		// later sweep (sweepIfDue) rather than this one.
+		f.log.Warn("flusher: swept entries a peer acknowledged but never removed from the stream; a retirement was torn and they had left the pending list",
+			"entries", n)
+	}
+}
+
+// sweepIfDue issues the sweep when at least StaleAfter has elapsed since the
+// last one, so a strand the startup sweep cannot reach is retired by the process
+// that is already running rather than by a later start. StaleAfter is the right
+// interval rather than a new one: it is how long another consumer's pending batch
+// must have been untouched before the flusher takes it over, so by the time the
+// next sweep runs, the entries that biased the bound below the strand have either
+// been retired by this process or would themselves have been reclaimed.
+//
+// The error case records the attempt too, so a Redis that cannot answer is
+// retried on the next cadence instead of on every loop iteration.
+func (f *Flusher) sweepIfDue(ctx context.Context) {
+	if f.opts.StaleAfter > 0 && time.Since(f.lastSweep) < f.opts.StaleAfter {
+		return
+	}
+	f.sweep(ctx)
 }
 
 // Drain flushes until the buffer is empty or ctx expires, and returns how many

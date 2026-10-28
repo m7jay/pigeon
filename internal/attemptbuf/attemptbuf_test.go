@@ -299,18 +299,29 @@ func TestDialPingsTheServer(t *testing.T) {
 	}
 }
 
-// ackPipelineHook records the command names of every pipeline go-redis sends.
-// That is the only observable seam the transaction has: a tear between two
-// commands cannot be injected without a special Redis, so the mechanism - one
-// pipeline carrying both commands, in order - is what the test asserts.
+// ackPipelineHook records the command names of every pipeline and every single
+// command go-redis sends. That is the only observable seam the transaction has: a
+// tear between two commands cannot be injected without a special Redis, so the
+// mechanism - one pipeline carrying both commands, in order - is what the test
+// asserts. The single commands are what lets a test watch the sweep: XTRIM and
+// XINFO are not pipelined, and "the cadence issued no XTRIM" is only observable
+// at this seam.
 type ackPipelineHook struct {
 	mu        sync.Mutex
 	pipelines [][]string
+	singles   []string
 }
 
 func (h *ackPipelineHook) DialHook(next redis.DialHook) redis.DialHook { return next }
 
-func (h *ackPipelineHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+func (h *ackPipelineHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.mu.Lock()
+		h.singles = append(h.singles, cmd.Name())
+		h.mu.Unlock()
+		return next(ctx, cmd)
+	}
+}
 
 func (h *ackPipelineHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
@@ -333,6 +344,20 @@ func (h *ackPipelineHook) seen() [][]string {
 	out := make([][]string, len(h.pipelines))
 	copy(out, h.pipelines)
 	return out
+}
+
+// count is how many times a single (non-pipelined) command has been issued since
+// the hook was added.
+func (h *ackPipelineHook) count(name string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, s := range h.singles {
+		if s == name {
+			n++
+		}
+	}
+	return n
 }
 
 // pendingCount is XPENDING's summary count: the entries the group holds as
