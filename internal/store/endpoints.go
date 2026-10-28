@@ -320,6 +320,24 @@ func (s *Store) DeleteEndpoint(ctx context.Context, sc Scope, endpointID string)
 	return err
 }
 
+// EndpointIsInternal reports whether an endpoint is flagged internal (FR-402).
+//
+// It exists for FR-1005's request-time check: the delivery worker may only dial a
+// private or loopback address for an endpoint the operator has explicitly opted
+// in, and the claim path does not carry the flag. The worker caches the answer per
+// endpoint, so this is one query per endpoint per process, not one per delivery.
+func (s *Store) EndpointIsInternal(ctx context.Context, endpointID string) (bool, error) {
+	var internal bool
+	err := s.pool.QueryRow(ctx, `select internal from endpoints where id = $1`, endpointID).Scan(&internal)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, fmt.Errorf("read endpoint internal flag: %w", err)
+	}
+	return internal, nil
+}
+
 // VerifyEndpoint answers the ownership challenge (FR-403). A correct token for a
 // non-deleted endpoint stamps verified_at; from then it may receive live events.
 // A wrong token is ErrInvalid (422); an unknown endpoint is ErrNotFound. It never
@@ -330,9 +348,11 @@ func (s *Store) VerifyEndpoint(ctx context.Context, sc Scope, endpointID, token 
 	}
 	return s.scoped(ctx, sc, func(tx pgx.Tx) error {
 		var hash []byte
-		err := tx.QueryRow(ctx, `select verification_token_hash
+		var endpointURL string
+		var internal bool
+		err := tx.QueryRow(ctx, `select verification_token_hash, url, internal
 			from endpoints where producer_id = $1 and env = $2 and id = $3 and status <> 'deleted'`,
-			sc.ProducerID, sc.Env, endpointID).Scan(&hash)
+			sc.ProducerID, sc.Env, endpointID).Scan(&hash, &endpointURL, &internal)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -341,6 +361,16 @@ func (s *Store) VerifyEndpoint(ctx context.Context, sc Scope, endpointID, token 
 		}
 		if subtle.ConstantTimeCompare(hash, tokenHash(token)) != 1 {
 			return fmt.Errorf("%w: token does not match", ErrInvalid)
+		}
+		// FR-1005's second call site, and it runs after the token has been
+		// accepted so the challenge answer is not given away by a different
+		// error. The URL was checked when it was registered; it is checked again
+		// here because the DNS answer it depends on is not a fact that was
+		// recorded, and between the two calls a name can be pointed somewhere
+		// else. An endpoint whose name now resolves to an internal address is not
+		// verified - which is the point of it.
+		if err := ssrf.CheckVerificationURL(endpointURL, sc.Env, internal); err != nil {
+			return err
 		}
 		res, err := tx.Exec(ctx, `
 			update endpoints set verified_at = now()

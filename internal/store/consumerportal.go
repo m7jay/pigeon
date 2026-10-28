@@ -6,12 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/m7jay/pigeon/internal/id"
 	"github.com/m7jay/pigeon/internal/ssrf"
 )
+
+// SecretOverlapTTL is FR-1004's dual-signature window: after a rotation the
+// previous secret stays valid, and both signatures are sent, for this long. A day
+// is what the requirement fixes; it is long enough for a receiver to deploy
+// without coordinating the release with the rotation, and short enough that the
+// endpoint does not carry two live credentials indefinitely.
+const SecretOverlapTTL = 24 * time.Hour
 
 // Consumer portal self-service (M2b, UI-13/UI-14, AC-38, AC-39).
 //
@@ -297,20 +305,33 @@ func (s *Store) UpdateConsumerEndpoint(ctx context.Context, sc Scope, consumerID
 // (AC-39). Only the endpoint's own secret moves: the ownership challenge, the URL
 // and the verified state are untouched, so rotating needs no re-verification.
 //
-// FR-1004's dual-signature overlap window (both secrets in webhook-signature for
-// up to 24h) belongs with the signer, not here: the delivery worker is a separate
-// slice and reads endpoints.signing_secret, so today the new secret simply takes
-// effect for the next delivery. Recorded as the FR-1004 card rather than implied.
+// FR-1004's overlap is two halves that live in two places, and both are here to
+// read: this function moves the outgoing secret into previous_signing_secret with
+// SecretOverlapTTL's expiry, and the delivery worker's signer emits both
+// signatures while that expiry is in the future. Neither half is optional - a
+// rotation that forgot the first would drop the old secret instantly, making the
+// overlap impossible to honour; a signer that ignored the second would send one
+// signature and the requirement's "verifies against either" would be false.
 func (s *Store) RotateConsumerEndpointSecret(ctx context.Context, sc Scope, consumerID, endpointID string) (EndpointSecret, error) {
 	secret, hint, err := createEndpointSecret()
 	if err != nil {
 		return EndpointSecret{}, err
 	}
 	err = s.scoped(ctx, sc, func(tx pgx.Tx) error {
+		// FR-1004: the rotation keeps the outgoing secret for SecretOverlapTTL so a
+		// receiver still verifying with it has a day to deploy the new one. The old
+		// secret is carried forward, not discarded - discarding it is what makes
+		// rotation require a coordinated deploy, which is the thing the overlap
+		// exists to avoid. A second rotation inside the window simply moves the
+		// window: the secret that was current a moment ago is the one a receiver is
+		// most likely still using.
 		res, err := tx.Exec(ctx, `
-			update endpoints set signing_secret = $5, signing_secret_hint = $6
+			update endpoints
+			set previous_signing_secret = signing_secret,
+			    previous_secret_expires_at = now() + $7::interval,
+			    signing_secret = $5, signing_secret_hint = $6
 			where producer_id = $1 and env = $2 and consumer_id = $3 and id = $4 and status <> 'deleted'`,
-			sc.ProducerID, sc.Env, consumerID, endpointID, secret, hint)
+			sc.ProducerID, sc.Env, consumerID, endpointID, secret, hint, SecretOverlapTTL.String())
 		if err != nil {
 			return mapPgError(err, ErrConflict, ErrNotFound)
 		}
@@ -354,9 +375,11 @@ func (s *Store) VerifyConsumerEndpoint(ctx context.Context, sc Scope, consumerID
 	}
 	return s.scoped(ctx, sc, func(tx pgx.Tx) error {
 		var hash []byte
-		err := tx.QueryRow(ctx, `select verification_token_hash
+		var endpointURL string
+		var internal bool
+		err := tx.QueryRow(ctx, `select verification_token_hash, url, internal
 			from endpoints where producer_id = $1 and env = $2 and consumer_id = $3 and id = $4 and status <> 'deleted'`,
-			sc.ProducerID, sc.Env, consumerID, endpointID).Scan(&hash)
+			sc.ProducerID, sc.Env, consumerID, endpointID).Scan(&hash, &endpointURL, &internal)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -365,6 +388,12 @@ func (s *Store) VerifyConsumerEndpoint(ctx context.Context, sc Scope, consumerID
 		}
 		if subtle.ConstantTimeCompare(hash, tokenHash(token)) != 1 {
 			return fmt.Errorf("%w: token does not match", ErrInvalid)
+		}
+		// FR-1005 at verification time, the same re-check the producer path
+		// makes: a consumer's endpoint is no more trusted than a producer's, and
+		// DNS is no more stable for it.
+		if err := ssrf.CheckVerificationURL(endpointURL, sc.Env, internal); err != nil {
+			return err
 		}
 		res, err := tx.Exec(ctx, `
 			update endpoints set verified_at = now()

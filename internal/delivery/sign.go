@@ -90,9 +90,43 @@ func buildSignedRequest(d store.LeasedDelivery, attempt int, userAgent string, n
 		body:           body,
 		webhookID:      env.ID,
 		webhookTime:    ts,
-		webhookSig:     env.Signature(key, ts, string(body)),
+		webhookSig:     dualSignature(env, d, key, ts, string(body), now),
 		userAgent:      userAgent,
 		customHeaders:  d.CustomHeaders,
 		droppedHeaders: d.DroppedCustomHeaders,
 	}, keyErr
+}
+
+// dualSignature renders FR-1004's header value during a rotation's 24 h overlap:
+// BOTH signatures, space-separated, so a receiver verifies against either one
+// without a deploy of its own. Standard Webhooks' header is a space-separated
+// list for exactly this reason, and the order carries no meaning - a verifier
+// checks each entry and accepts the first that matches.
+//
+// The expiry is applied HERE rather than in the claim query, because the rule
+// that has to hold is "both signatures while the overlap is open, one after", and
+// a pure function is where a rule is easy to see and easy to test. An endpoint
+// that has never rotated, or whose overlap has closed, gets the single signature
+// the delivery has always carried.
+func dualSignature(env envelope.Envelope, d store.LeasedDelivery, key []byte, ts, body string, now time.Time) string {
+	sig := env.Signature(key, ts, body)
+	if d.PreviousSigningSecret == "" || d.PreviousSecretExpiresAt == nil {
+		return sig
+	}
+	if !now.Before(*d.PreviousSecretExpiresAt) {
+		// The window has closed. The sweeper clears the pair shortly after, and
+		// this branch covers the attempt that lands in between - the endpoint
+		// must not be signed with a secret it may have retired.
+		return sig
+	}
+	previousKey, err := envelope.SecretBytes(d.PreviousSigningSecret)
+	if err != nil {
+		// The stored value is not a decodable whsec_. Signing with the raw bytes
+		// would produce a signature no conforming receiver can verify, so the
+		// header carries only the signature that can be verified and the
+		// unreadable secret is reported by the caller's own error path at the
+		// next rotation.
+		previousKey = []byte(d.PreviousSigningSecret)
+	}
+	return sig + " " + env.Signature(previousKey, ts, body)
 }
