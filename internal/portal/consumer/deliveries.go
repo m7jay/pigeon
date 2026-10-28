@@ -250,11 +250,12 @@ type replayResponse struct {
 // --- the delivery log (UI-15) ---------------------------------------------
 
 // deliveryStatuses is FR-1101's `status` filter as the log offers it. The four
-// values are the deliveries column's own check constraint
-// (0007_routing.sql:153) - the API's contract for the field - so the control
-// lists them rather than accepting free text: a status the API does not define
-// could only ever select nothing.
-var deliveryStatuses = []string{"pending", "delivered", "failed", "skipped"}
+// values are the deliveries column's own check constraint - the API's contract
+// for the field - so the control lists them rather than accepting free text: a
+// status the API does not define could only ever select nothing. 0007_routing.sql
+// defined them first; S5's 0013 is the current one, because I-4/FR-1201 renamed
+// the terminal value to `failed_terminal` and replaced the constraint with it.
+var deliveryStatuses = []string{"pending", "delivered", "failed_terminal", "skipped"}
 
 // deliveryFilterNames is exactly the set of read parameters the core API's
 // delivery list defines (FR-1101 plus its paging). The portal forwards these and

@@ -136,7 +136,7 @@ func TestConsumerPortalDeliveryLogEndToEnd(t *testing.T) {
 	if !strings.Contains(logBody, wantLink) {
 		t.Fatalf("the log is missing the session consumer's delivery %d:\n%s", mine[0], logBody)
 	}
-	if !strings.Contains(logBody, "failed") {
+	if !strings.Contains(logBody, "failed_terminal") {
 		t.Fatalf("the log does not show the delivery's status:\n%s", logBody)
 	}
 
@@ -175,7 +175,7 @@ func TestConsumerPortalDeliveryLogEndToEnd(t *testing.T) {
 	// number this test made up. The selection is this test's own endpoint and this
 	// test's own failed delivery, so the API's answer is exactly one.
 	code, raw = e.do(http.MethodPost, "/v1/consumer/deliveries/replay", token, map[string]any{
-		"endpoint_id": fx.EndpointID, "status": "failed", "dry_run": true, "idempotency_key": "s9b-e2e-probe",
+		"endpoint_id": fx.EndpointID, "status": "failed_terminal", "dry_run": true, "idempotency_key": "s9b-e2e-probe",
 	})
 	mustStatus(t, code, raw, http.StatusOK)
 	api := decode[replayJSONBody](t, raw)
@@ -184,7 +184,7 @@ func TestConsumerPortalDeliveryLogEndToEnd(t *testing.T) {
 	}
 
 	selection := url.Values{
-		"endpoint_id": {fx.EndpointID}, "status": {"failed"}, "idempotency_key": {"s9b-e2e-key"},
+		"endpoint_id": {fx.EndpointID}, "status": {"failed_terminal"}, "idempotency_key": {"s9b-e2e-key"},
 	}
 	confirm := portalRequest(t, p, token, http.MethodPost, "/deliveries/replay/confirm", selection)
 	if confirm.Code != http.StatusOK {
