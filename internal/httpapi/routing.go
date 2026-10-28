@@ -56,6 +56,46 @@ type createEndpointRequest struct {
 	Name     string `json:"name"`
 	URL      string `json:"url"`
 	Internal bool   `json:"internal"`
+	// CustomHeaders are added to every delivery to this endpoint (FR-405). There
+	// is deliberately no field of this shape on any read: a value goes in once and
+	// is never handed back (FR-1006).
+	CustomHeaders []customHeaderRequest `json:"custom_headers"`
+}
+
+// customHeaderRequest is one custom header on the way in. The bound (5), the
+// forbidden names and the value's legality are the store's rules, applied before
+// anything is written; the handler only carries the field, so the API and the
+// portal cannot drift from the delivery path about what is acceptable.
+type customHeaderRequest struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// customHeaderJSON is the read shape: a name in the clear and a mask where the
+// value was. `value` is never populated from storage - the only place a plaintext
+// exists is the delivery worker's outbound request (FR-1006).
+type customHeaderJSON struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+func customHeadersToStore(in []customHeaderRequest) []store.CustomHeader {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]store.CustomHeader, 0, len(in))
+	for _, h := range in {
+		out = append(out, store.CustomHeader{Name: h.Name, Value: h.Value})
+	}
+	return out
+}
+
+func toCustomHeadersJSON(in []store.CustomHeaderView) []customHeaderJSON {
+	out := make([]customHeaderJSON, 0, len(in))
+	for _, h := range in {
+		out = append(out, customHeaderJSON{Name: h.Name, Value: h.Value})
+	}
+	return out
 }
 
 // endpointJSON is the wire view of an endpoint, shared by list, get and create
@@ -73,6 +113,10 @@ type endpointJSON struct {
 	Status            string  `json:"status"`
 	Verified          bool    `json:"verified"`
 	CreatedAt         string  `json:"created_at"`
+	// CustomHeaders is FR-405's list as a reader sees it: the names, and a mask in
+	// place of every value (FR-1006). Always present, empty array when there are
+	// none, so a client never has to distinguish "none" from "field missing".
+	CustomHeaders []customHeaderJSON `json:"custom_headers"`
 }
 
 func toEndpointJSON(ep store.Endpoint) endpointJSON {
@@ -80,6 +124,7 @@ func toEndpointJSON(ep store.Endpoint) endpointJSON {
 		ID: ep.ID, ConsumerID: ep.ConsumerID, Name: ep.Name, URL: ep.URL,
 		NotificationEmail: ep.NotificationEmail,
 		Internal:          ep.Internal, Status: ep.Status, Verified: ep.Verified, CreatedAt: ts(ep.CreatedAt),
+		CustomHeaders: toCustomHeadersJSON(ep.CustomHeaders),
 	}
 }
 
@@ -127,6 +172,7 @@ func (s *Server) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := s.deps.Data.CreateEndpoint(r.Context(), sc, store.NewEndpoint{
 		Name: req.Name, URL: req.URL, ConsumerID: r.PathValue("consumerID"), Internal: req.Internal,
+		CustomHeaders: customHeadersToStore(req.CustomHeaders),
 	})
 	if err != nil {
 		// FR-402: a blocked URL is invalid input, not a 500. The SSRF reason (a
@@ -135,6 +181,9 @@ func (s *Server) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnprocessableEntity, "invalid", err.Error())
 			return
 		}
+		// FR-405's refusals (a forbidden header name, a sixth one, a value that is
+		// not a value) arrive as store.ErrInvalid and become a 422 with the reason,
+		// naming the header but never its value (FR-1008).
 		s.storeError(w, r, err)
 		return
 	}

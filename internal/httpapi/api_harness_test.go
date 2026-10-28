@@ -18,6 +18,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/m7jay/pigeon/internal/atrest"
 	"github.com/m7jay/pigeon/internal/db"
 	"github.com/m7jay/pigeon/internal/identity"
 	"github.com/m7jay/pigeon/internal/ratelimit"
@@ -52,7 +53,6 @@ type env struct {
 	st    *store.Store
 	srv   *httptest.Server
 	api   *Server
-
 	// lastHeader holds the headers of the most recent request, so assertions
 	// about Retry-After do not need a second request path.
 	lastHeader http.Header
@@ -95,6 +95,10 @@ var (
 	sharedOnce sync.Once
 	sharedEnv  *env
 	sharedErr  error
+
+	// harnessHeadersKey is the at-rest key the shared harness's store seals header
+	// values with (FR-1006), exposed so a test can seal or open a value itself.
+	harnessHeadersKey atrest.Key
 )
 
 // setup returns the shared environment, provisioning it on first use.
@@ -137,7 +141,15 @@ func buildEnv() (*env, error) {
 		return nil, fmt.Errorf("connect as %s: %w", appRole, err)
 	}
 
-	st := store.New(app)
+	// FR-1006: the harness gives the store the at-rest key production always has,
+	// so the endpoint registration path here is the same one that ships. The key is
+	// per-run and protects nothing.
+	headersKey, _, err := atrest.GenerateKey()
+	if err != nil {
+		return nil, fmt.Errorf("generate the at-rest headers key: %w", err)
+	}
+	st := store.New(app, store.WithHeadersKey(headersKey))
+	harnessHeadersKey = headersKey
 	e := &env{admin: admin, app: app, st: st}
 
 	// FR-101: the bootstrap credential exists and demands a change.
