@@ -239,7 +239,7 @@ Per-requirement map, corrected:
 | **S10 additions** | |
 | FR-1004 | `TestRotationCarriesBothSignaturesFor24h`, `TestRotationOverlapEndsAt24Hours`, `TestRotateKeepsThePreviousSecretForTheOverlap`, `TestClaimScansAnEndpointThatHasNeverRotated` (migration `0014_s10_rotation_overlap.sql`) |
 | FR-1005 | `TestRebindingIsCaughtAtEveryCallSite`, `TestDialControlIsTheOnlyCheckWithoutAWindow`, `TestCheckVerificationURLRejectsAChangedAnswer`, `TestRequestTimeRefusalIsTerminal`, `TestTransportRefusesToDialABlockedAddress` |
-| FR-1006 | **not implemented — the feature it qualifies does not exist.** FR-405 (custom endpoint headers) is absent from this tree: no column, no route, no UI, so there is nothing to encrypt at rest or redact. Recorded as `t_f65f1bc1` rather than implemented inside a hardening card. |
+| FR-1006 | **removed from this slice by a scope change.** Investigating it here found that FR-405 - the feature it hardens - does not exist in this tree: no headers column on `endpoints`, no registration or delivery path for headers, so there was nothing to encrypt at rest or redact. Jay ruled that FR-405 and FR-1006 ship **together** as one feature slice on `t_f65f1bc1`. |
 | AC-19 | FR-1005's five tests above; `169.254.0.0/16` is rejected at registration, at verification and at dial time |
 | OPS-4 | `TestHealthyBoxPassesAndExitsZero`, `TestRedisWithoutAOFIsAFailure`, `TestClockSkewFailsPastTheLimit`, `TestDiskHeadroomReadsTheVolumeOrTheDatabase`, `TestUlimitNamesTheConcurrencyItMustCover`, `cmd/pigeon/doctor.go` |
 | OPS-10 | `TestConnectionBudgetNamesTheArithmetic` (check id `db.connection_budget`, substituted formula as the observed value) |
