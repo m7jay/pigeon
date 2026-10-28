@@ -92,9 +92,15 @@ type Options struct {
 	// Metrics carries the counters that replace per-success log lines (LOG-2,
 	// AC-33) and the delivery outcome counts.
 	Metrics *metrics.Metrics
-	// SuccessLogRPS bounds per-success log lines (LOG-2). 0 selects the default
-	// of 100; a negative value means "no gate" — every success logs, which is
-	// only sensible below a few hundred deliveries a second.
+	// SuccessLogRPS bounds per-success log lines (LOG-2): at most this rate
+	// sustained, and at most 2 × it in any one-second window, because the bucket
+	// holds one second's allowance (§13.1). 0 selects the default of 100. The
+	// environment cannot turn the gate off: config.Load raises a value below 1 to
+	// 1 before Validate runs, so nothing negative arrives from PIGEON_SUCCESS_LOG_RPS.
+	// A negative value is the explicit "no gate" escape hatch for a caller that
+	// builds a Worker (or calls New) directly - only sensible below a few hundred
+	// deliveries a second - and the nil-gate branch in successLogGate.allow
+	// honours it.
 	SuccessLogRPS int
 }
 
@@ -161,7 +167,10 @@ func New(st *store.Store, opts Options) *Worker {
 	}
 	// LOG-2's gate. A negative SuccessLogRPS is the explicit "log every success"
 	// escape hatch (only sensible below a few hundred deliveries a second); 0
-	// takes the requirement's default of 100.
+	// takes the requirement's default of 100. The environment cannot reach the
+	// negative branch: config.Load floors PIGEON_SUCCESS_LOG_RPS at 1 before
+	// Validate runs and main passes the floored value (A-8), so this is a
+	// direct-caller path only.
 	if opts.SuccessLogRPS >= 0 {
 		rps := opts.SuccessLogRPS
 		if rps == 0 {

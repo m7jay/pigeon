@@ -11,11 +11,14 @@ import (
 //
 // §13.1 is explicit that a service delivering thousands of requests a second
 // cannot log a line per success: that is thousands of lines a second of its own
-// I/O problem, and it buries the failures the logs exist to surface. So the
-// success path logs at most SuccessLogRPS lines per second (100 by default) and
-// counts the rest — below the bound every success still logs, which is what a
-// small deployment wants. Failures and state transitions are NOT gated: LOG-2
-// requires those at warn, always.
+// I/O problem, and it buries the failures the logs exist to surface. So §13.1's
+// bound is what this gate enforces, in both of its legs: the success path logs at
+// most SuccessLogRPS lines per second (100 by default) sustained, and at most
+// 2 × that rate in any one-second window, because the bucket starts holding one
+// second's allowance. Everything above the bound increments the suppressed
+// counter instead, so no volume is lost; below the bound every success still
+// logs, which is what a small deployment wants. Failures and state transitions
+// are NOT gated: LOG-2 requires those at warn, always.
 type successLogGate struct {
 	mu     sync.Mutex
 	rate   float64   // lines per second
@@ -52,8 +55,8 @@ func newSuccessLogGateAt(perSecond int, m *metrics.Metrics, now func() time.Time
 
 // allow reports whether this success may be logged, counting it either way. It
 // is a token bucket: the bucket holds one second's worth of lines and refills at
-// the configured rate, so a burst cannot exceed the bound over any second and an
-// idle period restores a full second's worth.
+// the configured rate, so a burst cannot exceed §13.1's bound over any second -
+// 2 × the rate - and an idle period restores a full second's worth.
 func (g *successLogGate) allow() bool {
 	if g == nil {
 		// No gate means the operator asked for no light: every success logs. This
