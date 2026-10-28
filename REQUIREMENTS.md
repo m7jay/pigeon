@@ -536,14 +536,33 @@ The class is declared on the event type, not chosen per event, so a payload cann
 
 | ID | Requirement | Pri |
 |---|---|---|
-| FR-1301 | Per-producer publish and delivery quotas MUST be configurable. | P1 |
+| FR-1301 | Per-producer **publish** and **delivery** quotas MUST be configurable. The publish half is met by FR-207's per-key and per-producer rate limits (`429` with `Retry-After`, per process, §13.1) and the row is recorded that way rather than left unowned. The delivery half is **deferred to v1.1**: the mistake it guards against is real (a producer with many endpoints can occupy the shared delivery lanes up to the sum of its endpoints' caps), but v1.0 bounds a producer's blast radius per endpoint (FR-1302, FR-1306), per attempt class (FR-1303) and at publish (FR-207), never per producer, and a per-producer value needs a config surface and an API to set it. `REQUIREMENTS.md` §17.1 states the cost of the deferral. | P1 |
 | FR-1302 | Per-endpoint **concurrency** (default 10) MUST be enforced cluster-wide, not per process: slots are leased in Redis with a TTL, acquisition and release are atomic, and a crashed worker's slots expire. An in-process semaphore MAY exist as a latency optimisation but MUST NOT be the authoritative limit. | P0 |
-| FR-1303 | Retries MUST draw a separate budget from first attempts. | P0 |
-| FR-1304 | Throttling MUST be visible to the producer as "holding back deliveries", not silent latency. | P1 |
+| FR-1303 | Retries MUST draw on a budget separate from first attempts, and that budget is the platform's **attempt-execution capacity**, never a second set of endpoint limits: a delivery worker MUST partition its attempt budget into a first-attempt lane (`deliveries.attempts = 0`) and a retry lane (`attempts > 0`) with independent allowances, so retry work cannot consume the allowance a first attempt draws on; the claim path MUST be able to select a class, or a retry backlog is claimed ahead of every newer first attempt. The retry lane's allowance MUST be configurable and MUST leave the first-attempt lane at least one slot. Both lanes are per process, the scope FR-816's cap has; the endpoint's limits stay shared by every attempt class (FR-1308). | P0 |
+| FR-1304 | Throttling MUST be visible to the producer as "holding back deliveries", not silent latency. A delivery an endpoint's limits cannot admit MUST NOT be attempted, and MUST NOT hold a claim or a lane slot while it waits: the worker reschedules it at the wait the limiter reports, records the hold on the delivery row (`held_back_since`, `held_back_reason`), and returns to the next claim. The hold MUST be returned by the delivery view (FR-1102, FR-1103) and counted per endpoint (OBS-13). A hold MUST NOT consume a retry attempt and MUST NOT extend the retry deadline: the window moves only for a pause (FR-1207), and an endpoint that is up but at its cap has not exercised that reason. | P1 |
 | FR-1305 | A saturated producer MUST NOT raise another producer's publish p99 by more than 20%. | P0 |
 | FR-1306 | Per-endpoint **RPS** (default 25) MUST be enforced by a token bucket refilled at a fixed rate and decremented atomically. RPS and concurrency MUST NOT be conflated: a bucket bounds rate over time, a leased slot bounds in-flight count, and a request that is slow is still one request. | P0 |
 | FR-1307 | Increasing the replica count MUST NOT increase the effective per-endpoint concurrency or RPS. The limit is a property of the endpoint, not of the cluster size, and is verified by AC-41. | P0 |
 | FR-1308 | Replay and first attempts MUST draw on the same endpoint limits, so a replay burst cannot exceed the cap the endpoint was promised. | P0 |
+
+**Why FR-1303's budget is the worker's and not the receiver's.** An attempt passes two
+independent admissions, and the two halves of this section are those admissions. The lane it
+belongs to decides whether it may start (FR-1303: platform capacity, per process, so a retry
+storm cannot reach the allowance a first attempt draws on) and the endpoint's limits decide how
+many attempts of any class reach the receiver at once (FR-1302, FR-1306, FR-1308: the receiver's
+capacity, cluster-wide, shared by first attempts, retries and replays alike). Read against each
+other, the two are consistent by construction: a second slot set for retries would break FR-1308,
+because a capped endpoint would see twice the concurrency it was promised, exactly when it is
+least able to absorb it, and a per-producer quota is a third axis (FR-1301) that answers a
+different question. The mechanism, the hold's interaction with the retry window, and the trade-off
+are recorded in `SPEC.md` A-10 so a slice does not invent its own reading.
+
+**A hold is not an attempt, and it is not a pause.** It moves no attempt number and no deadline -
+only `next_attempt_at`, so the producer sees "holding back" and the receiver's cap is still
+honoured. FR-1207 extends the deadline for a pause because the endpoint was broken; an endpoint
+that is up and at its cap has given no such reason, and the window stays the consumer's promise
+about staleness. The distinction is the reason FR-1304 names the hold rather than leaving it as
+latency.
 
 ---
 
@@ -850,6 +869,7 @@ Every metric marked **[absence]** exists to catch work that should have happened
 | OBS-10 | `endpoints_paused_total` | any increase notifies producer |
 | OBS-11 | `disk_used_pct`, `retention_dropped_partitions_total` | > 80% |
 | OBS-12 | `publish_5xx_rate` | > 0.5% |
+| OBS-13 | `endpoint_held_back_total`, `endpoint_held_back_seconds` per endpoint (FR-1304) | - |
 
 Trace one `event_id` from accept through relay, fan-out, and every attempt. Metrics MUST be exposable without an external collector; Grafana is optional.
 
@@ -1028,12 +1048,17 @@ a second token beside this one.
 | AC-49 | Every `Set-Cookie` a portal emits (session, flash, CSRF) | Carries `HttpOnly`, `Secure` and `SameSite=Lax`; no portal cookie lacks any of the three |
 | AC-50 | A state-changing `POST` to a portal route - the anonymous `/login` and `/invite` included - with the CSRF token absent or not matching the session cookie: a cross-origin form, or a same-origin request with the hidden field stripped | `403` and no state change; the same `POST` carrying the token the page rendered succeeds |
 | AC-51 | Core `PIGEON_SESSION_TTL=24h`, then log in to a portal; repeat at `15m` | The session cookie's `Max-Age` is the 24 h / 15 m the core issued (from the login response's `expires_at`), not the 12 h constant the portal used to hardcode |
+| AC-52 | The process attempt budget split into a first-attempt lane and a retry lane, with one endpoint at its concurrency cap holding a due retry backlog and a second endpoint healthy | The healthy endpoint's delivery is claimed and attempted without waiting for the capped endpoint's backlog; with the retry lane at `R`, retry attempts in flight never exceed `R` and the first-attempt lane is never empty (FR-1303) |
+| AC-53 | An endpoint at its concurrency cap (and separately, an endpoint whose RPS bucket is empty) while deliveries are due | No attempt is made and no attempt row is written; each held delivery carries `held_back_since` and a reason, the delivery view returns them, `endpoint_held_back_total` advances, `retry_deadline` is unchanged and `deliveries.attempts` does not advance; when the cap frees, the delivery's next attempt is the one it already owed (FR-1304) |
 
 AC-44…AC-48 are defined above, by the gap amendment that landed as
 `docs/spec-gap-closure` - AC-47 is its consumer-session criterion and overlaps
 AC-49/AC-50 in scope; the three portal-security criteria take the ids after it for that
 reason, so §16's table reads as one contiguous AC-44…AC-51 block and no criterion
-restates another.
+restates another. AC-52 and AC-53 are the delivery-fairness criteria added by `SPEC.md`
+A-10 (FR-1303, FR-1304). They are integration-level - two endpoints, one capped, one
+healthy - so they are slice S11's exit rather than a load measurement; S10's AC-16 and
+AC-17 stay S10's, and AC-16's NFR-2 leg cannot pass until S11 lands.
 
 ### 16.5 Fault injection matrix
 
@@ -1048,7 +1073,7 @@ The durability claims in §6 are only credible if each failure mode is exercised
 | M0 | Schema, migrations, producer/keys, `/health`, cross-producer CI harness | AC-15, AC-20 |
 | M1 | Event types, endpoints, subscriptions, ingest + outbox + relay | AC-02, AC-03, AC-08, AC-09 |
 | M2 | Fan-out, delivery, leases, sweeper, attempt buffer | AC-04…AC-07, AC-21 |
-| M3 | Retry classification, DLQ, pause thresholds, throttles | AC-05, AC-14, AC-16, AC-17 |
+| M3 | Retry classification, DLQ, pause thresholds, throttles | AC-05, AC-14, AC-16, AC-17, AC-52, AC-53 |
 | M2a | Producer portal: onboarding, endpoints, deliveries, consumers (parallel) | AC-01 |
 | M2b | Consumer portal: invitation, self-service endpoints and subscriptions, scoped log, replay (parallel) | AC-38, AC-39 |
 | M4 | Replay with bounds, inspect API, dedupe visibility | AC-12, AC-13 |
@@ -1071,6 +1096,7 @@ The durability claims in §6 are only credible if each failure mode is exercised
 | Kafka transport | if >100K events/min | A consumer rewrite; the envelope does not change |
 | Helm chart | on demand | Packaging only |
 | Signed asymmetric payloads (Ed25519) | if demanded | A new signature header version; HMAC stays valid |
+| Per-producer delivery quotas (FR-1301's delivery half) | v1.1 | A producer with several endpoints can occupy the shared delivery lanes up to the sum of its endpoints' caps, so one producer's volume can raise another's delivery latency; v1.0 bounds it per endpoint (FR-1302, FR-1306), per attempt class (FR-1303) and at publish (FR-207), never per producer. The enforcement itself is a producer-keyed lease beside `internal/limit` (the claim row already carries `producer_id`); what is deferred is the *configurable* part, a per-producer value plus a config surface and an API to set it |
 
 ---
 
@@ -1120,6 +1146,7 @@ Recorded so they are not relitigated in review.
 | Deployables | Three: core, producer portal, consumer portal | Different audiences, auth, branding and release cadence. Svix ships no portal in OSS and Hook0's themes stop at a logo, so this is the differentiator, and fusing them is what made the production portal internal-only. Portals are thin API consumers, so the core can run without either |
 | Transport, compute | Kafka and serverless both rejected | Argued once in §0.1; not restated here |
 | The six specification gaps | Closed, see `SPEC.md`'s amendments A-1…A-6 | Six places these requirements were silent, contradictory or untestable. Recorded with mechanism and trade-off so they are not re-argued per slice, and so a slice that needs one does not invent its own |
+| Retry budget (FR-1303) and visible throttling (FR-1304) | Retries draw on the worker's attempt-execution capacity, partitioned into a first-attempt lane and a retry lane with the claim path able to select a class; the endpoint's limits stay shared by every attempt class (FR-1302, FR-1306, FR-1308 unchanged). A delivery an endpoint cannot admit is held, not attempted: it consumes no attempt, moves no retry deadline and is visible to the producer | The shipped dispatch path claims a delivery and takes the process slot *before* it asks the endpoint for a slot, then sleeps inside that path (`internal/delivery/delivery.go:439-486`, `:502-534`), so with `PIGEON_DELIVERY_WORKERS=1` (the default) one capped endpoint occupies a process's only dispatch loop - an endpoint at its cap of 10 with 5 s hangs drains at 2 attempts/s, so 1,000 due rows park that process for about 8 minutes against NFR-2's 60 s bound. A second endpoint slot set for retries would instead break FR-1308 and double what a capped receiver sees. Mechanism in `SPEC.md` A-10; slice S11 (card `t_558a9f59`) |
 | Portal session security (FR-1009) | `HttpOnly` + `Secure` + `SameSite=Lax` on every portal cookie; CSRF via a stateless HMAC double-submit token bound to the portal's own session cookie and verified on every state-changing `POST`, the anonymous `/login` and `/invite` included; the session cookie's lifetime is the core session's `expires_at`, with no portal-side TTL constant (AC-49…AC-51) | `SameSite=Lax` alone loses to Chrome's Lax+POST 2-minute window on a freshly set cookie and to any same-site sibling origin — and UI-19 puts the consumer portal on the producer's own domain, where such siblings exist. A `PORTAL_SESSION_TTL` knob would drift from `PIGEON_SESSION_TTL` and re-create the cookie-outlives-token mismatch this decision removes. The token costs no server storage because the portal renders its own form server-side and can HMAC the nonce under the cookie secret it already holds. AC-47 (gap A-5) already asserts the consumer session cookie's flags and the CSRF rejection, so AC-49/AC-50 state the shared invariant and AC-51 the lifetime leg it lacks instead of restating it; A-5's `csrf_secret` on the session record would have put a second token on the portal-to-core hop, which no CSRF attack traverses, so A-5's mechanism no longer carries one and FR-113 names this single browser-to-portal token - not a second mechanism |
 
 ---
