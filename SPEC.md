@@ -901,13 +901,20 @@ Neither is the mechanism. The budget that separates is the worker's.
   its own class. Today it cannot: it selects `order by d.id limit 1` over every pending delivery
   (`0013_s5_retry_pause_limits.sql:308`), so the oldest row wins and a retry backlog is claimed
   ahead of every newer first attempt.
-- **Lane side.** The worker runs one claim loop per lane. The first-attempt lane keeps
-  `PIGEON_DELIVERY_CONCURRENCY` (FR-816's per-process cap, default 64); the retry lane gets
-  `PIGEON_DELIVERY_RETRY_CONCURRENCY` (default 16), clamped into
-  `[1, PIGEON_DELIVERY_CONCURRENCY - 1]` so no configuration can starve the first-attempt lane to
-  zero. Both are per process, the scope FR-816's cap and FR-207's rate limits already have (§13.1):
-  the property is that this worker can always start a first attempt, and a cross-replica budget
-  would need Redis on the dispatch path.
+- **Lane side.** The worker runs one claim loop per lane, and the two allowances are a **partition**
+  of the process's existing attempt budget, not an addition to it: with `C =
+  PIGEON_DELIVERY_CONCURRENCY` (FR-816's per-process cap, default 64) and the retry lane's
+  configurable allowance `R = PIGEON_DELIVERY_RETRY_CONCURRENCY` (default 16), the retry lane holds
+  `R` slots and the first-attempt lane holds `C - R` (default 48). Attempts in flight for one
+  process therefore still total at most `C`, the ceiling FR-816 already shipped; the trade-off
+  below is the price of the split, not a raised budget. `R = clamp(configured, 0, C - 1)`, so
+  `C - R >= 1` holds at every accepted `C` (`internal/config/config.go:420` rejects only `C < 1`).
+  The boundary is `C = 1`: there `R = 0` means **no separate retry lane** - one lane serves both
+  classes and the isolation above is not claimed - not a lane that can never run, because a
+  degenerate partition MUST NOT starve FR-1201's retry policy. Both allowances are per process, the
+  scope FR-816's cap and FR-207's rate limits already have (§13.1): the property is that this
+  worker can always start a first attempt, and a cross-replica budget would need Redis on the
+  dispatch path.
 - **A hold is not an attempt.** When the endpoint cannot admit a request (no free slot, empty
   bucket), the worker MUST NOT sleep holding the claim and the lane slot. `limit.Acquire` and
   `limit.Allow` already return the wait; the worker reschedules the delivery at `now + wait`,
@@ -953,7 +960,8 @@ value is a config surface and an API that v1.0 does not otherwise need. §7.13's
 halves so it stops reading as one unowned claim.
 
 **Trade-off.** A retry lane caps how fast a failing endpoint's backlog drains, and every slot given
-to the retry lane is a slot the first-attempt lane does not have: a deployment that wants one
+to the retry lane is a slot the first-attempt lane does not have - the per-process budget itself
+stays `C` (FR-816), and the split only decides who may use it - so a deployment that wants one
 endpoint's 20,000-row backlog drained as fast as its cap allows must now raise a knob and pay for it
 in first-attempt capacity. A hold delays a delivery without extending its window, so an endpoint
 saturated for hours can push deliveries past their 72 h deadline that a pause would have extended
