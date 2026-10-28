@@ -34,6 +34,67 @@ func seedLeafEvent(t *testing.T, admin *pgxpool.Pool, producerID, name, eventID 
 	}
 }
 
+// leafFixtureEvent is one event this fixture seeds, and the tenant that owns it.
+type leafFixtureEvent struct {
+	eventID  string
+	tenant   string // "a" or "b"
+	typeName string
+}
+
+// leafFixtureEvents is the fixture's whole event set, and the only source of the
+// events it seeds: the two probe deliveries, plus the three the write probes use
+// (a cross-tenant insert must fail on the policy, not on the unique arbiter).
+// resetLeafFixture deletes exactly these and their trails, so the seed list and the
+// reset cannot drift apart.
+var leafFixtureEvents = []leafFixtureEvent{
+	{"evt_leafiso_a", "a", "leafiso.a"},
+	{"evt_leafiso_b", "b", "leafiso.b"},
+	{"evt_leafiso_a_w1", "a", "leafiso.a"},
+	{"evt_leafiso_a_w2", "a", "leafiso.a"},
+	{"evt_leafiso_b_w", "b", "leafiso.b"},
+}
+
+// resetLeafFixture makes the fixture own the state it asserts on. The row counts
+// below are exact ("one per tenant"), and this database is reused across local runs,
+// so rows a previous run left in the day would either fail that guard or, worse,
+// leave the isolation assertions vacuous.
+//
+// The attempt trail is cleared by the whole UTC day rather than by this fixture's
+// delivery ids, and that is deliberate: 0012 dropped attempts' foreign key to
+// deliveries, so another test's `truncate table ... deliveries cascade` removes the
+// delivery and leaves its trail behind: a predicate over the surviving deliveries
+// never sees those orphaned rows, which is how a second run accumulated four rows in
+// this leaf. The fixture already claims the day exclusively (it asserts the leaf
+// holds exactly its own two rows), so clearing the day is clearing its own state.
+func resetLeafFixture(t *testing.T, admin *pgxpool.Pool, day time.Time, events []leafFixtureEvent) {
+	t.Helper()
+	ctx := context.Background()
+	dayStart := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)
+	dayEnd := dayStart.AddDate(0, 0, 1)
+
+	ids := make([]string, 0, len(events))
+	for _, ev := range events {
+		ids = append(ids, ev.eventID)
+	}
+
+	// Order matters: the trail's predicate reads the deliveries, and deleting the
+	// events cascades into them (deliveries_event_id_fkey).
+	for _, stmt := range []struct {
+		what string
+		sql  string
+		args []any
+	}{
+		{"attempt trail", `delete from attempts where occurred_at >= $1 and occurred_at < $2`,
+			[]any{dayStart, dayEnd}},
+		{"deliveries", `delete from deliveries where event_id = any($1)`, []any{ids}},
+		{"events", `delete from events where id = any($1)`, []any{ids}},
+	} {
+		if _, err := admin.Exec(ctx, stmt.sql, stmt.args...); err != nil {
+			t.Fatalf("reset %s for the leaf fixture: %v", stmt.what, err)
+		}
+	}
+}
+
 // TestPartitionLeavesEnforceTenantIsolation is the MT-1 half of SB-1.
 //
 // 0012 replaces one protected relation with a parent plus daily children, and
@@ -70,6 +131,10 @@ func TestPartitionLeavesEnforceTenantIsolation(t *testing.T) {
 		t.Fatalf("EnsurePartition(attempts, %s): %v", day.Format("2006-01-02"), err)
 	}
 
+	// The leaves exist; clear whatever a previous run left in them before seeding, so
+	// the exact counts below are this run's rows.
+	resetLeafFixture(t, admin, day, leafFixtureEvents)
+
 	// The runtime role's privileges on those two leaves. In a deployment they come
 	// from the default privileges in deploy/postgres/01-roles.sql, which cover
 	// partitions created after the grant; a test database has no such default
@@ -83,14 +148,16 @@ func TestPartitionLeavesEnforceTenantIsolation(t *testing.T) {
 	}
 
 	// Two tenants' rows in ONE day's partition: a delivery each, plus the attempt
-	// trail the read policy is about. The second pair of events is reserved for the
+	// trail the read policy is about. The last three events are reserved for the
 	// write probes, so a cross-tenant insert cannot fail on the unique arbiter
 	// instead of on the policy.
-	seedLeafEvent(t, admin, aID, "leafiso.a", "evt_leafiso_a", at)
-	seedLeafEvent(t, admin, bID, "leafiso.b", "evt_leafiso_b", at)
-	seedLeafEvent(t, admin, aID, "leafiso.a", "evt_leafiso_a_w1", at)
-	seedLeafEvent(t, admin, aID, "leafiso.a", "evt_leafiso_a_w2", at)
-	seedLeafEvent(t, admin, bID, "leafiso.b", "evt_leafiso_b_w", at)
+	for _, ev := range leafFixtureEvents {
+		owner := aID
+		if ev.tenant == "b" {
+			owner = bID
+		}
+		seedLeafEvent(t, admin, owner, ev.typeName, ev.eventID, at)
+	}
 
 	for _, d := range []struct{ eventID, producerID, consumerID string }{
 		{"evt_leafiso_a", aID, "cns_leafiso_a"},
