@@ -560,28 +560,41 @@ func TestEndpointBreadthPauseDoesNotTouchSubscriptions(t *testing.T) {
 	defer srv.Close()
 
 	f := newS5Fixture(t, srv.URL, types...)
-	held := make([]int64, 0, len(types))
-	for _, et := range types {
-		_, id := f.publish(t, et, `{"id":"b1"}`)
-		held = append(held, id)
-	}
 	w := New(f.st, f.options(func(o *Options) {
-		// A failed attempt's retry is pushed out far enough that the claim loop
-		// reaches the endpoint's other subscriptions before it comes back to this
-		// one, so the three accumulate three failures each (AC-44's 3 x 3 = 9)
-		// instead of one subscription racing to its own depth of ten.
-		o.BackoffBase = 60 * time.Millisecond
-		o.BackoffMax = 60 * time.Millisecond
+		// A failed delivery's next attempt is pushed past the rest of this test,
+		// so the worker cannot come back to a subscription it has already failed:
+		// the 3 x 3 the breadth rule counts (AC-44) is placed by the loop below -
+		// one fresh delivery per failure - rather than hoped for from a retry
+		// cadence, which under load can let one subscription race to its own depth
+		// of ten before the other two have three failures each.
+		o.BackoffBase = time.Second
+		o.BackoffMax = time.Second
 	}))
 	ctx := context.Background()
 
-	if !drive(t, w, 500, func() bool {
-		status, _ := f.endpointStatus(t)
-		return status == "paused"
-	}) {
+	// Three failures for each of the three subscriptions, in rounds: nine
+	// failures spread 3/3/3 is exactly what N = min(3, max(3, ceil(3/4))) = 3
+	// wants, and nowhere near any subscription's own depth of ten.
+	held := make([]int64, 0, len(types)*len(types))
+	paused := false
+	for round := 0; round < len(types) && !paused; round++ {
+		for _, et := range types {
+			_, id := f.publish(t, et, `{"id":"b1"}`)
+			held = append(held, id)
+			if !drive(t, w, 300, func() bool { return f.attemptCount(t, id) >= 1 }) {
+				t.Fatalf("the %s delivery of round %d was never attempted: status %q",
+					et, round+1, f.deliveryStatus(t, id))
+			}
+			if status, _ := f.endpointStatus(t); status == "paused" {
+				paused = true
+				break
+			}
+		}
+	}
+	if !paused {
 		status, reason := f.endpointStatus(t)
-		t.Fatalf("endpoint = (%q, %q); FR-1203 wants it paused once %d subscriptions hold three failures each",
-			status, reason, len(types))
+		t.Fatalf("endpoint = (%q, %q) after %d failures spread over %d subscriptions; FR-1203 wants %d failing subscriptions to pause it",
+			status, reason, len(held), len(types), len(types))
 	}
 	if _, reason := f.endpointStatus(t); reason != "failure_threshold" {
 		t.Errorf("endpoint pause_reason = %q, want failure_threshold", reason)
@@ -594,7 +607,20 @@ func TestEndpointBreadthPauseDoesNotTouchSubscriptions(t *testing.T) {
 				et, status)
 		}
 	}
-	// No subscription reached ten: this trip was breadth, not depth.
+	// The breadth set is the three subscriptions, each with three failures: this
+	// trip was breadth, not depth, and the count is of subscriptions rather than
+	// of attempts (a subscription with nine failures is still one member).
+	sortedTypes := append([]string(nil), types...)
+	sort.Strings(sortedTypes)
+	members, err := f.counters.FailingMembers(ctx, f.endpointID)
+	if err != nil {
+		t.Fatalf("FailingMembers: %v", err)
+	}
+	sort.Strings(members)
+	if !reflect.DeepEqual(members, sortedTypes) {
+		t.Errorf("breadth set = %v, want %v: the endpoint tripped on %d failing subscriptions",
+			members, sortedTypes, len(types))
+	}
 	for _, id := range held {
 		if n := f.attemptCount(t, id); n >= 10 {
 			t.Errorf("delivery %d has %d attempts; the endpoint should have tripped at breadth before any depth of ten", id, n)
@@ -650,10 +676,13 @@ func TestEndpointBreadthPauseDoesNotTouchSubscriptions(t *testing.T) {
 		t.Errorf("endpoint after resume = (%q, %q), want (active, none)", status, reason)
 	}
 
-	// The held deliveries were never replayed, and they now deliver.
+	// The held deliveries were never replayed, and they now deliver. The budget
+	// covers the 1 s the placement's backoff put on their schedule: the retry
+	// cadence lives in the lease (0013's requeue sets lease_expires_at to the
+	// next attempt), so the worker has to wait it out rather than be rushed.
 	healthy.Store(true)
 	for _, id := range held {
-		if !drive(t, w, 200, func() bool { return f.deliveryStatus(t, id) == "delivered" }) {
+		if !drive(t, w, 2000, func() bool { return f.deliveryStatus(t, id) == "delivered" }) {
 			t.Fatalf("delivery %d = %q after the resume, want delivered", id, f.deliveryStatus(t, id))
 		}
 	}
