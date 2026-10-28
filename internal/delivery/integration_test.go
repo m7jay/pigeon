@@ -500,7 +500,7 @@ func TestLeaseExpiryReclaimsWithoutDuplicateAttempts(t *testing.T) {
 	_, _, deliveryID := seedHarness(t, st, admin, "http://127.0.0.1:1/") // URL never contacted in this test
 
 	// Claim, then simulate a crash: write attempt 1 as a partial, durable record.
-	if _, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour); err != nil {
+	if _, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour, store.AttemptClassAny); err != nil {
 		t.Fatalf("first claim: %v", err)
 	} else if !got {
 		t.Fatal("first claim found nothing to lease")
@@ -517,7 +517,7 @@ func TestLeaseExpiryReclaimsWithoutDuplicateAttempts(t *testing.T) {
 		`update deliveries set lease_expires_at = now() - interval '1 second' where id=$1`, deliveryID); err != nil {
 		t.Fatalf("expire lease: %v", err)
 	}
-	d2, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour)
+	d2, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour, store.AttemptClassAny)
 	if err != nil {
 		t.Fatalf("re-claim: %v", err)
 	}
@@ -639,7 +639,7 @@ func TestSweeperRequeuesExpiredLease(t *testing.T) {
 		t.Fatalf("SweeperRequeue reclaimed %d, want 2 (D-6 re-queues any lapsed lease)", n)
 	}
 	// A swept row is immediately claimable, with no waiting for the old lease.
-	if _, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour); err != nil {
+	if _, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour, store.AttemptClassAny); err != nil {
 		t.Fatalf("claim after sweep: %v", err)
 	} else if !got {
 		t.Fatal("a swept delivery was not claimable")

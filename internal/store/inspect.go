@@ -107,6 +107,12 @@ type DeliverySummary struct {
 	CreatedAt          time.Time
 	NonDeliveryReason  *string
 	ReplayOfDeliveryID *int64
+	// HeldBackSince and HeldBackReason are FR-1304: this delivery is being held
+	// back by its endpoint's limits rather than attempted, since the given
+	// instant and for the given reason. Both are nil on a delivery that is not
+	// being held, which is every delivery whose attempt has started.
+	HeldBackSince  *time.Time
+	HeldBackReason *string
 }
 
 // DurationMs is how long the delivery took: the wait between its first attempt
@@ -209,7 +215,8 @@ func (s *Store) ListDeliveries(ctx context.Context, sc Scope, f DeliveryFilter, 
 		rows, err := tx.Query(ctx, `
 			select d.id, d.event_id, e.event_type, d.endpoint_id, d.consumer_id, d.status,
 			       d.attempts, d.first_attempt_at, d.delivered_at, d.created_at,
-			       d.non_delivery_reason, d.replay_of_delivery_id
+			       d.non_delivery_reason, d.replay_of_delivery_id,
+			       d.held_back_since, d.held_back_reason
 			from deliveries d
 			join events e on e.id = d.event_id
 			where d.producer_id = $1 and d.env = $2
@@ -232,7 +239,8 @@ func (s *Store) ListDeliveries(ctx context.Context, sc Scope, f DeliveryFilter, 
 			var d DeliverySummary
 			if err := rows.Scan(&d.ID, &d.EventID, &d.EventType, &d.EndpointID, &d.ConsumerID,
 				&d.Status, &d.Attempts, &d.FirstAttemptAt, &d.DeliveredAt, &d.CreatedAt,
-				&d.NonDeliveryReason, &d.ReplayOfDeliveryID); err != nil {
+				&d.NonDeliveryReason, &d.ReplayOfDeliveryID,
+				&d.HeldBackSince, &d.HeldBackReason); err != nil {
 				return err
 			}
 			page.Deliveries = append(page.Deliveries, d)
@@ -263,13 +271,15 @@ func (s *Store) GetDelivery(ctx context.Context, sc Scope, id int64) (DeliveryDe
 		err := tx.QueryRow(ctx, `
 			select d.id, d.event_id, e.event_type, d.endpoint_id, d.consumer_id, d.status,
 			       d.attempts, d.first_attempt_at, d.delivered_at, d.created_at,
-			       d.non_delivery_reason, d.replay_of_delivery_id
+			       d.non_delivery_reason, d.replay_of_delivery_id,
+			       d.held_back_since, d.held_back_reason
 			from deliveries d
 			join events e on e.id = d.event_id
 			where d.producer_id = $1 and d.env = $2 and d.id = $3`,
 			sc.ProducerID, sc.Env, id).Scan(&d.ID, &d.EventID, &d.EventType, &d.EndpointID,
 			&d.ConsumerID, &d.Status, &d.Attempts, &d.FirstAttemptAt, &d.DeliveredAt,
-			&d.CreatedAt, &d.NonDeliveryReason, &d.ReplayOfDeliveryID)
+			&d.CreatedAt, &d.NonDeliveryReason, &d.ReplayOfDeliveryID,
+			&d.HeldBackSince, &d.HeldBackReason)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -440,7 +450,8 @@ func deliveriesForEvent(ctx context.Context, tx pgx.Tx, sc Scope, eventID string
 	rows, err := tx.Query(ctx, `
 		select d.id, d.event_id, e.event_type, d.endpoint_id, d.consumer_id, d.status,
 		       d.attempts, d.first_attempt_at, d.delivered_at, d.created_at,
-		       d.non_delivery_reason, d.replay_of_delivery_id
+		       d.non_delivery_reason, d.replay_of_delivery_id,
+		       d.held_back_since, d.held_back_reason
 		from deliveries d
 		join events e on e.id = d.event_id
 		where d.producer_id = $1 and d.env = $2 and d.event_id = $3
@@ -455,7 +466,8 @@ func deliveriesForEvent(ctx context.Context, tx pgx.Tx, sc Scope, eventID string
 		var d DeliverySummary
 		if err := rows.Scan(&d.ID, &d.EventID, &d.EventType, &d.EndpointID, &d.ConsumerID,
 			&d.Status, &d.Attempts, &d.FirstAttemptAt, &d.DeliveredAt, &d.CreatedAt,
-			&d.NonDeliveryReason, &d.ReplayOfDeliveryID); err != nil {
+			&d.NonDeliveryReason, &d.ReplayOfDeliveryID,
+			&d.HeldBackSince, &d.HeldBackReason); err != nil {
 			rows.Close()
 			return nil, err
 		}

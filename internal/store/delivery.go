@@ -63,6 +63,45 @@ type LeasedDelivery struct {
 	// retry policy, the per-attempt timeout, and the two limits. They come back
 	// with the claim so an attempt needs no second read to know its own limits.
 	Endpoint EndpointPolicy
+
+	// HeldBack is FR-1304's flag: this delivery was being held back by its
+	// endpoint's limits when it was claimed. The worker clears the hold the
+	// moment an attempt starts, and this is what tells it whether there is one
+	// to clear - so ordinary traffic pays nothing for the hold existing.
+	HeldBack bool
+}
+
+// AttemptClass is FR-1303's attempt class: which lane a delivery belongs to. It
+// is the class of the delivery's OWN counter, not of the event that produced it:
+// `deliveries.attempts = 0` is a first attempt and `> 0` is a retry, and a replay
+// creates a new row (FR-1106), so a replayed delivery's first attempt is a first
+// attempt.
+//
+// It is a string type so an unknown value can be refused at this boundary: the
+// alternative - letting it reach the claim function - would select nothing and
+// look like an idle queue instead of a programming error.
+type AttemptClass string
+
+const (
+	// AttemptClassFirst claims deliveries that have never been attempted.
+	AttemptClassFirst AttemptClass = "first"
+	// AttemptClassRetry claims deliveries that have been attempted at least once.
+	AttemptClassRetry AttemptClass = "retry"
+	// AttemptClassAny claims either class. It is what a single-lane worker uses
+	// (FR-1303's `R = 0`, reached only at `PIGEON_DELIVERY_CONCURRENCY = 1`) and
+	// what a caller that is not running lanes - the deterministic single-unit
+	// path the tests drive - asks for.
+	AttemptClassAny AttemptClass = "any"
+)
+
+// valid reports whether the class is one of the three the claim function
+// understands.
+func (c AttemptClass) valid() bool {
+	switch c {
+	case AttemptClassFirst, AttemptClassRetry, AttemptClassAny:
+		return true
+	}
+	return false
 }
 
 // EndpointPolicy is one endpoint's retry policy and limits, as stored on its row
@@ -99,16 +138,25 @@ func (d LeasedDelivery) NextAttemptNumber() int {
 	return n + 1
 }
 
-// ClaimDelivery leases the next due pending delivery with SKIP LOCKED (FR-813,
-// FR-809), extends its lease so a concurrent claimant skips it, and returns the
-// whole row. The boolean is false when nothing was claimable (empty queue, or
-// every row still leased), which tells the worker to wait rather than spin. The
-// lease is extended here, exactly as pigeon_lease_outbox does for the relay; the
-// FR-813 lease that distinguishes this from a lifecycle write is the one set at
-// fan-out, which the worker never rewrites except to schedule a retry.
-func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow time.Duration) (LeasedDelivery, bool, error) {
+// ClaimDelivery leases the next due pending delivery of one attempt class with
+// SKIP LOCKED (FR-813, FR-809, FR-1303), extends its lease so a concurrent
+// claimant skips it, and returns the whole row. The boolean is false when nothing
+// was claimable (empty queue, every row still leased, or nothing due in this
+// class), which tells the worker to wait rather than spin. The lease is extended
+// here, exactly as pigeon_lease_outbox does for the relay; the FR-813 lease that
+// distinguishes this from a lifecycle write is the one set at fan-out, which the
+// worker never rewrites except to schedule a retry.
+//
+// The class is the lane's (FR-1303): a first-attempt lane must not claim a retry
+// and a retry lane must not claim a first attempt, or the oldest row wins and the
+// retry backlog is served ahead of every newer first attempt. A caller with no
+// lanes passes AttemptClassAny, which is what the pre-S11 claim did.
+func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow time.Duration, class AttemptClass) (LeasedDelivery, bool, error) {
 	if defaultRetryWindow <= 0 {
 		defaultRetryWindow = 72 * time.Hour
+	}
+	if !class.valid() {
+		return LeasedDelivery{}, false, fmt.Errorf("claim delivery: unknown attempt class %q", string(class))
 	}
 	var d LeasedDelivery
 	var backoffBaseS, backoffMaxS, retryWindowS float64
@@ -118,14 +166,14 @@ func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow tim
 		occurred_at, payload, prior_attempts, row_attempts, first_attempt_at,
 		next_attempt_at, retry_deadline,
 		max_retries, retry_backoff_base_s, retry_backoff_max_s, retry_window_s,
-		delivery_timeout_ms, max_concurrency, max_rps
-		from pigeon_claim_delivery($1, $2)`, lease, defaultRetryWindow,
+		delivery_timeout_ms, max_concurrency, max_rps, held_back
+		from pigeon_claim_delivery($1, $2, $3)`, lease, defaultRetryWindow, string(class),
 	).Scan(&d.DeliveryID, &d.EventID, &d.ProducerID, &d.Env, &d.EndpointID,
 		&d.EndpointURL, &d.SigningSecret, &d.EventType, &d.PayloadVersion,
 		&d.ConsumerRef, &d.OccurredAt, &d.Payload, &d.PriorAttempts, &d.RowAttempts, &d.FirstAttemptAt,
 		&d.NextAttemptAt, &d.RetryDeadline,
 		&d.Endpoint.MaxRetries, &backoffBaseS, &backoffMaxS, &retryWindowS,
-		&timeoutMS, &d.Endpoint.MaxConcurrency, &d.Endpoint.MaxRPS)
+		&timeoutMS, &d.Endpoint.MaxConcurrency, &d.Endpoint.MaxRPS, &d.HeldBack)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return d, false, nil
 	}
@@ -139,6 +187,40 @@ func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow tim
 	d.Endpoint.RetryWindow = seconds(retryWindowS)
 	d.Endpoint.Timeout = time.Duration(timeoutMS) * time.Millisecond
 	return d, true, nil
+}
+
+// HoldDelivery records FR-1304's hold on a delivery the endpoint's limits could
+// not admit: the reason, the start of the hold episode (preserved across repeated
+// refusals), and the instant the row may be claimed again. It consumes no attempt
+// and leaves retry_deadline alone - a hold is neither an attempt nor a pause - and
+// it moves the claim gate, so the row is not re-claimed in the same instant.
+//
+// The boolean is false when the row was no longer pending (another worker
+// finalized it while this one was being refused admission): there is nothing to
+// hold, and that is not an error.
+func (s *Store) HoldDelivery(ctx context.Context, deliveryID int64, reason string, until time.Time) (bool, error) {
+	var held bool
+	err := db.ControlTx(ctx, s.pool, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `select pigeon_hold_delivery($1,$2,$3)`,
+			deliveryID, reason, until).Scan(&held)
+	})
+	if err != nil {
+		return false, fmt.Errorf("hold delivery: %w", err)
+	}
+	return held, nil
+}
+
+// ClearDeliveryHold ends the hold episode: it is called when an attempt actually
+// starts, so the producer's view says "held" only while the delivery is waiting.
+// It is a no-op on a row that is not held, so a caller never has to read first.
+func (s *Store) ClearDeliveryHold(ctx context.Context, deliveryID int64) error {
+	if err := db.ControlTx(ctx, s.pool, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `select pigeon_clear_delivery_hold($1)`, deliveryID)
+		return err
+	}); err != nil {
+		return fmt.Errorf("clear delivery hold: %w", err)
+	}
+	return nil
 }
 
 // seconds converts the epoch-seconds form the claim function returns into a

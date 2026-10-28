@@ -560,7 +560,7 @@ func TestAC37ClaimUsesTheEndpointWindow(t *testing.T) {
 	const deploymentWindow = 72 * time.Hour
 
 	_, byDefault := f.publish(t, "order.created", `{"id":"o1"}`)
-	d, got, err := f.st.ClaimDelivery(ctx, 40*time.Second, deploymentWindow)
+	d, got, err := f.st.ClaimDelivery(ctx, 40*time.Second, deploymentWindow, store.AttemptClassAny)
 	if err != nil || !got {
 		t.Fatalf("ClaimDelivery: (got=%v, err=%v)", got, err)
 	}
@@ -577,7 +577,7 @@ func TestAC37ClaimUsesTheEndpointWindow(t *testing.T) {
 	_, withOverride := f.publish(t, "order.created", `{"id":"o2"}`)
 	// The first delivery is leased for 40 s by the claim above, so the next claim
 	// is the new one.
-	d2, got, err := f.st.ClaimDelivery(ctx, 40*time.Second, deploymentWindow)
+	d2, got, err := f.st.ClaimDelivery(ctx, 40*time.Second, deploymentWindow, store.AttemptClassAny)
 	if err != nil || !got {
 		t.Fatalf("ClaimDelivery for the override: (got=%v, err=%v)", got, err)
 	}
@@ -1185,7 +1185,7 @@ func TestFR1207ResumeExtendsThePromisedWindow(t *testing.T) {
 
 	// And the claim hands the worker that deadline: a stamped deadline is what the
 	// worker schedules against from here on.
-	d, got, err := f.st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour)
+	d, got, err := f.st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour, store.AttemptClassAny)
 	if err != nil || !got {
 		t.Fatalf("ClaimDelivery after the resume: (got=%v, err=%v)", got, err)
 	}
@@ -1268,7 +1268,7 @@ func TestFR1207EndpointResumeExtendsThePromisedWindow(t *testing.T) {
 
 	// And the claim hands the worker that deadline: a stamped deadline is what
 	// the worker schedules against from here on.
-	d, got, err := f.st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour)
+	d, got, err := f.st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour, store.AttemptClassAny)
 	if err != nil || !got {
 		t.Fatalf("ClaimDelivery after the endpoint resume: (got=%v, err=%v)", got, err)
 	}

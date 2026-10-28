@@ -46,6 +46,13 @@ type deliveryJSON struct {
 	DurationMs         *int    `json:"duration_ms"`
 	NonDeliveryReason  *string `json:"non_delivery_reason"`
 	ReplayOfDeliveryID *int64  `json:"replay_of_delivery_id"`
+	// HeldBackSince and HeldBackReason are FR-1304: the delivery is being held
+	// back by its endpoint's limits - not attempted, not failed, not slow - since
+	// the given instant and for the given reason ("endpoint_concurrency_cap" from
+	// FR-1302, "endpoint_rps" from FR-1306). Both are null on a delivery that is
+	// not held, which is every delivery whose attempt has started.
+	HeldBackSince  *string `json:"held_back_since"`
+	HeldBackReason *string `json:"held_back_reason"`
 	// AttemptsRows are the attempt ROWS (FR-1102/FR-1103), in attempt order.
 	// Empty for a successful first attempt, which FR-811 records as columns on
 	// the delivery instead of a row.
@@ -92,6 +99,7 @@ func toDeliveryJSON(d store.DeliverySummary) deliveryJSON {
 		FirstAttemptAt: tsPtr(d.FirstAttemptAt), DeliveredAt: tsPtr(d.DeliveredAt),
 		CreatedAt: ts(d.CreatedAt), DurationMs: d.DurationMs(),
 		NonDeliveryReason: d.NonDeliveryReason, ReplayOfDeliveryID: d.ReplayOfDeliveryID,
+		HeldBackSince: tsPtr(d.HeldBackSince), HeldBackReason: d.HeldBackReason,
 		AttemptsRows: []attemptJSON{},
 	}
 }

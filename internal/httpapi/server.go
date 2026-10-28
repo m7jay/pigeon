@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -281,6 +282,28 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP pigeon_publishes_shed_total Publishes refused with 429 because the disk was over budget (SB-7).\n")
 	_, _ = fmt.Fprintf(w, "# TYPE pigeon_publishes_shed_total counter\n")
 	_, _ = fmt.Fprintf(w, "pigeon_publishes_shed_total %d\n", s.deps.Metrics.ShedCount())
+	// OBS-13, per endpoint (FR-1304): how often an endpoint's limits refused to
+	// admit a delivery, and how long those holds lasted. A series exists once an
+	// endpoint has held something; an endpoint that never has is absent rather
+	// than zero, and the delivery row carries the per-delivery truth meanwhile.
+	held := s.deps.Metrics.HeldBackSnapshot()
+	if len(held) > 0 {
+		endpoints := make([]string, 0, len(held))
+		for id := range held {
+			endpoints = append(endpoints, id)
+		}
+		sort.Strings(endpoints)
+		_, _ = fmt.Fprintf(w, "# HELP %s Times this endpoint's limits refused to admit a delivery (FR-1304).\n", metrics.EndpointHeldBackTotal)
+		_, _ = fmt.Fprintf(w, "# TYPE %s counter\n", metrics.EndpointHeldBackTotal)
+		for _, id := range endpoints {
+			_, _ = fmt.Fprintf(w, "%s{endpoint_id=%q} %d\n", metrics.EndpointHeldBackTotal, id, held[id].Total)
+		}
+		_, _ = fmt.Fprintf(w, "# HELP %s Total time this endpoint's limits held deliveries back (FR-1304).\n", metrics.EndpointHeldBackSeconds)
+		_, _ = fmt.Fprintf(w, "# TYPE %s counter\n", metrics.EndpointHeldBackSeconds)
+		for _, id := range endpoints {
+			_, _ = fmt.Fprintf(w, "%s{endpoint_id=%q} %s\n", metrics.EndpointHeldBackSeconds, id, strconv.FormatFloat(held[id].Seconds(), 'f', -1, 64))
+		}
+	}
 }
 
 // sortedReasons gives the series a stable, deterministic order so the scrape is

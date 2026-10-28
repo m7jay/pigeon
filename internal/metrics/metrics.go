@@ -8,7 +8,10 @@
 // four-way split.
 package metrics
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Metrics holds labelled counters. It is safe for concurrent use; the relay
 // records from many goroutines as events fan out.
@@ -18,6 +21,11 @@ type Metrics struct {
 	// counters is the S6 delivery/attempt/log-gate set, name -> value, exposed
 	// verbatim at GET /metrics (LOG-2, AC-33).
 	counters map[string]int64
+	// heldBacks is OBS-13's per-endpoint hold set (FR-1304), keyed by endpoint
+	// id. It is a label-keyed map for the same reason nonDeliveries is: the
+	// label IS the question ("which endpoint is refusing work"), and the number
+	// of endpoints is bounded by the deployment's own endpoint rows.
+	heldBacks map[string]HeldBack
 	// Storage budget telemetry (SB-6): how many partitions retention has
 	// dropped, and how many publishes were shed because the volume was over
 	// budget. Both are operator-facing — /metrics is the scrape an alert rule
@@ -28,6 +36,18 @@ type Metrics struct {
 	partitionDrops int64
 	sheds          int64
 }
+
+// HeldBack is one endpoint's hold state (OBS-13, FR-1304): how many holds were
+// recorded and how long they were for in total. Millis is the accumulator; the
+// exposition reports it as seconds.
+type HeldBack struct {
+	Total  int64
+	Millis int64
+}
+
+// Seconds is the held time as Prometheus' own unit for
+// `endpoint_held_back_seconds`.
+func (h HeldBack) Seconds() float64 { return float64(h.Millis) / 1000 }
 
 // The counter names the delivery and flusher paths advance. They exist because
 // LOG-2 and AC-33 require the volume a log line would have carried to live in a
@@ -70,6 +90,14 @@ const (
 	// partition). It is a gauge because the archive's size is a level an operator
 	// reads, not an event count.
 	DedupeArchiveBytes = "pigeon_dedupe_archive_bytes"
+	// EndpointHeldBackTotal and EndpointHeldBackSeconds are OBS-13's two
+	// per-endpoint series (FR-1304): how many times an endpoint's limits refused
+	// to admit a delivery, and how long those holds lasted in total. They are
+	// per endpoint because the question an operator asks is "which endpoint is
+	// holding work back"; `endpoint_held_back_seconds` is exposed in seconds
+	// with millisecond resolution, accumulated as milliseconds here.
+	EndpointHeldBackTotal   = "pigeon_endpoint_held_back_total"
+	EndpointHeldBackSeconds = "pigeon_endpoint_held_back_seconds"
 )
 
 // gauges are the series exposed with `# TYPE … gauge` rather than `counter`, so a
@@ -84,7 +112,11 @@ func IsGauge(name string) bool { return gauges[name] }
 
 // New builds an empty Metrics.
 func New() *Metrics {
-	return &Metrics{nonDeliveries: map[string]int64{}, counters: map[string]int64{}}
+	return &Metrics{
+		nonDeliveries: map[string]int64{},
+		counters:      map[string]int64{},
+		heldBacks:     map[string]HeldBack{},
+	}
 }
 
 // Inc advances a counter by one. A nil Metrics is a no-op, so a worker
@@ -173,6 +205,53 @@ func (m *Metrics) NonDeliverySnapshot() map[string]int64 {
 	defer m.mu.Unlock()
 	out := make(map[string]int64, len(m.nonDeliveries))
 	for k, v := range m.nonDeliveries {
+		out[k] = v
+	}
+	return out
+}
+
+// RecordHeldBack advances OBS-13's counters for one endpoint by one hold of the
+// given length (FR-1304). A non-positive wait is recorded as a hold with no
+// duration rather than skipped: the hold happened, and OBS-13's count is what
+// says the endpoint's limits are the reason work is not moving.
+func (m *Metrics) RecordHeldBack(endpointID string, wait time.Duration) {
+	if m == nil || endpointID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.heldBacks == nil {
+		m.heldBacks = map[string]HeldBack{}
+	}
+	h := m.heldBacks[endpointID]
+	h.Total++
+	if wait > 0 {
+		h.Millis += wait.Milliseconds()
+	}
+	m.heldBacks[endpointID] = h
+}
+
+// HeldBackFor is the read side of RecordHeldBack: one endpoint's OBS-13 pair. An
+// endpoint that has never held anything reads as zero, not as absent.
+func (m *Metrics) HeldBackFor(endpointID string) HeldBack {
+	if m == nil {
+		return HeldBack{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.heldBacks[endpointID]
+}
+
+// HeldBackSnapshot returns a copy of every endpoint's OBS-13 pair, so the
+// /metrics scrape and a test see one consistent view without holding the lock.
+func (m *Metrics) HeldBackSnapshot() map[string]HeldBack {
+	if m == nil {
+		return map[string]HeldBack{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]HeldBack, len(m.heldBacks))
+	for k, v := range m.heldBacks {
 		out[k] = v
 	}
 	return out
