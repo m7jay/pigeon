@@ -1049,7 +1049,7 @@ a second token beside this one.
 | AC-49 | Every `Set-Cookie` a portal emits (session, flash, CSRF) | Carries `HttpOnly`, `Secure` and `SameSite=Lax`; no portal cookie lacks any of the three |
 | AC-50 | A state-changing `POST` to a portal route - the anonymous `/login` and `/invite` included - with the CSRF token absent or not matching the session cookie: a cross-origin form, or a same-origin request with the hidden field stripped | `403` and no state change; the same `POST` carrying the token the page rendered succeeds |
 | AC-51 | Core `PIGEON_SESSION_TTL=24h`, then log in to a portal; repeat at `15m` | The session cookie's `Max-Age` is the 24 h / 15 m the core issued (from the login response's `expires_at`), not the 12 h constant the portal used to hardcode |
-| AC-52 | The process attempt budget `PIGEON_DELIVERY_CONCURRENCY` (`C`, default 64) partitioned into a first-attempt lane of `C - R` slots and a retry lane of `R` (`PIGEON_DELIVERY_RETRY_CONCURRENCY`, default 16, so 48 first-attempt slots), with one endpoint at its concurrency cap holding a due retry backlog and a second endpoint healthy | The healthy endpoint's delivery is claimed and attempted without waiting for the capped endpoint's backlog; retry attempts in flight never exceed `R` and never hold a first-attempt allowance; with first attempts due throughout the drain, first-attempt attempts keep being claimed and started to the healthy endpoint while the retry backlog drains; attempts in flight across both lanes never exceed `C` (FR-1303, FR-816) |
+| AC-52 | The process attempt budget `PIGEON_DELIVERY_CONCURRENCY` (`C`, default 64) partitioned into a first-attempt lane of `C - R` slots and a retry lane of `R` (`PIGEON_DELIVERY_RETRY_CONCURRENCY`, default 16, so 48 first-attempt slots), with one endpoint at its concurrency cap holding a due retry backlog and a second endpoint healthy | The healthy endpoint's delivery is claimed and attempted without waiting for the capped endpoint's backlog; retry attempts in flight never exceed `R` and never hold a first-attempt allowance; with first attempts due throughout the drain, first-attempt attempts keep being claimed and started to the healthy endpoint while the retry backlog drains; attempts in flight across both lanes never exceed `C` (FR-1303, FR-816). Its two lane clauses - the `R` bound and "never hold a first-attempt allowance" - are asserted for `R >= 1`; at `R = 0` (only `C = 1`) one lane serves both classes and only the progress and `C` clauses are asserted |
 | AC-53 | An endpoint at its concurrency cap (and separately, an endpoint whose RPS bucket is empty) while deliveries are due | No attempt is made and no attempt row is written; each held delivery carries `held_back_since` and a reason, the delivery view returns them, `endpoint_held_back_total` advances, `retry_deadline` is unchanged and `deliveries.attempts` does not advance; when the cap frees, the delivery's next attempt is the one it already owed (FR-1304) |
 
 AC-44…AC-48 are defined above, by the gap amendment that landed as
@@ -1063,8 +1063,10 @@ AC-17 stay S10's, and AC-16's NFR-2 leg cannot pass until S11 lands. The partiti
 part of S11's exit rather than an inference from the row: `R = clamp(PIGEON_DELIVERY_RETRY_CONCURRENCY,
 0, C - 1)` over a knob validated `>= 1` at config load, so `R >= 1` at every accepted `C >= 2` and
 `R = 0` is reached only by that clamp, at `C = 1`, where one lane serves both classes and FR-1303's
-isolation is not claimed. S11 pins both ends of that range: `C = 1`, the single-lane state, and
-`C = 2`, where the retry lane can hold at most one slot while the first-attempt lane keeps the other.
+isolation is not claimed. AC-52's two lane clauses are asserted for `R >= 1`; at `R = 0` the single
+lane serves both classes, so only its progress and `C` clauses are asserted. S11 pins both ends of
+that range: `C = 1`, the single-lane state, and `C = 2`, where the retry lane can hold at most one
+slot while the first-attempt lane keeps the other.
 
 ### 16.5 Fault injection matrix
 
