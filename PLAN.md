@@ -236,6 +236,18 @@ Per-requirement map, corrected:
 | FR-208 | `TestReplayScopedKeyCanBeIssued` (issuance + reporting; enforcement is S2's publish path) |
 | MT-5 | `TestInstanceAdminCreatesProducersAndIsAudited`, `TestAuditLogIsAppendOnly` |
 | OPS-8 | `TestValidateBudgetIsTheOPS8Arithmetic`, `docs/topology.md` |
+| **S10 additions** | |
+| FR-1004 | `TestRotationCarriesBothSignaturesFor24h`, `TestRotationOverlapEndsAt24Hours`, `TestRotateKeepsThePreviousSecretForTheOverlap`, `TestClaimScansAnEndpointThatHasNeverRotated` (migration `0014_s10_rotation_overlap.sql`) |
+| FR-1005 | `TestRebindingIsCaughtAtEveryCallSite`, `TestDialControlIsTheOnlyCheckWithoutAWindow`, `TestCheckVerificationURLRejectsAChangedAnswer`, `TestRequestTimeRefusalIsTerminal`, `TestTransportRefusesToDialABlockedAddress` |
+| FR-1006 | **not implemented — the feature it qualifies does not exist.** FR-405 (custom endpoint headers) is absent from this tree: no column, no route, no UI, so there is nothing to encrypt at rest or redact. Recorded as `t_f65f1bc1` rather than implemented inside a hardening card. |
+| AC-19 | FR-1005's five tests above; `169.254.0.0/16` is rejected at registration, at verification and at dial time |
+| OPS-4 | `TestHealthyBoxPassesAndExitsZero`, `TestRedisWithoutAOFIsAFailure`, `TestClockSkewFailsPastTheLimit`, `TestDiskHeadroomReadsTheVolumeOrTheDatabase`, `TestUlimitNamesTheConcurrencyItMustCover`, `cmd/pigeon/doctor.go` |
+| OPS-10 | `TestConnectionBudgetNamesTheArithmetic` (check id `db.connection_budget`, substituted formula as the observed value) |
+| OPS-11 | `TestObservedValuesAreSingleLine`, `TestNoSecretAppearsInAnyRendering`, `TestNothingToObserveIsExitThree`, `TestJSONMatchesTheLineOutput`, `TestChecksAreBoundedAndOrdered` |
+| AC-22 | OPS-4's rows; `TestAConfiguredDependencyThatWillNotAnswerIsAFailure` and `TestArithmeticChecksSkipWhenTheConfigurationDidNotLoad` pin the two kinds of silence |
+| AC-30, AC-31, AC-34 | `docs/load-test.md` and the runnable harness `cmd/loadgen` (`run`, `seed`, `sink`, `compare`); the document reports what was measured and names AC-34 as outstanding |
+| AC-43 | **not measured here** — one host cannot show per-doubling scaling; `docs/load-test.md` says so |
+| §16.5 / AC-42 | `internal/faults/faults_test.go` behind `-tags faults`, run nightly by `.github/workflows/nightly-faults.yml` |
 
 Honest limits — the next slices own these:
 
