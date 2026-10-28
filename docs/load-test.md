@@ -5,10 +5,20 @@ model - a row-level arithmetic argument for what 2 vCPU / 4 GB should hold - and
 NFR-4 makes the rated load a property of the machine class rather than one number
 asserted everywhere. This is where the arithmetic meets a stopwatch.
 
-The claim being published:
+The claim this document publishes is the measured result, not the design target:
 
-> **250 events/s × 10 subscriptions per event = 2,500 deliveries/s on 2 vCPU / 4 GB
-> (NFR-4's reference machine), measured.**
+> **On 2 vCPU / 4 GB (NFR-4's reference machine) one instance accepted 207.1
+> events/s at 10 subscriptions per event, and 82.0 deliveries/s were written.**
+> That is 82.8% of §8.1's 250 events/s offered and **3.3% of §8.1's
+> 250 × 10 = 2,500 deliveries/s target**.
+>
+> **§8.1's 2,500 deliveries/s is the target this run missed, not a number it
+> measured.** The two causes are named below and neither is tuned around: FR-818's
+> bounded batch queue is implemented nowhere, so the instance never sheds and never
+> reaches a ceiling; and the relay fans out one row per iteration, so deliveries
+> stop before they reach the dispatch loop. What the run does *not* show is that
+> this machine class cannot do better - it shows that two required paths are
+> missing, and a ceiling cannot be measured on a tree that has none.
 
 Two units are always reported together, because they are not the same workload and
 conflating them is the defect §8.1's "Capacity basis" paragraph fixes: ingest is two
@@ -196,11 +206,28 @@ Two independent defects, both owned by other cards. Neither is tuned around here
    therefore occupies a process's only dispatch loop, and everything else queues
    behind it. Recorded before this run on `t_4b766094` and in `SPEC.md` A-10; S11
    owns the fix and this card does not tune the test around it.
-2. **The relay stalls as well - and that is this run's new observation.** Over a
+2. **The relay's outbox loop, which is a *different* path from S11's.** Over a
    five-minute sample the relay published 99 outbox rows while ingest created
    62,391, so deliveries stop at the fan-out before they ever reach the dispatch
-   loop. That is a second symptom for S11 to look at, and it is why the reported
-   deliveries/s is what it is: a stalled relay, not only a parked dispatcher.
+   loop. The mechanism is `internal/relay/relay.go:128-143`: it leases one outbox
+   row per iteration and runs publish -> fan-out -> mark serially, with no
+   batching anywhere on that path, against §8.1's L1. Measured directly at
+   `a944f20` with the instance **idle of ingest**: the unpublished outbox drained
+   758 -> 698 rows in 46 s and 647 -> 517 in 92 s, i.e. **~1.3-1.4 events/s**, with
+   517 rows still unpublished minutes after the generator stopped, and the run
+   reconciled 360 delivery rows for 955 accepted events at 10 subscriptions.
+   NFR-3 (outbox lag p99 <= 2 s) and NFR-6 ("a queue that does not drain is a
+   defect") are both at risk, and this leg alone caps the system orders of
+   magnitude below §8.1.
+
+   **Attribution, corrected.** This is not S11's card: S11 (`t_558a9f59`) is
+   chartered to the *dispatch* path (`internal/delivery/delivery.go`
+   `dispatch`/`acquireEndpointLimits`, the first-attempt and retry lanes, and the
+   hold). The relay's non-batched outbox loop is carded separately as
+   **`t_b9850e1b`** (pigeon-dev) with the reproduction above and the instruction to
+   measure it on a compliant host before closing it as not-a-defect or fixing it.
+   Both legs are real and both are required for the delivery unit; they are simply
+   two mechanisms, and sending this one to S11's dispatch scope would have lost it.
 
 ### Why nothing was shed: FR-818 is implemented nowhere
 
@@ -251,27 +278,67 @@ Reported here so the gap is a sentence rather than a discovery:
   is no `-class` comparison, no §8.1 table in `cmd/loadgen`, and `compare` is the
   AC-43 scaling comparison only. That leg needs the instance to reach its ceiling,
   which the FR-818 gap above prevents. Recorded as a gap, not claimed.
-- **AC-34's census is a bound, not 2,500 simultaneous attempts.**
-  `TestAttemptFanOutIsBounded` (`internal/delivery`) proves the property AC-34
-  actually names - the concurrent attempt count, the goroutines behind it and the
-  open descriptors are bounded by the process cap and the per-endpoint cap rather
-  than by the queue behind them. Measured on this box: offering 20 deliveries gave a
-  peak of 6 attempts in flight, 39 goroutines and 30 descriptors; offering 120 - six
-  times the load - gave a peak of 9, 71 and 52. The footprint tracks *concurrency*,
-  which is correct and is itself capped, and it grows nothing like the offered load
-  (a goroutine per delivery would have produced ~6x the small run's figures and the
-  test fails on exactly that). The peak never exceeded the endpoint's cap of 10.
-  The test does **not** drive 2,500 attempts at once, and cannot on this box: 2,500 in-flight
-  attempts hold roughly 5,000 descriptors between the client and server halves in
-  one process, and the soft `ulimit -n` here is **4096**. That number is itself
-  AC-34's finding - "FD usage within the documented ulimit" is an operator
-  requirement, and `pigeon doctor`'s `ulimit.no_file` check is where it is
-  reported. Driving the literal 2,500 needs the limit raised first.
+- **AC-34 is measured at the criterion's own figure, and the earlier reading of it
+  was wrong.** `TestAttemptFanOutIsBounded` (`internal/delivery`) now has three legs,
+  and the third drives AC-34's literal **2,500 due deliveries offered at once** to
+  one endpoint capped at 10. On this box that leg reported **peak 5 attempts in
+  flight, 39 goroutines, 34 open descriptors, 0.12 CPU cores**, with all 2,500
+  deliveries served, and `RLIMIT_NOFILE` at 524287/524288 entering the leg and
+  524288/524288 during it - the test raises the soft limit to the hard limit itself,
+  which needs no privilege, so "the limit was raised" is a fact in the log rather
+  than a claim in this document.
+  The two shorter legs are the bound: 20 offered gave 9 in flight / 55 goroutines /
+  42 descriptors, 120 offered gave 10 / 85 / 62, and 2,500 offered - twenty times
+  the load - gave 5 / 39 / 34. The footprint tracks *concurrency*, which is capped,
+  not the backlog behind it, and the peak never exceeded the endpoint's cap of 10.
+
+  An earlier version of this paragraph said that 2,500 in-flight attempts "hold
+  roughly 5,000 descriptors" and that the run "needs the soft `ulimit -n` raised
+  first (here 4096)". Both statements were wrong: 5,000 descriptors is the
+  goroutine-per-offered-delivery model this criterion exists to refute, and the
+  soft limit here is not 4096. The figures above are the correction, and the
+  literal leg is now in the suite so the claim cannot drift back.
 - **AC-43 (1 → 2 → 4 replicas scaling ≥ 80% per doubling, and no improvement above
   the Postgres ceiling)** needs more than one host, and `compare` needs at least
   two reports to say anything. This run is a single replica and cannot speak to it.
-- **AC-16's NFR-1 leg (1,000 events/s ingest-only on 8 vCPU / 16 GB)** is not this
-  machine's rating, and is not measured here.
+- **AC-16 and AC-17 are this card's, and this box cannot rate them.** Both are
+  recorded here explicitly rather than dropped: `PLAN.md:77-82` and S11's card both
+  say AC-16 and AC-17 remain S10's measurements, and silence in this document would
+  delete two criteria from the project. Each is split into the part that is
+  measured, the part that is unmeasurable here, and the part that is blocked on
+  another slice - and each needs a ruling, requested on the card.
+  - **AC-16** asks for 1,000 events/s with 10 subscriptions and one hanging endpoint
+    on **8 vCPU / 16 GB**. This box is 2 vCPU / 7.9 GB, a quarter of the cores, and
+    it accepted 207.1 of 250 offered events/s with a 4.3 s p99: a 1,000 events/s run
+    here would measure the box. Its legs individually:
+    - *hanging endpoint capped* - **measured**, in-process:
+      `TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas` (an endpoint capped at
+      10 never observes more than 10 in flight, identically at 1 and 2 replicas),
+      and AC-34's census below (never above the cap with 2,500 deliveries offered).
+    - *commit rate stays under 100/s* - **measured** in this run: 0.17 xact/s at
+      1,638.74 rows per transaction.
+    - *NFR-1 at 1,000 events/s* - **unmeasurable on this machine class**; needs the
+      8 vCPU / 16 GB reference host.
+    - *NFR-2 (publish -> first attempt <= 60 s)* - **blocked on S11**: `dispatch`
+      claims a delivery and then waits synchronously for the endpoint's slot or
+      token, so one capped endpoint parks the process's only dispatch loop
+      (`PIGEON_DELIVERY_WORKERS=1` by default). Recorded before this run by
+      pigeon-arch on this card and in `SPEC.md` A-10.
+
+    **Disposition requested:** a ruling on whether that split - two legs measured,
+    one unmeasurable here, one blocked on S11 - discharges AC-16, or whether the
+    card should be re-gated behind S11 and the 8 vCPU host.
+  - **AC-17** asks that with one producer at 50% of the load the other producer's
+    p99 degrades by <= 20%. It is not a machine rating, but it *is* a differential
+    measurement, and on a box already saturated at 207 of 250 events/s with a 4.3 s
+    p99 both producers queue behind the same connection pool and the same missing
+    bounded batch queue, so the comparison would report the box's contention rather
+    than producer isolation. It needs a host with headroom at the rated load (the
+    8 vCPU class again) and two independent generators.
+
+    **Disposition requested:** a ruling on whether AC-17 stays S10's (to be measured
+    on the 8 vCPU host), moves to that measurement card, or is descoped. It is not
+    claimed by this run.
 - **A first full run was discarded, and why it is worth saying so.** It was taken
   while the test suites were also running on the same 2 vCPU box, which is a
   measurement error: the instance shared its cores with `go test`. It also exposed
