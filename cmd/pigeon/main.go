@@ -137,6 +137,7 @@ func run() error {
 		DeliveriesRetention: cfg.RetentionDeliveries,
 		AttemptsRetention:   cfg.RetentionAttempts,
 		EventsRetention:     cfg.RetentionEvents,
+		DedupeRetention:     cfg.RetentionDedupe,
 		Logger:              log,
 	})
 	log.Info("retention configured",
@@ -144,6 +145,7 @@ func run() error {
 		"deliveries_window", cfg.RetentionDeliveries,
 		"attempts_window", cfg.RetentionAttempts,
 		"events_window", cfg.RetentionEvents,
+		"dedupe_window", cfg.RetentionDedupe,
 		"disk_dir", cfg.DiskDir, "disk_bytes", cfg.DiskBytes)
 	api := httpapi.New(httpapi.Deps{
 		Lookup: func(ctx context.Context, plaintext string) (store.Principal, error) {

@@ -65,7 +65,22 @@ const (
 	// AttemptBufferPending is the buffer depth at the last flush pass. A gauge,
 	// not a counter (OBS-9's queue depth in the same spirit).
 	AttemptBufferPending = "pigeon_attempt_buffer_pending"
+	// DedupeArchiveBytes is FR-905's archive gauge: the size of `delivery_dedupe`
+	// as measured by pg_total_relation_size (heap + primary-key index + every day
+	// partition). It is a gauge because the archive's size is a level an operator
+	// reads, not an event count.
+	DedupeArchiveBytes = "pigeon_dedupe_archive_bytes"
 )
+
+// gauges are the series exposed with `# TYPE … gauge` rather than `counter`, so a
+// Prometheus reader does not rate() a level (FR-905, OBS-9).
+var gauges = map[string]bool{
+	AttemptBufferPending: true,
+	DedupeArchiveBytes:   true,
+}
+
+// IsGauge reports whether a counter name is exposed as a gauge.
+func IsGauge(name string) bool { return gauges[name] }
 
 // New builds an empty Metrics.
 func New() *Metrics {

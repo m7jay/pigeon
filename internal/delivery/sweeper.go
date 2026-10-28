@@ -181,6 +181,14 @@ func (s *Sweeper) sweepOnce(ctx context.Context) {
 		}
 		s.log.Info("sweeper: dropped partitions", "dropped", len(rep.Dropped))
 	}
+	if s.opts.Metrics != nil {
+		// FR-905's archive gauge, refreshed on every tick whether or not anything
+		// was dropped: it is a level (how big is the archive), and an operator
+		// reading a calm number needs it to keep updating. The number itself is
+		// measured by the manager with pg_total_relation_size (Status), never
+		// estimated here.
+		s.opts.Metrics.Set(metrics.DedupeArchiveBytes, rep.Status.DedupeArchiveBytes)
+	}
 	if rep.KeptOverBudget {
 		// The manager already logged this at error level; the sweeper adds the
 		// tick's own context so an operator sees it from both owners.

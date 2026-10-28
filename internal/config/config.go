@@ -135,6 +135,11 @@ type Config struct {
 	RetentionDeliveries time.Duration // PIGEON_RETENTION_DELIVERIES (14 d)
 	RetentionAttempts   time.Duration // PIGEON_RETENTION_ATTEMPTS (7 d)
 	RetentionEvents     time.Duration // PIGEON_RETENTION_EVENTS (14 d)
+	// RetentionDedupe is FR-905's archive window (30 d). The archive is what
+	// answers the dedupe question between the deliveries window and this one, so
+	// a value below RetentionDeliveries leaves the archive nothing to hold and a
+	// value below 30 d shortens FR-903's promise.
+	RetentionDedupe time.Duration // PIGEON_RETENTION_DEDUPE (30 d)
 
 	// Observability
 	LogLevel slog.Level // PIGEON_LOG_LEVEL
@@ -187,6 +192,7 @@ func defaults() Config {
 		RetentionDeliveries:  14 * 24 * time.Hour,
 		RetentionAttempts:    7 * 24 * time.Hour,
 		RetentionEvents:      14 * 24 * time.Hour,
+		RetentionDedupe:      30 * 24 * time.Hour,
 	}
 }
 
@@ -308,6 +314,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if c.RetentionEvents, err = envDuration("PIGEON_RETENTION_EVENTS", c.RetentionEvents); err != nil {
+		return Config{}, err
+	}
+	if c.RetentionDedupe, err = envDuration("PIGEON_RETENTION_DEDUPE", c.RetentionDedupe); err != nil {
 		return Config{}, err
 	}
 	// FR-815 is a floor, not a target: a batch below 2,000 rows is raised rather
@@ -460,10 +469,10 @@ func (c Config) Validate() error {
 	}
 	// SB-5: retention is configuration. A zero window is not "keep everything",
 	// it is "drop everything", so it is refused rather than defaulted silently.
-	if c.RetentionDeliveries <= 0 || c.RetentionAttempts <= 0 || c.RetentionEvents <= 0 {
+	if c.RetentionDeliveries <= 0 || c.RetentionAttempts <= 0 || c.RetentionEvents <= 0 || c.RetentionDedupe <= 0 {
 		problems = append(problems, fmt.Sprintf(
-			"retention windows must be positive (SB-5 defaults: deliveries %s, attempts %s, events %s)",
-			14*24*time.Hour, 7*24*time.Hour, 14*24*time.Hour))
+			"retention windows must be positive (SB-5/FR-905 defaults: deliveries %s, attempts %s, events %s, dedupe archive %s)",
+			14*24*time.Hour, 7*24*time.Hour, 14*24*time.Hour, 30*24*time.Hour))
 	}
 	if c.RateLimitPerKeyRPS < 0 || c.RateLimitPerProducerRPS < 0 {
 		problems = append(problems, "rate limits must be >= 0 (0 disables the limit)")

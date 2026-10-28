@@ -266,7 +266,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(names)
 	for _, name := range names {
 		metricType := "counter"
-		if name == metrics.AttemptBufferPending {
+		if metrics.IsGauge(name) {
 			metricType = "gauge"
 		}
 		_, _ = fmt.Fprintf(w, "# TYPE %s %s\n", name, metricType)

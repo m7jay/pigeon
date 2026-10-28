@@ -1,18 +1,22 @@
 // Package retention enforces the storage budget (SB-1…SB-8).
 //
-// The contract in one paragraph: `deliveries` and `attempts` are daily range
-// partitions (SB-1); history leaves by dropping whole partitions, never by
-// DELETE (SB-2); when the volume holding the data directory is above
-// retention.max_disk_pct the oldest partition goes first and the drop is logged
-// at warning level (SB-3); while the volume is above the budget the ingest path
-// sheds load with 429 rather than accepting events it cannot keep (SB-7); and
-// GET /v1/meta/usage reports the volume against the budget so pressure is
-// visible before history disappears (SB-6).
+// The contract in one paragraph: `deliveries`, `attempts` and the FR-905 dedupe
+// archive `delivery_dedupe` are daily range partitions (SB-1); history leaves by
+// dropping whole partitions, never by DELETE (SB-2); when the volume holding the
+// data directory is above retention.max_disk_pct a partition goes first - the
+// archive's oldest before any delivery partition, because the archive is derived
+// from it - and the drop is logged at warning level together with the dedupe
+// answers it costs (FR-903/SB-3); while the volume is above the budget the ingest
+// path sheds load with 429 rather than accepting events it cannot keep (SB-7);
+// and GET /v1/meta/usage reports the volume against the budget, the archive's
+// measured size and the live partition catalogue, so pressure is visible before
+// history disappears (SB-6, FR-905).
 //
 // It is deliberately one place. The sweeper (which owns the leadership lease,
 // D-7) drives RunOnce; the HTTP layer only reads Status/OverBudget. Partition DDL
 // itself lives behind two SECURITY DEFINER functions in 0012_partitioning.sql,
-// because the runtime role owns nothing and must not hold CREATE on the schema.
+// extended by 0013_dedupe_archive.sql, because the runtime role owns nothing and
+// must not hold CREATE on the schema.
 package retention
 
 import (
@@ -57,6 +61,13 @@ type Status struct {
 	Partitions        map[string][]Partition `json:"partitions"`
 	DroppedPartitions int64                  `json:"dropped_partitions_total"`
 	CheckedAt         time.Time              `json:"checked_at"`
+	// DedupeArchiveBytes is the FR-905 gauge: the dedupe archive's on-disk size,
+	// measured with pg_total_relation_size rather than computed from the pair
+	// count, so an operator reads the real figure. DedupeArchiveError says the
+	// reading failed, because a hard zero and "we could not measure it" must not
+	// look the same on a disk-pressure dashboard.
+	DedupeArchiveBytes int64  `json:"dedupe_archive_bytes"`
+	DedupeArchiveError string `json:"dedupe_archive_error,omitempty"`
 	// ReadError is set when the most recent gauge read failed and Disk carries
 	// the last good reading. The payload stays useful, but an operator can see
 	// that the number is stale instead of trusting a calm figure that stopped
@@ -77,9 +88,30 @@ type Gauge interface {
 type Store interface {
 	EnsurePartition(ctx context.Context, table string, day time.Time) (string, error)
 	ListPartitions(ctx context.Context, table string) ([]Partition, error)
-	DropPartition(ctx context.Context, table, name string) (bool, error)
+	DropPartition(ctx context.Context, table, name string, reason DropReason) (bool, error)
 	DatabaseSize(ctx context.Context) (int64, error)
+	// DedupeArchiveSize is the FR-905 gauge: pg_total_relation_size over the
+	// archive, measured by the database rather than estimated in Go.
+	DedupeArchiveSize(ctx context.Context) (int64, error)
 }
+
+// DropReason is why a partition is leaving, and it is not decoration: FR-905
+// makes an ordinary (age-driven) drop of a `deliveries` partition copy the day's
+// dedupe keys into the archive in the same transaction as the drop, while an SB-3
+// disk-pressure drop may skip the copy because the space is what is being
+// reclaimed. The primitive (pigeon_drop_partition) validates the value and warns
+// with the partition and the day range when the copy is skipped (FR-903).
+type DropReason string
+
+const (
+	// DropByAge is the ordinary path: the day is past the configured window and
+	// nothing may be lost. A `deliveries` partition is copied into
+	// `delivery_dedupe` before it is dropped, in one transaction.
+	DropByAge DropReason = "age"
+	// DropByPressure is SB-3's disk-pressure path, which drops before the age
+	// window and may lose dedupe answers. It is logged at warn (FR-903).
+	DropByPressure DropReason = "pressure"
+)
 
 // Options are the policy knobs. Defaults are SB-5's conservative, volume-aware
 // values; config.Load reads them from the environment (FR-1104: retention is
@@ -91,6 +123,11 @@ type Options struct {
 	// DeliveriesRetention and AttemptsRetention are SB-5's age defaults.
 	DeliveriesRetention time.Duration
 	AttemptsRetention   time.Duration
+	// DedupeRetention is FR-905's archive window (default 30 d). It is what the
+	// 30-day dedupe answer rides on: the archive holds the days between the
+	// deliveries window and this one, so shortening it shortens FR-903's answer
+	// just like shortening DeliveriesRetention does.
+	DedupeRetention time.Duration
 	// EventsRetention is reported in /v1/meta/usage (SB-5). Events is not
 	// partitioned yet, so enforcement is deferred and documented; the default is
 	// still surfaced so the operator sees the intended window.
@@ -111,6 +148,7 @@ func Defaults() Options {
 		MaxDiskPct:          80,
 		DeliveriesRetention: 14 * 24 * time.Hour,
 		AttemptsRetention:   7 * 24 * time.Hour,
+		DedupeRetention:     30 * 24 * time.Hour,
 		EventsRetention:     14 * 24 * time.Hour,
 		AheadDays:           2,
 		CacheTTL:            5 * time.Second,
@@ -147,6 +185,9 @@ func NewManager(st Store, g Gauge, opts Options) *Manager {
 	if opts.AttemptsRetention <= 0 {
 		opts.AttemptsRetention = def.AttemptsRetention
 	}
+	if opts.DedupeRetention <= 0 {
+		opts.DedupeRetention = def.DedupeRetention
+	}
 	if opts.EventsRetention <= 0 {
 		opts.EventsRetention = def.EventsRetention
 	}
@@ -168,14 +209,19 @@ func NewManager(st Store, g Gauge, opts Options) *Manager {
 // Options returns the resolved policy, for the usage payload and tests.
 func (m *Manager) Options() Options { return m.opts }
 
-// Tables are the partitioned tables this manager owns.
-func (m *Manager) Tables() []string { return []string{"deliveries", "attempts"} }
+// Tables are the partitioned tables this manager owns, in the order they are
+// listed and have their days created. `delivery_dedupe` is FR-905's archive: it is
+// derived from `deliveries`, which is why the disk-pressure path drops its
+// partitions first (see oldestDroppable) and why its age window is the longer one.
+func (m *Manager) Tables() []string { return []string{"deliveries", "attempts", "delivery_dedupe"} }
 
 // RetentionFor returns the configured age window per table.
 func (m *Manager) RetentionFor(table string) time.Duration {
 	switch table {
 	case "attempts":
 		return m.opts.AttemptsRetention
+	case "delivery_dedupe":
+		return m.opts.DedupeRetention
 	default:
 		return m.opts.DeliveriesRetention
 	}
@@ -266,7 +312,10 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 	}
 	st.RetentionDays["deliveries"] = int(m.opts.DeliveriesRetention / (24 * time.Hour))
 	st.RetentionDays["attempts"] = int(m.opts.AttemptsRetention / (24 * time.Hour))
+	st.RetentionDays["delivery_dedupe"] = int(m.opts.DedupeRetention / (24 * time.Hour))
 	st.RetentionDays["events"] = int(m.opts.EventsRetention / (24 * time.Hour))
+
+	st.DedupeArchiveBytes, st.DedupeArchiveError = m.archiveBytes(ctx)
 
 	for _, table := range m.Tables() {
 		parts, err := m.store.ListPartitions(ctx, table)
@@ -334,17 +383,20 @@ func (m *Manager) RunOnce(ctx context.Context) (Report, error) {
 	dropped := m.dropped.Load()
 	m.mu.Unlock()
 
+	size, sizeErr := m.archiveBytes(ctx)
 	rep.OverBudget = u.TotalBytes > 0 && u.UsedPct >= float64(m.opts.MaxDiskPct)
 	rep.Status = Status{
-		Disk:              u,
-		MaxDiskPct:        m.opts.MaxDiskPct,
-		OverBudget:        rep.OverBudget,
-		DroppedPartitions: dropped,
-		CheckedAt:         now,
+		Disk:               u,
+		MaxDiskPct:         m.opts.MaxDiskPct,
+		OverBudget:         rep.OverBudget,
+		DroppedPartitions:  dropped,
+		CheckedAt:          now,
+		DedupeArchiveBytes: size,
+		DedupeArchiveError: sizeErr,
 	}
 
-	// 3. Disk pressure first, as SB-3 requires: the oldest partition goes before
-	//    anything is dropped on age.
+	// 3. Disk pressure first, as SB-3 requires: a partition goes before anything
+	//    is dropped on age.
 	if rep.OverBudget {
 		oldest, ok, err := m.oldestDroppable(ctx, now)
 		if err != nil {
@@ -356,21 +408,31 @@ func (m *Manager) RunOnce(ctx context.Context) (Report, error) {
 				"used_pct", u.UsedPct, "max_disk_pct", m.opts.MaxDiskPct, "database_bytes", u.DatabaseBytes)
 			return rep, nil
 		}
-		// SB-3: log the drop at warning level.
-		m.log.Warn("retention: dropping oldest partition under disk pressure",
+		// SB-3: log the drop at warning level, with the day range it covers and,
+		// when the drop can cost a dedupe answer, which of FR-903's two loss paths
+		// this is. A support answer that is gone must be known, not discovered.
+		attrs := []any{
 			"partition", oldest.Name, "table", oldest.Table,
-			"day", oldest.Day.Format("2006-01-02"), "bytes", oldest.Bytes,
-			"used_pct", u.UsedPct, "max_disk_pct", m.opts.MaxDiskPct)
-		if droppedNow, err := m.drop(ctx, oldest); err != nil {
+			"day", oldest.Day.Format("2006-01-02"), "day_range", dayRange(oldest),
+			"bytes", oldest.Bytes,
+			"used_pct", u.UsedPct, "max_disk_pct", m.opts.MaxDiskPct,
+		}
+		if loss := dedupeLoss(oldest.Table); loss != "" {
+			attrs = append(attrs, "dedupe_loss", loss)
+		}
+		m.log.Warn("retention: dropping oldest partition under disk pressure", attrs...)
+		if droppedNow, err := m.drop(ctx, oldest, DropByPressure); err != nil {
 			return rep, err
 		} else if droppedNow {
 			rep.Dropped = append(rep.Dropped, oldest)
 		}
+		rep.refreshArchiveGauge(ctx, m)
 		return rep, nil
 	}
 
 	// 4. Under budget: enforce age. Partitions are dropped whole (SB-2), never
-	//    row-by-row.
+	//    row-by-row. A `deliveries` partition leaving here is copied into the
+	//    dedupe archive by the drop primitive in the same transaction (FR-905).
 	for _, table := range m.Tables() {
 		cutoff := now.Add(-m.RetentionFor(table))
 		parts, err := m.store.ListPartitions(ctx, table)
@@ -379,7 +441,7 @@ func (m *Manager) RunOnce(ctx context.Context) (Report, error) {
 		}
 		for _, p := range parts {
 			if !p.Day.AddDate(0, 0, 1).After(cutoff) {
-				if droppedNow, err := m.drop(ctx, p); err != nil {
+				if droppedNow, err := m.drop(ctx, p, DropByAge); err != nil {
 					return rep, err
 				} else if droppedNow {
 					rep.Dropped = append(rep.Dropped, p)
@@ -387,46 +449,130 @@ func (m *Manager) RunOnce(ctx context.Context) (Report, error) {
 			}
 		}
 	}
+	// FR-905's gauge is re-read after the drops: the tick that copies a day into
+	// the archive (or drops archive days) is the tick the operator's number has to
+	// move on, not the next one. The reading above is what an operator sees when
+	// the tick decides nothing - it is the same measurement, taken earlier.
+	rep.refreshArchiveGauge(ctx, m)
 	return rep, nil
 }
 
-// oldestDroppable finds the oldest partition across both tables that may be
-// dropped: its day must have fully elapsed (so today's and tomorrow's partitions
-// — the ones receiving writes — are never candidates).
+// refreshArchiveGauge re-reads the archive's measured size into the report, so
+// whatever the tick dropped is reflected in the number the sweeper exports to
+// GET /metrics on the same tick (FR-905).
+func (r *Report) refreshArchiveGauge(ctx context.Context, m *Manager) {
+	r.Status.DedupeArchiveBytes, r.Status.DedupeArchiveError = m.archiveBytes(ctx)
+}
+
+// archiveBytes reads FR-905's archive gauge. A failed read is reported rather than
+// hidden: the caller puts the error in the payload, because 0 bytes and "we could
+// not measure it" must not read the same on a disk-pressure dashboard.
+func (m *Manager) archiveBytes(ctx context.Context) (int64, string) {
+	if m.store == nil {
+		return 0, ""
+	}
+	n, err := m.store.DedupeArchiveSize(ctx)
+	if err != nil {
+		m.log.Warn("retention: reading the dedupe archive size failed", "error", err)
+		return 0, err.Error()
+	}
+	return n, ""
+}
+
+// dayRange is the half-open UTC day range a daily partition covers, for the warn
+// logs FR-903 requires ("the partition and the day range it covered").
+func dayRange(p Partition) string {
+	start := p.Day.UTC().Format("2006-01-02")
+	end := p.Day.UTC().AddDate(0, 0, 1).Format("2006-01-02")
+	return start + "/" + end
+}
+
+// dedupeLoss names which of FR-903's two dedupe loss paths a partition drop takes,
+// or "" when the drop loses no dedupe answer at all. Only SB-3 disk pressure
+// reaches it: an age-driven drop copies before it drops (FR-905) and a pressure
+// drop of `attempts` holds no dedupe key.
+func dedupeLoss(table string) string {
+	switch table {
+	case "deliveries":
+		return "deliveries partition dropped before its FR-905 copy: every dedupe key it held is no longer answerable (FR-903)"
+	case "delivery_dedupe":
+		return "archive partition dropped ahead of dedupe_retention: those archived dedupe days are gone whole (FR-903)"
+	default:
+		return ""
+	}
+}
+
+// oldestDroppable finds the partition a pressure drop should take: oldest first,
+// to a day that has fully elapsed (so today's and tomorrow's partitions - the ones
+// receiving writes - are never candidates).
+//
+// The archive is derived from `deliveries`, so FR-905 orders it first: while any
+// archive partition is droppable, none of its source tables is touched. Only when
+// the archive has nothing left to give does the drop fall back to the oldest
+// partition of the retained tables - which is the second of FR-903's loss paths,
+// because that `deliveries` partition leaves without its copy.
 func (m *Manager) oldestDroppable(ctx context.Context, now time.Time) (Partition, bool, error) {
 	today := truncDay(now)
+
+	// Derived first (FR-905).
+	archive, err := m.store.ListPartitions(ctx, "delivery_dedupe")
+	if err != nil {
+		return Partition{}, false, fmt.Errorf("retention: list delivery_dedupe partitions: %w", err)
+	}
+	if oldest, ok := oldestBefore(archive, today); ok {
+		return oldest, true, nil
+	}
+
 	var oldest Partition
 	found := false
 	for _, table := range m.Tables() {
+		if table == "delivery_dedupe" {
+			continue
+		}
 		parts, err := m.store.ListPartitions(ctx, table)
 		if err != nil {
 			return Partition{}, false, fmt.Errorf("retention: list %s partitions: %w", table, err)
 		}
-		for _, p := range parts {
-			if !p.Day.Before(today) {
-				continue
-			}
-			if !found || p.Day.Before(oldest.Day) {
-				oldest = p
-				found = true
-			}
+		if p, ok := oldestBefore(parts, today); ok && (!found || p.Day.Before(oldest.Day)) {
+			oldest = p
+			found = true
 		}
 	}
 	return oldest, found, nil
 }
 
-// drop removes one partition and counts it. A partition a writer held is skipped
-// (the SQL primitive returns false after its lock_timeout) rather than retried in
-// a tight loop; the next tick tries again.
-func (m *Manager) drop(ctx context.Context, p Partition) (bool, error) {
-	dropped, err := m.store.DropPartition(ctx, p.Table, p.Name)
+// oldestBefore returns the oldest partition that ended before today.
+func oldestBefore(parts []Partition, today time.Time) (Partition, bool) {
+	var oldest Partition
+	found := false
+	for _, p := range parts {
+		if !p.Day.Before(today) {
+			continue
+		}
+		if !found || p.Day.Before(oldest.Day) {
+			oldest = p
+			found = true
+		}
+	}
+	return oldest, found
+}
+
+// drop removes one partition, saying why, and counts it. A partition a writer held
+// is skipped (the SQL primitive returns false after its lock_timeout) rather than
+// retried in a tight loop; the next tick tries again.
+func (m *Manager) drop(ctx context.Context, p Partition, reason DropReason) (bool, error) {
+	dropped, err := m.store.DropPartition(ctx, p.Table, p.Name, reason)
 	if err != nil {
 		return false, fmt.Errorf("retention: drop %s: %w", p.Name, err)
 	}
 	if dropped {
 		m.dropped.Add(1)
-		m.log.Info("retention: dropped partition", "partition", p.Name, "table", p.Table,
-			"day", p.Day.Format("2006-01-02"), "bytes", p.Bytes)
+		attrs := []any{"partition", p.Name, "table", p.Table,
+			"day", p.Day.Format("2006-01-02"), "day_range", dayRange(p), "bytes", p.Bytes}
+		if reason == DropByPressure {
+			attrs = append(attrs, "reason", string(reason))
+		}
+		m.log.Info("retention: dropped partition", attrs...)
 	}
 	return dropped, nil
 }
