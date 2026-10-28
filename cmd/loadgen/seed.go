@@ -134,9 +134,18 @@ func cmdSeed(args []string) error {
 		}
 	}
 
-	fmt.Printf("seeded producer %s (%s) with %d endpoint(s) subscribed to %s, routed to consumer_ref %s\n",
-		pid, *slug, *endpoints, *eventType, "load-consumer")
-	fmt.Printf("run with: -consumer-ref load-consumer (a broadcast event creates no deliveries)\n")
+	if *routing == "consumer" {
+		fmt.Printf("seeded producer %s (%s) with %d endpoint(s) subscribed to %s, routed to consumer_ref load-consumer\n",
+			pid, *slug, *endpoints, *eventType)
+	} else {
+		fmt.Printf("seeded producer %s (%s) with %d endpoint(s) subscribed to %s (broadcast: no consumer_ref, no deliveries)\n",
+			pid, *slug, *endpoints, *eventType)
+	}
+	if *routing == "consumer" {
+		fmt.Printf("run with: -consumer-ref load-consumer (a broadcast event creates no deliveries)\n")
+	} else {
+		fmt.Printf("publish %s directly: a broadcast event is accepted with no consumer_ref and creates no deliveries\n", *eventType)
+	}
 	if !*quiet {
 		fmt.Printf("PIGEON_LOADGEN_KEY=%s\n", key.Plaintext)
 		fmt.Println("# This key is a load-test credential for a disposable database. Do not commit it.")
