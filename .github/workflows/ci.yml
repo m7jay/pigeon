@@ -108,6 +108,9 @@ jobs:
           # AC-42 plus MT-1 and D-7's second half) registered theirs the same
           # way, after their PRs merged. AC-16/AC-17 stay S10's: they are
           # load-level criteria and no harness for them exists in the tree.
+          # S11 (AC-52, AC-53, plus the lane-partition boundary that FR-1303's
+          # clamp depends on) registers its names here with the change itself, so
+          # the regression it pins cannot be renamed away silently.
           # Where one criterion's own sentence names more than one outcome,
           # every leg it names has a name here: either leg can otherwise be
           # deleted with the job still green, which is the failure this list
@@ -149,6 +152,7 @@ jobs:
             TestSuspendIsIdempotentAndReportsTheStoredTimestamp \
             TestDeliveryListFiltersAndCursorPagination \
             TestDeliveryDetailExposesOrderedAttempts \
+            TestDeliveryViewReturnsTheHold \
             TestEventRollupStatuses \
             TestDeliveredFirstAttemptHasNoEmptyTrail \
             TestReplayCreatesNewDeliveriesIdempotently \
@@ -192,6 +196,13 @@ jobs:
             TestAC37ClaimUsesTheEndpointWindow \
             TestAC37PerEndpointWindowGoverns \
             TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas \
+            TestAC52DeliveryLanesPartitionTheProcessBudget \
+            TestAC52SharedLaneAtOneProcessSlotRunsBothClasses \
+            TestAC52RegressionHealthyEndpointNotParkedBehindCappedBacklog \
+            TestAC53HoldOnTheEndpointConcurrencyCap \
+            TestAC53HoldOnTheEndpointsEmptyRateBucket \
+            TestLaneAllowancePartitionsEveryAcceptedProcessCap \
+            TestLanesAtTheTwoBoundaries \
             TestFR1207ResumeExtendsThePromisedWindow \
             TestRelayFlushWhilePendingRepublishesAll \
             TestRunOnceOverBudgetDropsOldestPartitionFirst \
