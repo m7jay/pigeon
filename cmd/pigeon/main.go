@@ -247,7 +247,7 @@ func run() error {
 			MaxAttempts:     cfg.DeliveryMaxAttempts,
 			MaxConnsPerHost: cfg.DeliveryMaxConnsPerHost,
 			PollInterval:    cfg.DeliveryPollInterval,
-			UserAgent:       "pigeon/" + version,
+			UserAgent:       userAgent(cfg, version),
 			Logger:          log,
 			// S6: evidence goes to the Redis buffer in buffered mode (D-1) or is
 			// written inline in sync mode (D-2). The counters and the log gate
@@ -344,4 +344,17 @@ func newLogger(cfg config.Config) *slog.Logger {
 		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
 	}
 	return slog.New(slog.NewTextHandler(os.Stdout, opts))
+}
+
+// userAgent is FR-810's User-Agent header for every attempt: the operator's
+// PIGEON_DELIVERY_USER_AGENT when they set one, otherwise the platform and the
+// version this binary was built from. The knob was read by config.Load and then
+// never passed to the worker, so the header was hard-coded and the setting had no
+// effect; OPS-3's promise that a documented knob is a configurable one is what
+// this closes.
+func userAgent(cfg config.Config, version string) string {
+	if ua := cfg.DeliveryUserAgent; ua != "" {
+		return ua
+	}
+	return "pigeon/" + version
 }
