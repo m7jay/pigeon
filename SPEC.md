@@ -676,6 +676,31 @@ and letting a retried fan-out batch create duplicates.
 **Encoded by.** FR-903 (rewritten), FR-905, §6's two dedupe rows, I-3 (amended),
 AC-46.
 
+**As implemented (0013_dedupe_archive.sql, 0013 because 0012's checksum is applied).**
+Four points where the code had to say something this section left open, so the next
+reader does not have to rediscover them:
+
+- **The primary key carries the partition key.** It is
+  `(endpoint_id, event_id, first_seen_at)`, not the pair alone: PostgreSQL requires a
+  partitioned table's unique key to contain the partition key, which is the same rule
+  that made S8's swap key `deliveries` on `(event_id, endpoint_id, created_at)`. The
+  pair is still the identity - the copy is `ON CONFLICT DO NOTHING` with no arbiter,
+  and a pair that appears in two days (a replay the next day, FR-1106) is folded back
+  into one answer by `delivery_dedupe_all`'s `min()` + `GROUP BY`.
+- **The gauge sums the partitions.** `pigeon_dedupe_archive_bytes` (gauge, not a
+  counter - it is a level, per OBS-9/OBS-11) is `pg_total_relation_size` summed over
+  the archive's partitions, because a partitioned table has no storage of its own and
+  `pg_total_relation_size('delivery_dedupe')` answers **0**. Measured on PostgreSQL
+  16.2 before the fix read 22 MB as 0.
+- **The knob is `PIGEON_RETENTION_DEDUPE`** (Go duration, default `720h` = 30 d,
+  `retention.dedupe_retention`), alongside the three existing windows, and the
+  archive's window is published as `retention_days.delivery_dedupe` in
+  `GET /v1/meta/usage`.
+- **The published figure holds.** AC-46's 100,000-pair probe measured **217 B per
+  pair** (21,757,952 B over 100,000 pairs, heap + primary-key index, `endpoint_id`
+  and `event_id` the 26-character text ids A-4 sizes for), inside the criterion's 50%
+  band around ~200 B and inside A-4's 10 GB estimate at the reference load.
+
 ### A-5 — Consumer sessions are opaque Postgres-backed tokens in an `HttpOnly` cookie
 
 **Decision.** A consumer user's session is an opaque 256-bit random token, stored
