@@ -32,6 +32,12 @@
 --     (internal/store/fanout.go) with the same predicate.
 --   * deliveries_event_idx (0011, FR-1109) and the attempts read policy (0011,
 --     FR-1102/1103), which die with the tables they hang off and are recreated here.
+--   * the row level security flag and policy on every partition (MT-1). PostgreSQL
+--     propagates neither to a child, so pigeon_ensure_partition applies both where it
+--     creates the leaf: without that, a query that named a day partition as the
+--     runtime role read every tenant's rows, which the single protected relation it
+--     replaced would have refused. The cutover loop below creates the first days
+--     through that same function, so they are covered too.
 --   * delivery_dedupe_all (0011, FR-903) — a view over deliveries, so it is dropped
 --     and recreated rather than blocked by the swap.
 --   * pigeon_record_attempts (0010, FR-815): the batched evidence insert. Its
@@ -205,6 +211,17 @@ as $$ select 4755598712897799028::bigint $$; -- "pigen_pd" as a stable key
 -- Create one day's partition if it is missing. Idempotent; safe to call on every
 -- fan-out and every sweep tick. Days are UTC days so the boundary is stable
 -- regardless of the server's TimeZone.
+--
+-- The leaf is created WITH its parent's row level security (MT-1). PostgreSQL
+-- does not propagate RLS to partitions: the flag and the policies belong to each
+-- relation, so a new child is unprotected however protected its parent is —
+-- measured on 16.2, `deliveries.relrowsecurity` true and `deliveries_YYYYMMDD`
+-- false. That is exactly the isolation the swap would otherwise have lost: the
+-- old single relation filtered a query that named it, and its replacement only
+-- filters queries that name the parent — the same query naming the day (a
+-- repository bug, a fixture, psql) reached every tenant's rows. Every partition
+-- is created here (the cutover loop below, fan-out, the sweeper,
+-- pigeon_record_attempts), so this is the one place that has to remember it.
 create or replace function pigeon_ensure_partition(p_table text, p_day date)
     returns text
     language plpgsql
@@ -212,9 +229,17 @@ create or replace function pigeon_ensure_partition(p_table text, p_day date)
     set search_path = public, pg_temp
 as $$
 declare
-    v_name text;
-    v_from timestamptz;
-    v_to   timestamptz;
+    v_name     text;
+    v_from     timestamptz;
+    v_to       timestamptz;
+    -- Policy names are per relation, so a leaf carries its parent's name.
+    v_policy   text;
+    -- The policy expression in the leaf's own terms: an attempts leaf must name
+    -- itself in the subquery, because `attempts` is not in scope on the leaf.
+    v_using    text;
+    -- The WITH CHECK expression, or null for a read-only policy.
+    v_check    text;
+    v_isolated boolean;
 begin
     if p_table not in ('deliveries', 'attempts') then
         raise exception 'pigeon_ensure_partition: unknown partitioned table %', p_table;
@@ -227,25 +252,64 @@ begin
     v_from := (p_day::timestamp) at time zone 'UTC';
     v_to   := ((p_day + 1)::timestamp) at time zone 'UTC';
 
-    if to_regclass(v_name) is not null then
-        return v_name;
+    if p_table = 'deliveries' then
+        v_policy := 'deliveries_tenant';
+        v_using  := 'producer_id = current_setting(''pigeon.producer_id'', true) and env = current_setting(''pigeon.env'', true)';
+        v_check  := v_using;
+    else
+        -- 0011's read policy: the predicate is the owning delivery's scope, and
+        -- the subquery reads deliveries under the caller's policies too.
+        v_policy := 'attempts_tenant_read';
+        v_using  := format(
+            'exists (select 1 from deliveries d where d.id = %I.delivery_id and d.producer_id = current_setting(''pigeon.producer_id'', true) and d.env = current_setting(''pigeon.env'', true))',
+            v_name);
+        v_check  := null;
     end if;
 
-    execute format(
-        'create table %I partition of %I for values from (%L) to (%L)',
-        v_name, p_table, v_from, v_to);
-
-    -- AC-07's defensive double-write guard lives per partition, because a
-    -- partitioned table cannot carry a global unique index on non-key columns.
-    -- The lease serialises per-delivery writers; this catches a bug that
-    -- double-writes the same attempt within the day.
-    if p_table = 'attempts' then
+    if to_regclass(v_name) is null then
         execute format(
-            'create unique index %I on %I (delivery_id, attempt)',
-            v_name || '_delivery_attempt_key', v_name);
+            'create table %I partition of %I for values from (%L) to (%L)',
+            v_name, p_table, v_from, v_to);
+
+        -- AC-07's defensive double-write guard lives per partition, because a
+        -- partitioned table cannot carry a global unique index on non-key columns.
+        -- The lease serialises per-delivery writers; this catches a bug that
+        -- double-writes the same attempt within the day.
+        if p_table = 'attempts' then
+            execute format(
+                'create unique index %I on %I (delivery_id, attempt)',
+                v_name || '_delivery_attempt_key', v_name);
+        end if;
+
+        raise notice 'pigeon: created partition %', v_name;
     end if;
 
-    raise notice 'pigeon: created partition %', v_name;
+    -- Idempotent, and the repair path for a leaf that predates this file (or was
+    -- attached by an operator): a leaf is isolated iff it has the flag AND the
+    -- policy. Both are checked, because the flag alone without the policy denies
+    -- the tenant its own rows and the policy alone without the flag allows
+    -- everyone everyone's.
+    select (c.relrowsecurity
+            and exists (select 1 from pg_policy p
+                         where p.polrelid = c.oid and p.polname = v_policy))
+      into v_isolated
+      from pg_class c
+     where c.oid = to_regclass(v_name);
+
+    if not coalesce(v_isolated, false) then
+        execute format('alter table %I enable row level security', v_name);
+        if not exists (select 1 from pg_policy p
+                        where p.polrelid = to_regclass(v_name) and p.polname = v_policy) then
+            if v_check is null then
+                execute format('create policy %I on %I for select using (%s)',
+                               v_policy, v_name, v_using);
+            else
+                execute format('create policy %I on %I using (%s) with check (%s)',
+                               v_policy, v_name, v_using, v_check);
+            end if;
+        end if;
+    end if;
+
     return v_name;
 end;
 $$;
