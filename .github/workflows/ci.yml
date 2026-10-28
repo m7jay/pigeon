@@ -74,12 +74,17 @@ jobs:
           # service-container database: running packages in parallel lets one
           # package's fixtures (and the identity bootstrap test, which deletes and
           # recreates the instance admin) interfere with another's.
-          # -timeout 25m: Go's default is 10m per test binary, and the httpapi
-          # package already spent 525s of that before this card. Run
-          # 40560104623 died at exactly 600s with every test up to that point
-          # passing - that is the default being the wrong budget for a package
-          # that builds a fresh env (full migration set) per acceptance test, not
-          # a test that hangs.
+          # -timeout 25m: Go's default is 10m per test binary, and internal/httpapi
+          # spent 652.880s of that on the S7 head (run 40586485856). The budget was
+          # a symptom, so card t_23c796d3 measured what the money went on, under
+          # -race on 2 vCPUs: a fresh migration set is 184 ms and the harness
+          # builds one env per package (sync.Once), while every seedTenant fixture
+          # accepts three invitations and logs in four times - seven bcrypt calls
+          # at the production cost of 12, ~3.5 s each. The harness now hashes test
+          # identities at bcrypt.MinCost (internal/httpapi/main_test.go, a test-only
+          # knob; the shipped default is unchanged), which took the package from
+          # 664.8 s to 13.2 s standalone. The 25m stays as headroom rather than as
+          # the thing the suite depends on.
           go test -count=1 -race -p 1 -v -timeout 25m ./... 2>&1 | tee /tmp/go-test.log
           # A skip is a failure here. The whole point of S0 is that the
           # cross-producer harness (AC-20) actually executes against Postgres;
@@ -93,6 +98,11 @@ jobs:
           # (AC-15) and that the route table is fully covered (AC-20). Each name
           # below is an acceptance criterion, so a rename without a CI update
           # fails loudly instead of quietly dropping the assertion.
+          #
+          # S4 (AC-04..07, AC-21, AC-28) and D-6/D-7, and S6 (AC-29, AC-33,
+          # D-1..D-3, FR-815/SB-4), registered theirs only after their PRs
+          # merged; their names are the tail of the list. Keep the list in the
+          # order the criteria were registered.
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -130,7 +140,20 @@ jobs:
             TestConsumerPortalSelfService \
             TestConsumerPortalForeignResourcesAreNotFound \
             TestConsumerPortalSubscribableGate \
-            TestCoreDoesNotDependOnThePortal
+            TestCoreDoesNotDependOnThePortal \
+            TestRetryThenDelivered \
+            TestTerminalFailureOn404 \
+            TestTimeoutRecordedAndRetried \
+            TestLeaseExpiryReclaimsWithoutDuplicateAttempts \
+            TestShutdownLeavesInFlightDeliveryPending \
+            TestSuccessfulDeliveryWritesNoAttemptRow \
+            TestSweeperRequeuesExpiredLease \
+            TestSweeperLeadershipLockIsExclusive \
+            TestEvidenceAndControlTxAreDistinguishableInPgStatActivity \
+            TestSuccessLogGateHoldsTheBoundAtLoad \
+            TestBufferedAttemptsFlowFromWorkerThroughRedisToPostgres \
+            TestBatchedEvidenceInsertIsOneIdempotentStatement \
+            TestRunDrainsOnCancellation
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
