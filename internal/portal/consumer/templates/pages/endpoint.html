@@ -7,6 +7,15 @@
     <dt>Status</dt><dd>{{template "badge" .Data.Status}}</dd>
     <dt>Verified</dt><dd>{{if .Data.Verified}}{{template "badge" "active"}}{{else}}{{template "badge" "unverified"}}{{end}}</dd>
     <dt>Notification email</dt><dd>{{if .Data.NotificationEmail}}{{.Data.NotificationEmail}}{{else}}<span class="muted">not set</span>{{end}}</dd>
+    <dt>Custom headers</dt>
+    <dd>
+      {{if .Data.CustomHeaders}}
+      <dl class="kv">
+        {{range .Data.CustomHeaders}}<dt class="mono">{{.Name}}</dt><dd class="mono">{{.Value}}</dd>{{end}}
+      </dl>
+      <span class="muted">Values are encrypted at rest and never shown again (FR-1006). To change them, register a new endpoint: headers are set at registration.</span>
+      {{else}}<span class="muted">none configured</span>{{end}}
+    </dd>
     <dt>Created</dt><dd>{{.Data.CreatedAt}}</dd>
   </dl>
   <div class="row-actions" style="margin-top:0.75rem">
