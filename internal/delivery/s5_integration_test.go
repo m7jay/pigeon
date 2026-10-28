@@ -1020,3 +1020,137 @@ func TestFR1207ResumeExtendsThePromisedWindow(t *testing.T) {
 			got, used)
 	}
 }
+
+// TestFR1207EndpointResumeExtendsThePromisedWindow: FR-1207 on the ENDPOINT
+// scope. 0013 implements the requirement twice - pigeon_resume_endpoint and
+// pigeon_resume_subscription are separate SQL bodies - so the subscription pin
+// above leaves the endpoint half free to fall back to resume_time + paused_for,
+// which is the shape the requirement forbids: an endpoint paused for ten minutes
+// would terminal everything it held after about two attempts.
+//
+// The endpoint carries no retry_window override here, so the promise is the
+// deployment's own window (the 72 h the resumer is handed), which is the
+// coalesce's right-hand side; the endpoint's 1 h override is the case above.
+func TestFR1207EndpointResumeExtendsThePromisedWindow(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	f := newS5Fixture(t, srv.URL, "order.created")
+	_, deliveryID := f.publish(t, "order.created", `{"id":"e1"}`)
+	created := f.createdAt(t, deliveryID)
+
+	// The case under test is the never-attempted row, so assert it is the one we
+	// have: a failure's requeue is what stamps retry_deadline, and a delivery
+	// that was only fanned out is exactly what an endpoint pause holds.
+	var before sql.NullTime
+	if err := f.admin.QueryRow(ctx, `select retry_deadline from deliveries where id=$1`, deliveryID).Scan(&before); err != nil {
+		t.Fatalf("read retry_deadline: %v", err)
+	}
+	if before.Valid {
+		t.Fatalf("the delivery already has retry_deadline %s; this test is about a delivery held by a pause that was never attempted",
+			before.Time)
+	}
+
+	if _, err := f.st.PauseEndpointForFailures(ctx, f.endpointID, 3); err != nil {
+		t.Fatalf("PauseEndpointForFailures: %v", err)
+	}
+	const paused = time.Second
+	time.Sleep(paused)
+
+	resumer := pause.NewResumer(f.st, f.counters, 0) // 0 = the documented deployment default (72 h)
+	out, err := resumer.ResumeEndpoint(ctx, f.endpointID)
+	if err != nil {
+		t.Fatalf("ResumeEndpoint: %v", err)
+	}
+	if !out.Resumed {
+		t.Fatal("resume reported no transition on a paused endpoint (FR-1205)")
+	}
+	resumedAt := time.Now()
+
+	// The window is the promise plus the pause ONCE. Both bounds sit inside one
+	// pause of the expected value on purpose: a resume that derives the deadline
+	// from now() grants about one pause (the old pigeon_resume_endpoint shape),
+	// and one that adds the paused period twice lands past the upper bound.
+	used := f.retryDeadline(t, deliveryID).Sub(created)
+	if used < 72*time.Hour+paused/2 {
+		t.Errorf("the endpoint resume granted a %s window, want the promised 72 h plus the %s pause: deriving the deadline from the resume instead of from created_at is what consumes a held delivery's window (FR-1207)",
+			used, paused)
+	}
+	if used > 72*time.Hour+paused+paused/2 {
+		t.Errorf("the endpoint resume granted a %s window, want the promised 72 h plus the %s pause added once, not twice (FR-1207)",
+			used, paused)
+	}
+	// A hold must not push a delivery into the future: the schedule a
+	// never-scheduled row does not have is not invented.
+	if next := f.nextAttemptAt(t, deliveryID); !next.Valid || next.Time.After(resumedAt.Add(time.Second)) {
+		t.Errorf("next_attempt_at = %v, want an instant at or before the resume", next)
+	}
+
+	// And the claim hands the worker that deadline: a stamped deadline is what
+	// the worker schedules against from here on.
+	d, got, err := f.st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour)
+	if err != nil || !got {
+		t.Fatalf("ClaimDelivery after the endpoint resume: (got=%v, err=%v)", got, err)
+	}
+	if d.DeliveryID != deliveryID {
+		t.Fatalf("claimed delivery %d, want %d", d.DeliveryID, deliveryID)
+	}
+	if got := d.RetryDeadline.Sub(created); got < used-time.Second || got > used+time.Second {
+		t.Errorf("the claim reports a %s deadline, want the stored %s: the endpoint resume's window has to be the one the worker schedules against",
+			got, used)
+	}
+}
+
+// TestFR1207EndpointResumeKeepsAStampedDeadline: the other half of the same
+// requirement on the same scope. A delivery that failed before the pause already
+// has its own deadline, and FR-1207 extends THAT instant by the paused period
+// rather than re-deriving it from the promise - which is the coalesce's
+// left-hand side, and the case a test of the NULL row alone cannot see (there
+// the promise and the resume are the same instant).
+func TestFR1207EndpointResumeKeepsAStampedDeadline(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	f := newS5Fixture(t, srv.URL, "order.created")
+	_, deliveryID := f.publish(t, "order.created", `{"id":"e2"}`)
+	// The instant a first failure would have stamped: an hour after the promise,
+	// so a resume that re-derived the deadline from created_at cannot be mistaken
+	// for one that kept this row's own.
+	if _, err := f.admin.Exec(ctx,
+		`update deliveries set retry_deadline = created_at + interval '1 hour' where id=$1`, deliveryID); err != nil {
+		t.Fatalf("stamp retry_deadline: %v", err)
+	}
+	stamped := f.retryDeadline(t, deliveryID)
+
+	if _, err := f.st.PauseEndpointForFailures(ctx, f.endpointID, 3); err != nil {
+		t.Fatalf("PauseEndpointForFailures: %v", err)
+	}
+	const paused = 500 * time.Millisecond
+	time.Sleep(paused)
+
+	resumer := pause.NewResumer(f.st, f.counters, 0)
+	if out, err := resumer.ResumeEndpoint(ctx, f.endpointID); err != nil {
+		t.Fatalf("ResumeEndpoint: %v", err)
+	} else if !out.Resumed {
+		t.Fatal("resume reported no transition on a paused endpoint (FR-1205)")
+	}
+
+	// The stamped instant moves by exactly the paused period: not to
+	// created_at + the window (which would re-promise an hour that has already
+	// partly elapsed) and not to the resume itself (which would hand a delivery
+	// that has been failing for an hour a fresh window).
+	delta := f.retryDeadline(t, deliveryID).Sub(stamped)
+	if delta < paused/2 {
+		t.Errorf("the stamped deadline moved %s, want the %s pause added once: a held delivery keeps the window it was promised (FR-1207)",
+			delta, paused)
+	}
+	if delta > paused+paused/2 {
+		t.Errorf("the stamped deadline moved %s, want the %s pause added once, not twice (FR-1207)", delta, paused)
+	}
+}
