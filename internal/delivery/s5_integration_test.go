@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/m7jay/pigeon/internal/atrest"
 	"github.com/m7jay/pigeon/internal/config"
 	"github.com/m7jay/pigeon/internal/limit"
 	"github.com/m7jay/pigeon/internal/metrics"
@@ -883,10 +884,16 @@ func TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas(t *testing.T) {
 	// written here: the third run below caps an endpoint that sets NO override, so
 	// the assertion has to be about what the deployment actually ships
 	// (PIGEON_DELIVERY_MAX_CONNS_PER_HOST, FR-1302's documented 10). Only the
-	// three variables Validate() requires are set; nothing else is configured.
+	// variables Validate() requires are set; nothing else is configured.
 	t.Setenv("PIGEON_DATABASE_URL", "postgres://unused/unused?sslmode=disable")
 	t.Setenv("PIGEON_REDIS_URL", "redis://unused:6379/0")
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "not-the-documented-weak-default")
+	// FR-1006's at-rest key is required too: config refuses to boot without one.
+	_, headersKey, keyErr := atrest.GenerateKey()
+	if keyErr != nil {
+		t.Fatalf("generate the at-rest key: %v", keyErr)
+	}
+	t.Setenv("PIGEON_HEADERS_KEY", headersKey)
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("config.Load with the required variables set: %v", err)
