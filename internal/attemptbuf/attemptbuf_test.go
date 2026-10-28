@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -509,5 +511,230 @@ func TestAckCancelledBeforeTheTransactionAppliesNothing(t *testing.T) {
 	reclaimed, err := b.Reclaim(ctx, 10, 0)
 	if err != nil || len(reclaimed) != 1 {
 		t.Fatalf("Reclaim(0) = %d entries, %v; want the entry still pending", len(reclaimed), err)
+	}
+}
+
+// assertSweepKeepsPendingAndUnread is the sweep's safety property, and it is run
+// against both servers the package can talk to: W2's shape - three entries read,
+// the first two acknowledged without being removed - plus one entry nobody has
+// read. The sweep removes exactly the stranded pair, because the bound is the
+// smallest pending id: anything older than the oldest unacknowledged entry has
+// been delivered and is not pending, so it is already acknowledged. XTRIM does
+// not consult the pending list, so that bound is the whole safety argument (D-9).
+func assertSweepKeepsPendingAndUnread(t *testing.T, b *Buffer) {
+	t.Helper()
+	ctx := context.Background()
+
+	for i := 1; i <= 3; i++ {
+		if err := b.Push(ctx, rec(int64(i), 1)); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+	entries, err := b.Read(ctx, 10)
+	if err != nil || len(entries) != 3 {
+		t.Fatalf("Read = %d entries, %v; want 3", len(entries), err)
+	}
+	// Strand the first two the way a torn retirement does: acknowledged, so out
+	// of the pending list, but never removed from the stream.
+	if err := b.rdb.XAck(ctx, b.Key(), b.group, entries[0].ID, entries[1].ID).Err(); err != nil {
+		t.Fatalf("XAck: %v", err)
+	}
+	// And one entry nobody has read yet.
+	if err := b.Push(ctx, rec(4, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if before, _ := b.Depth(ctx); before != 4 {
+		t.Fatalf("XLEN before the sweep = %d, want 4", before)
+	}
+
+	n, err := b.SweepStranded(ctx)
+	if err != nil {
+		t.Fatalf("SweepStranded: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("SweepStranded removed %d entries, want 2 (the stranded pair)", n)
+	}
+	if after, _ := b.Depth(ctx); after != 2 {
+		t.Fatalf("XLEN after the sweep = %d, want 2 (the pending entry and the unread one)", after)
+	}
+	if got := pendingCount(t, b); got != 1 {
+		t.Fatalf("pending after the sweep = %d, want 1: the sweep removed a pending entry", got)
+	}
+	// The pending entry is still the flusher's to hand back...
+	reclaimed, err := b.Reclaim(ctx, 10, 0)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].ID != entries[2].ID {
+		t.Fatalf("Reclaim(0) = %v, %v; want the pending entry %s", IDs(reclaimed), err, entries[2].ID)
+	}
+	// ...and the unread entry is still unread, not silently dropped.
+	unread, err := b.Read(ctx, 10)
+	if err != nil || len(unread) != 1 || unread[0].Record.DeliveryID != 4 {
+		t.Fatalf("Read = %+v, %v; want only the unread entry (delivery 4)", unread, err)
+	}
+}
+
+// assertSweepTrimsTheLastAckedEntry pins the +1 at the end of the bound. With
+// nothing pending the bound is the id AFTER the group's last delivery, because
+// the last delivered entry can itself be a strand: an acked-but-not-removed entry
+// whose id is exactly last-delivered-id, which a bound without the +1 leaves in
+// the stream for the life of the stream. It is run against both servers.
+func assertSweepTrimsTheLastAckedEntry(t *testing.T, b *Buffer) {
+	t.Helper()
+	ctx := context.Background()
+
+	for i := 1; i <= 2; i++ {
+		if err := b.Push(ctx, rec(int64(i), 1)); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+	entries, err := b.Read(ctx, 10)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("Read = %d entries, %v; want 2", len(entries), err)
+	}
+	// Both delivered entries are stranded and nothing is left pending, so the
+	// group's last-delivered id is the second entry's id.
+	if err := b.rdb.XAck(ctx, b.Key(), b.group, IDs(entries)...).Err(); err != nil {
+		t.Fatalf("XAck: %v", err)
+	}
+	if err := b.Push(ctx, rec(3, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+
+	n, err := b.SweepStranded(ctx)
+	if err != nil {
+		t.Fatalf("SweepStranded: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("SweepStranded removed %d entries, want 2 (both strands, including the one whose id is last-delivered-id)", n)
+	}
+	remaining, err := b.rdb.XRange(ctx, b.Key(), "-", "+").Result()
+	if err != nil {
+		t.Fatalf("XRANGE: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("XLEN after the sweep = %d, want 1 (only the unread entry)", len(remaining))
+	}
+	unread, err := b.Read(ctx, 10)
+	if err != nil || len(unread) != 1 || unread[0].Record.DeliveryID != 3 {
+		t.Fatalf("Read = %+v, %v; want only the unread entry (delivery 3)", unread, err)
+	}
+}
+
+// TestSweepStrandedKeepsEveryPendingAndUnreadEntry runs the sweep's safety
+// property on the package's own test Redis.
+func TestSweepStrandedKeepsEveryPendingAndUnreadEntry(t *testing.T) {
+	b, _ := newTestBuffer(t)
+	assertSweepKeepsPendingAndUnread(t, b)
+}
+
+// TestSweepStrandedTrimsTheLastAckedEntryWhenNothingIsPending runs the bound's +1
+// case on the package's own test Redis.
+func TestSweepStrandedTrimsTheLastAckedEntryWhenNothingIsPending(t *testing.T) {
+	b, _ := newTestBuffer(t)
+	assertSweepTrimsTheLastAckedEntry(t, b)
+}
+
+// TestSweepStrandedAgainstTheRealServer runs both bound cases against the real
+// Redis CI provides (PIGEON_TEST_REDIS_URL), and against miniredis when it is
+// unset - broker_test.go's pattern, so the case is never skipped (and CI fails a
+// run that skips). The sweep is the only destructive command in this package and
+// its safety argument rests on server semantics rather than on this package's
+// code: XINFO GROUPS reporting Pending and last-delivered-id, XPENDING's summary
+// reporting the smallest pending id, and XTRIM MINID not consulting the pending
+// list.
+func TestSweepStrandedAgainstTheRealServer(t *testing.T) {
+	t.Run("pending and unread survive", func(t *testing.T) {
+		assertSweepKeepsPendingAndUnread(t, newSweepBuffer(t))
+	})
+	t.Run("the last acked entry with nothing pending is trimmed", func(t *testing.T) {
+		assertSweepTrimsTheLastAckedEntry(t, newSweepBuffer(t))
+	})
+}
+
+// newSweepBuffer builds a Buffer the way newTestBuffer does - on the real Redis
+// CI provides when PIGEON_TEST_REDIS_URL is set, on a fresh in-process miniredis
+// otherwise. On the shared server the stream gets a key of this test's own, so no
+// other test's entries are in range of the sweep and none are left behind.
+func newSweepBuffer(t *testing.T) *Buffer {
+	t.Helper()
+	key := DefaultKey
+	if addr := os.Getenv("PIGEON_TEST_REDIS_URL"); addr != "" {
+		rdb, err := clientFromURL(addr)
+		if err != nil {
+			t.Fatalf("clientFromURL(%q): %v", addr, err)
+		}
+		key = fmt.Sprintf("%s:test:%s:%d", DefaultKey, strings.ReplaceAll(t.Name(), "/", "-"), time.Now().UnixNano())
+		b, err := New(rdb, Options{Key: key, Consumer: "test-flusher"})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := rdb.Del(context.Background(), key).Err(); err != nil {
+				t.Logf("cleanup: DEL %s: %v", key, err)
+			}
+			_ = rdb.Close()
+		})
+		return b
+	}
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis: %v", err)
+	}
+	t.Cleanup(mr.Close)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	b, err := New(rdb, Options{Key: key, Consumer: "test-flusher"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return b
+}
+
+// TestSweepStrandedIsANoOpOnAnEmptyAndOnASteadyStateBuffer: the sweep must not
+// issue a destructive command when there is nothing stranded, which is the
+// steady state it runs in on every start.
+func TestSweepStrandedIsANoOpOnAnEmptyAndOnASteadyStateBuffer(t *testing.T) {
+	ctx := context.Background()
+	b, _ := newTestBuffer(t)
+
+	n, err := b.SweepStranded(ctx)
+	if err != nil || n != 0 {
+		t.Fatalf("SweepStranded on an empty buffer = %d, %v; want 0, nil", n, err)
+	}
+
+	for i := 1; i <= 2; i++ {
+		if err := b.Push(ctx, rec(int64(i), 1)); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+	entries, err := b.Read(ctx, 10)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("Read = %d entries, %v; want 2", len(entries), err)
+	}
+	// Every entry is pending, so XLEN == pending and nothing can be stranded.
+	n, err = b.SweepStranded(ctx)
+	if err != nil || n != 0 {
+		t.Fatalf("SweepStranded with every entry pending = %d, %v; want 0, nil", n, err)
+	}
+	if got := pendingCount(t, b); got != 2 {
+		t.Fatalf("pending after the sweep = %d, want 2", got)
+	}
+}
+
+// TestNextStreamID pins the bound's arithmetic: the sequence steps first, a full
+// sequence steps the millisecond, and an id that does not parse yields a bound
+// that trims nothing rather than a guess.
+func TestNextStreamID(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"0-0", "0-1"},
+		{"1793179919951-2", "1793179919951-3"},
+		{"1793179919951-18446744073709551615", "1793179919952-0"},
+		{"", "0-1"},
+		{"garbage", "0-1"},
+		{"12-", "0-1"},
+		{"-1", "0-1"},
+	} {
+		if got := nextStreamID(tc.in); got != tc.want {
+			t.Errorf("nextStreamID(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -358,6 +359,117 @@ func (b *Buffer) Ack(ctx context.Context, ids []string) error {
 		return fmt.Errorf("ack and trim %d buffered attempts: %w", len(ids), err)
 	}
 	return nil
+}
+
+// SweepStranded removes entries that have left the pending list but not the
+// stream, and returns how many it removed. It runs once at flusher startup,
+// after the initial reclaim (D-9).
+//
+// A strand is the tear a transaction cannot cover: an acknowledgement applied in
+// halves by a hard kill between the two commands inside MULTI/EXEC, or by a Redis
+// crash whose AOF replay stopped after the XACK. The entry is out of the pending
+// list, where XAUTOCLAIM can never see it again, and out of the unread range,
+// where Read(">") never returns it either. Only XLEN still counts it, for the
+// life of the stream: the queue-depth gauge OBS-9 watches over-reports forever
+// (NFR-6 can never hold again) until somebody trims it by hand. This is that
+// trim, done once per start.
+//
+// The entire safety argument is the bound, because XTRIM does not consult the
+// pending list: every entry below it has been delivered (last-delivered-id only
+// moves forward, and only a read or a claim moves it) and is not pending, so it
+// has already been acknowledged, while every entry at or above it is pending or
+// unread and is kept. The bound is the smallest pending id when anything is
+// pending - anything older than the oldest unacknowledged entry is delivered and
+// not pending, so it is acknowledged - and otherwise the id after the group's
+// last delivery, because with nothing pending every delivered entry has been
+// acknowledged and everything after the last delivery is still unread.
+func (b *Buffer) SweepStranded(ctx context.Context) (int, error) {
+	if err := b.ensureGroup(ctx); err != nil {
+		return 0, err
+	}
+	before, err := b.Depth(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if before == 0 {
+		return 0, nil
+	}
+	groups, err := b.rdb.XInfoGroups(ctx, b.key).Result()
+	if err != nil {
+		return 0, fmt.Errorf("sweep stranded attempt entries: read consumer groups: %w", err)
+	}
+	var group *redis.XInfoGroup
+	for i := range groups {
+		if groups[i].Name == b.group {
+			group = &groups[i]
+			break
+		}
+	}
+	if group == nil {
+		return 0, fmt.Errorf("sweep stranded attempt entries: consumer group %s is not in XINFO GROUPS", b.group)
+	}
+	// XLEN is pending plus unread plus stranded, so XLEN <= pending means there
+	// is neither an unread entry nor a strand. That is the steady state, and it
+	// must not issue a destructive command.
+	if before <= group.Pending {
+		return 0, nil
+	}
+
+	var bound string
+	if group.Pending > 0 {
+		sum, err := b.rdb.XPending(ctx, b.key, b.group).Result()
+		if err != nil {
+			return 0, fmt.Errorf("sweep stranded attempt entries: read the pending summary: %w", err)
+		}
+		bound = sum.Lower
+		if bound == "" {
+			// Never guess an id for a destructive command.
+			return 0, fmt.Errorf("sweep stranded attempt entries: %d pending entries but XPENDING reported no smallest id", group.Pending)
+		}
+	} else {
+		bound = nextStreamID(group.LastDeliveredID)
+	}
+	if _, err := b.rdb.XTrimMinID(ctx, b.key, bound).Result(); err != nil {
+		return 0, fmt.Errorf("sweep stranded attempt entries below %s: %w", bound, err)
+	}
+	after, err := b.Depth(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return int(before - after), nil
+}
+
+// nextStreamID returns the smallest stream id greater than id: the first id an
+// XTRIM MINID bound may keep. A stream id is <ms>-<seq> with both parts compared
+// as unsigned integers, so the sequence steps first and a full sequence steps the
+// millisecond and restarts it. An id that does not parse is treated as 0-0, whose
+// next id trims nothing - the safe answer when the input is not understood.
+func nextStreamID(id string) string {
+	ms, seq, ok := parseStreamID(id)
+	if !ok {
+		return "0-1"
+	}
+	if seq == ^uint64(0) {
+		return fmt.Sprintf("%d-0", ms+1)
+	}
+	return fmt.Sprintf("%d-%d", ms, seq+1)
+}
+
+// parseStreamID splits a stream id into its millisecond and sequence parts.
+func parseStreamID(id string) (ms, seq uint64, ok bool) {
+	dash := strings.IndexByte(id, '-')
+	if dash <= 0 {
+		return 0, 0, false
+	}
+	ms, err := strconv.ParseUint(id[:dash], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	seq, err = strconv.ParseUint(id[dash+1:], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return ms, seq, true
 }
 
 // decode flattens XReadGroup's per-stream shape into entries.
