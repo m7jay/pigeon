@@ -94,7 +94,7 @@ func buildRenderer() (*portalui.Renderer, error) {
 }
 
 // pageNames is the set of page files, each a {{define "content"}} template.
-var pageNames = []string{"login", "invite", "me", "endpoints", "endpoint", "deliveries", "snippet"}
+var pageNames = []string{"login", "invite", "me", "endpoints", "endpoint", "deliveries", "delivery", "problem", "snippet"}
 
 // Handler returns the portal's HTTP surface: assets, then the portal routes.
 func (h *Handler) Handler() http.Handler {
@@ -130,7 +130,14 @@ func (h *Handler) Handler() http.Handler {
 	mux.HandleFunc("POST /endpoints/{id}/subscriptions/{event}/delete", h.requireLogin(h.unsubscribe))
 	mux.HandleFunc("GET /frag/endpoints", h.requireLogin(h.fragEndpoints))
 
-	mux.HandleFunc("GET /deliveries", h.requireLogin(h.deliveries))
+	mux.HandleFunc("GET /deliveries", h.requireLogin(h.deliveryLog))
+	// UI-15's attempt detail. The route is the delivery id alone: the consumer id
+	// is on the session claim, so there is no consumer segment to put in a path.
+	mux.HandleFunc("GET /deliveries/{id}", h.requireLogin(h.deliveryDetail))
+	// UI-16's two steps: the API's dry run (the count and rate the confirmation
+	// states) and the commit, both bounded by the API and neither by the portal.
+	mux.HandleFunc("POST /deliveries/replay/confirm", h.requireLogin(h.deliveryReplayConfirm))
+	mux.HandleFunc("POST /deliveries/replay", h.requireLogin(h.deliveryReplay))
 	// UI-18: the snippet form and its generation are both behind login, and the
 	// secret is posted (never a query parameter), so it stays out of access logs,
 	// browser history and shared links.
@@ -233,6 +240,14 @@ func pullFlash(r *http.Request) (kind, msg string) {
 // coreReq issues a core API request with the caller's session token.
 func (h *Handler) coreReq(r *http.Request, method, path string, body any) (portal.Response, error) {
 	return h.core.Request(r.Context(), h.tokenFromCookie(r), method, path, body)
+}
+
+// coreReqHeaders is coreReq with extra headers: replay's `Idempotency-Key`
+// (FR-1107) is the one core parameter that travels in a header rather than a
+// body field, and the portal passes it through rather than reimplementing it.
+func (h *Handler) coreReqHeaders(r *http.Request, method, path string, body any,
+	headers map[string]string) (portal.Response, error) {
+	return h.core.RequestHeaders(r.Context(), h.tokenFromCookie(r), method, path, body, headers)
 }
 
 // page builds a portalui.Page for a logged-in view.

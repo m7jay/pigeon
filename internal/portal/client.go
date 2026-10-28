@@ -53,6 +53,17 @@ type Response struct {
 // Response, not as an error, so the caller can branch on 404/409/422 exactly as
 // the API defines them.
 func (c *Client) Request(ctx context.Context, token, method, path string, body any) (Response, error) {
+	return c.RequestHeaders(ctx, token, method, path, body, nil)
+}
+
+// RequestHeaders is Request with extra request headers attached. It exists for
+// the one core call that needs a header of its own: a replay is idempotent on
+// FR-1107's request key, which the API reads from the `Idempotency-Key` header
+// (the same place publish takes it, FR-603). The key is the portal's own - the
+// user does not type it - and the API is what enforces it, so this is still a
+// thin client: no replay rule lives here.
+func (c *Client) RequestHeaders(ctx context.Context, token, method, path string, body any,
+	headers map[string]string) (Response, error) {
 	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -67,6 +78,9 @@ func (c *Client) Request(ctx context.Context, token, method, path string, body a
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
