@@ -600,6 +600,99 @@ func TestArchiveLeavesAreTenantIsolated(t *testing.T) {
 	}
 }
 
+// TestRuntimeRoleCannotWriteTheArchive is MT-1 applied to what the archive is FOR.
+// Production grants the runtime role every table privilege through
+// deploy/postgres/01-roles.sql's default privileges, so what has to stop the
+// application from writing `delivery_dedupe` is the policy - and it exists FOR
+// SELECT only, which is deliberate: the copy is the SECURITY DEFINER function's
+// job, and a role that could insert could forge an "already seen" answer, while a
+// role that could delete could erase one (SB-2's "never by DELETE", as a property
+// of the role rather than only of the code).
+func TestRuntimeRoleCannotWriteTheArchive(t *testing.T) {
+	admin := testPool(t)
+	resetRoutingTables(t, admin)
+	app := appPool(t, admin)
+	st := New(app)
+	ctx := context.Background()
+
+	d := seedDedupeDay(t, admin, st, "dedupeforge", time.Now().UTC().AddDate(0, 0, -41))
+	if got, err := st.DropPartition(ctx, "deliveries", d.leaf, retention.DropByAge); err != nil || !got {
+		t.Fatalf("DropPartition(%s) = (%v, %v), want (true, nil)", d.leaf, got, err)
+	}
+
+	// The grant the production roles file would have applied. Granting it here is
+	// what makes the refusals below about the policy rather than about a missing
+	// privilege (a test database has no default privileges).
+	if _, err := admin.Exec(ctx,
+		`grant select, insert, update, delete on delivery_dedupe to `+appRole); err != nil {
+		t.Fatalf("grant the archive to the runtime role: %v", err)
+	}
+
+	// The role can read its own pair, so the grant and the policy are both in force
+	// and a later refusal cannot be read as "no privilege".
+	var readable int
+	if err := db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+		if err := db.SetProducerScope(ctx, tx, d.producerID); err != nil {
+			return err
+		}
+		if err := db.SetEnvScope(ctx, tx, "live"); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `select count(*) from delivery_dedupe where endpoint_id = $1`,
+			d.endpointID).Scan(&readable)
+	}); err != nil {
+		t.Fatalf("scoped read as the runtime role: %v", err)
+	}
+	if readable != 1 {
+		t.Fatalf("the runtime role reads %d of its own archived rows, want 1", readable)
+	}
+
+	// A forged answer: refused, by the policy rather than by the grant. The scope is
+	// set to the caller's own tenant here, so this cannot pass merely because the
+	// writer was scoped out of the row it is trying to touch.
+	err := db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+		if err := db.SetProducerScope(ctx, tx, d.producerID); err != nil {
+			return err
+		}
+		if err := db.SetEnvScope(ctx, tx, "live"); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+			insert into delivery_dedupe (endpoint_id, event_id, first_delivery_id, first_seen_at)
+			values ($1, $2, 999, $3)`, d.endpointID, "evt_forged_by_the_app_role", d.seenAt)
+		return err
+	})
+	if err == nil {
+		t.Fatal("the runtime role inserted into the dedupe archive: an answer can be forged (FR-905)")
+	}
+	if !strings.Contains(err.Error(), "row-level security") {
+		t.Fatalf("the insert was refused for the wrong reason: %v", err)
+	}
+
+	// Erasure: no policy covers DELETE or UPDATE, so either the statement is refused
+	// or it sees no rows - it cannot touch what the support path reads.
+	if tag, err := app.Exec(ctx, `delete from delivery_dedupe`); err == nil && tag.RowsAffected() != 0 {
+		t.Fatalf("the runtime role deleted %d archived rows, want 0 (SB-2, FR-905)", tag.RowsAffected())
+	}
+	if tag, err := app.Exec(ctx, `update delivery_dedupe set first_delivery_id = 1`); err == nil && tag.RowsAffected() != 0 {
+		t.Fatalf("the runtime role updated %d archived rows, want 0 (FR-905)", tag.RowsAffected())
+	}
+	var after int64
+	if err := admin.QueryRow(ctx, `
+		select count(*) from delivery_dedupe where endpoint_id = $1 and event_id = $2`,
+		d.endpointID, d.eventID).Scan(&after); err != nil {
+		t.Fatalf("count the archive: %v", err)
+	}
+	if after != 1 {
+		t.Fatalf("the archive holds %d rows for the pair after a delete by the runtime role, want 1 (SB-2, FR-905)", after)
+	}
+	firstID, seenAt, n := archiveRows(t, admin, d.endpointID, d.eventID)
+	if n != 1 || firstID != d.firstID || !seenAt.UTC().Equal(d.seenAt) {
+		t.Fatalf("the archived answer is now (%d, %s, %d rows), want the original %d / %s / 1 row",
+			firstID, seenAt.UTC().Format(time.RFC3339), n, d.firstID, d.seenAt.Format(time.RFC3339))
+	}
+}
+
 // TestDedupeArchiveIsDroppedByPartitionOnly is SB-2 on FR-905's table, as a static
 // guard because no runtime assertion can cover a statement that does not exist
 // yet: there is no DELETE against the archive in the tree, so the archive leaves
