@@ -235,6 +235,118 @@ kind of split dangerous when done with `ALTER ROLE`.
 - Forward-only. A bad migration is fixed by a new migration; rollback is
   documented per release, not automated.
 
+## S8 decisions — partitioning, retention and the sweeper lease
+
+These are the places S8 (SB-1…SB-8, D-7) had to choose. They are recorded because
+each one changes observable behaviour or closes a destructive failure mode.
+
+**Partitioning is a swap migration, not an in-place `ALTER`.** PostgreSQL cannot
+convert a plain table into a partitioned one. `0012_partitioning.sql` therefore
+renames `deliveries`/`attempts` to `*_legacy`, creates partitioned replacements
+with identical columns and daily range bounds on the UTC day of
+`deliveries.created_at` / `attempts.occurred_at`, copies the rows into per-day
+partitions, and drops the legacy tables — all inside `db.Migrate`'s single
+transaction, so a failure leaves the plain tables untouched. Day boundaries are
+UTC so a partition's contents do not depend on the server's `TimeZone`.
+
+**The dedupe key now includes the partition key.** The first-fan-out arbiter that
+0011 created — `UNIQUE (event_id, endpoint_id) WHERE replay_of_delivery_id IS NULL`
+(A-4) — becomes `UNIQUE (event_id, endpoint_id, created_at) WHERE
+replay_of_delivery_id IS NULL`: a partitioned table's unique index must contain the
+partition key, and the predicate, which *is* the invariant, is kept.
+`attempts` keeps per-partition uniqueness on `(delivery_id, attempt)`. This is a
+behavioural change: FR-704's idempotency now holds *within a day*. It is safe
+because fan-out stamps `deliveries.created_at` from the **event's** `created_at`
+(not `now()`), so re-fanning the same event lands in the same partition and still
+conflicts; a replay row is outside the partial index and may add a second delivery
+for the pair (FR-1106). Fan-out's `ON CONFLICT` target
+(`internal/store/fanout.go`) names the same key and predicate, so the arbiter
+inference matches the index. A defaulted `now()` key would have defeated the
+conflict check — this was verified against real Postgres before the migration was
+written.
+
+**The swap carries what S6 and S7 added, and it runs last on purpose.** The
+partitioning is `0012_partitioning.sql`, after `0010_attempt_buffer.sql` (S6) and
+`0011_s7_inspect_replay.sql` (S7): migrations apply in ascending order, so those two
+see the plain tables and 0012 reconciles the objects the swap would otherwise lose.
+`deliveries.replay_of_delivery_id` loses its self-referencing foreign key and becomes
+a plain provenance column (a partitioned table's referenced key must contain the
+partition key — the same reason `attempts` lost its FK, and dropping the original
+partition still cannot take the replay with it). `deliveries_first_fanout_key` is
+recreated with the partition key and A-4's predicate; `deliveries_event_idx`, the
+`attempts` read policy and the `delivery_dedupe_all` view are recreated.
+`pigeon_record_attempts` (S6's batched evidence insert) is restated with the
+targetless `ON CONFLICT` — a partitioned parent cannot infer a per-partition unique
+index — and creates the day's partition itself, because evidence is stamped `now()`
+and a first attempt just after midnight must not fail on a partition the sweeper has
+not reached. Renumbering rather than editing an applied migration is deliberate:
+`db.Migrate` records a checksum per file, so editing 0010/0011 in place would break
+every database that had already applied them.
+
+**Retention windows are configuration, once.** The merged base carried a second,
+day-granularity set of retention knobs (`PIGEON_RETENTION_*_DAYS`) with no consumer,
+while `retention.Options` takes durations and S6's
+`PIGEON_RETENTION_DELIVERIES/ATTEMPTS/EVENTS` parse them. The duplicates were removed
+rather than kept: one window, one setting. `PIGEON_RETENTION_MAX_DISK_PCT`,
+`PIGEON_DISK_DIR` and `PIGEON_DISK_BYTES` are S8's and unchanged.
+
+**Retention removes whole partitions, never rows.** `DROP TABLE` on a leaf
+partition is the only removal path (SB-2); there is no `DELETE` on either table in
+the retention code. The drop primitives are `SECURITY DEFINER` functions because
+the runtime role owns nothing and must not hold `CREATE` on the schema; they
+validate the table against a closed set, the name against
+`^<table>_[0-9]{8}$`, that the relation really is a leaf of that parent, and that
+the day has fully elapsed. Grants on the partitioned parent are sufficient for the
+runtime role in deployments (default privileges cover partitions created later);
+the test harness's blanket grant does the same for existing partitions.
+
+**Disk pressure is checked before age, and the oldest partition goes first.** When
+the volume is at or above `PIGEON_RETENTION_MAX_DISK_PCT` (default 80), `RunOnce`
+drops exactly one droppable partition per tick — the oldest across both tables —
+and logs at warning level (SB-3). Age windows (`deliveries` 14 d, `attempts` 7 d)
+are enforced only when the volume is under budget. Today's and future partitions
+are never candidates. If the budget is exceeded and nothing is droppable, the
+report sets `KeptOverBudget` and the ingest path sheds; the next tick retries.
+
+**The gauge prefers the filesystem, falls back to database size.** `PIGEON_DISK_DIR`
+(set when core and Postgres share a volume) is read with `statfs`; otherwise usage
+is pigeon's own `pg_database_size` against `PIGEON_DISK_BYTES`. With neither, the
+reading source is `none`, `GET /v1/meta/usage` answers 503, and the ingest gate
+never sheds — a documented degraded mode rather than a fabricated 0%. A failed
+read keeps the last good reading and surfaces `read_error` in the payload, so an
+operator is never shown a calm figure that stopped updating.
+
+**Over budget means shed ingest, not queue it.** While over budget the publish
+path refuses with `429`, `Retry-After: 30`, error code `over_budget`, and increments
+`pigeon_publishes_shed_total` (SB-7); nothing is written for a shed publish. The
+usage payload and the drop/shed counters are admin-only infrastructure telemetry
+(SB-6) — `/v1/meta/usage` and `/metrics` are `kindAdmin`, not tenant routes.
+
+**One sweeper per deployment, and it is also the dropper.** Leadership is the
+session-level advisory lock on a dedicated connection (`sweeperLockID`), taken with
+`pg_try_advisory_lock`; the lock dies with the session, and low TCP keepalives
+bound Postgres' detection of a dead holder to ~12 s, under D-7's 30 s ceiling. A
+replica that does not win stays a **standby that keeps competing** (it does not
+give up after a lock wait — AC-42 needs it alive to take over). The leader
+re-verifies each tick, via `pg_locks` on its own locked connection, that it still
+holds the lock and stands down if it does not, so a dead lease cannot keep
+sweeping. Retention runs on the same lease, so exactly one replica drops
+partitions. As defence in depth the SQL drop primitive takes its own
+transaction-scoped advisory lock with `lock_timeout = 5s`, so no partition drop can
+run concurrently with itself even across processes; a contended drop returns false
+and is retried on the next tick.
+
+**Events retention is reported, not enforced.** `events` is not partitioned yet, so
+the configured `PIGEON_RETENTION_EVENTS_DAYS` window appears in the usage payload
+but no partitions are dropped for it. This is a known gap, not a silent promise.
+
+**SB-6's dashboard half has no dashboard to put it in.** SB-6 asks for the disk
+figure on "the dashboard and `GET /v1/meta/usage`". There is no operator dashboard in
+the tree (the consumer portal is tenant-facing), so the pressure signal ships as the
+admin-only JSON endpoint plus `pigeon_partition_drops_total` and
+`pigeon_publishes_shed_total` on `/metrics`, which an external dashboard or alert
+scrapes. If an operator UI lands later, it reads the same payload.
+
 ## Local toolchain
 
 Go 1.23+ is required. On this build host it is installed at
