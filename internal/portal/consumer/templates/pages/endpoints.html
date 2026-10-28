@@ -21,6 +21,11 @@
   <form method="post" action="/endpoints">
     <div class="form-row"><label for="name">Name</label><input id="name" type="text" name="name" required placeholder="production webhook"></div>
     <div class="form-row"><label for="url">URL</label><input id="url" type="url" name="url" required placeholder="https://you.example.com/hooks"></div>
+    <div class="form-row">
+      <label for="custom_headers">Custom headers</label>
+      <textarea id="custom_headers" name="custom_headers" rows="3" placeholder="X-Api-Key: your-key&#10;X-Tenant: acme"></textarea>
+      <span class="muted">Optional, up to 5, one <span class="mono">Name: value</span> per line. Sent with every delivery to this endpoint. <span class="mono">Host</span>, <span class="mono">Content-Length</span>, <span class="mono">Content-Type</span> and <span class="mono">Authorization</span> are refused (FR-405). Values are stored encrypted and are never shown again (FR-1006), so keep your own copy.</span>
+    </div>
     <button class="btn" type="submit">Register</button>
   </form>
 </div>

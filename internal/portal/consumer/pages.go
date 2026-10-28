@@ -38,6 +38,43 @@ type endpointRow struct {
 	CreatedAt string
 }
 
+// headerRow is one configured custom header as the portal may show it (FR-405,
+// FR-1006): the name, and the mask the API put in place of the value. The portal
+// never sees a plaintext - it renders the mask the API sent, and a value it never
+// received cannot be leaked by a template.
+type headerRow struct {
+	Name  string
+	Value string
+}
+
+// customHeaderInput is one parsed line of the registration form's header field.
+type customHeaderInput struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// parseCustomHeaders reads the registration form's "Name: value" lines. It does
+// the mechanical part only: FR-405's rules (the bound, the forbidden names, the
+// legality of the value) are the API's, applied at registration, so the portal
+// cannot grow a second opinion about what is acceptable. A line with no colon is
+// reported here, because that is a typo the API would report less helpfully as
+// "the name is not a valid HTTP header name".
+func parseCustomHeaders(text string) ([]customHeaderInput, error) {
+	var out []customHeaderInput
+	for i, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, value, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("line %d is not \"Name: value\"", i+1)
+		}
+		out = append(out, customHeaderInput{Name: strings.TrimSpace(name), Value: strings.TrimSpace(value)})
+	}
+	return out, nil
+}
+
 type endpointsView struct {
 	Endpoints []endpointRow
 	Created   *createdView
@@ -73,6 +110,11 @@ type endpointDetail struct {
 	RotatedSecret string
 	// Subs is the subscription panel (UI-14).
 	Subs subsView
+	// CustomHeaders are the endpoint's FR-405 headers as configured: names in the
+	// clear and the API's mask where the value was (FR-1006). There is no way for
+	// this field to hold a value, which is what makes the page redactable by
+	// construction.
+	CustomHeaders []headerRow
 	// AvailableTypes is the set the subscribe control offers: exactly the event
 	// types the producer has left open to public subscription, from
 	// GET /v1/consumer/event-types. Offering a free-text field would offer a control
@@ -314,8 +356,22 @@ func (h *Handler) endpointCreate(w http.ResponseWriter, r *http.Request) {
 		h.renderPage(w, r, "endpoints", "Your endpoints", "endpoints", endpointsView{})
 		return
 	}
-	resp, err := h.coreReq(r, http.MethodPost, "/v1/consumer/endpoints",
-		map[string]string{"name": name, "url": url})
+	// FR-405: the headers field is parsed here and validated by the API, which
+	// owns the rules. A typo in the field itself is the portal's to report.
+	headers, err := parseCustomHeaders(r.FormValue("custom_headers"))
+	if err != nil {
+		// A malformed field is the one thing the API cannot describe usefully, so
+		// the portal reports it - then redirects, because a flash set on a response
+		// is only rendered after the browser sends it back on the next request.
+		h.setFlash(w, "error", "Custom headers: "+err.Error())
+		http.Redirect(w, r, "/endpoints", http.StatusSeeOther)
+		return
+	}
+	body := map[string]any{"name": name, "url": url}
+	if len(headers) > 0 {
+		body["custom_headers"] = headers
+	}
+	resp, err := h.coreReq(r, http.MethodPost, "/v1/consumer/endpoints", body)
 	if err != nil {
 		http.Error(w, "cannot reach the API", http.StatusBadGateway)
 		return
@@ -333,8 +389,13 @@ func (h *Handler) endpointCreate(w http.ResponseWriter, r *http.Request) {
 		}}
 		h.renderPageStatus(w, r, http.StatusOK, "endpoints", "Your endpoints", "endpoints", view)
 	default:
-		// 422 (SSRF-blocked URL), 409, etc. Re-render with the API's reason.
-		h.renderPageStatus(w, r, http.StatusOK, "endpoints", "Your endpoints", "endpoints", endpointsView{})
+		// 422 (an SSRF-blocked URL, or FR-405's refusal of a header name), 409, etc.
+		// The API's reason is what the user has to act on, and it never quotes a
+		// header value (FR-1006). It travels in the flash cookie, which the browser
+		// sends back on the redirect below, so it actually renders - a flash set and
+		// read in the same response would be silently dropped.
+		h.setFlash(w, "error", coreErrorMessage(resp))
+		http.Redirect(w, r, "/endpoints", http.StatusSeeOther)
 	}
 }
 
@@ -366,11 +427,18 @@ func (h *Handler) endpointDetailView(w http.ResponseWriter, r *http.Request, id 
 		ID, Name, URL, Status, CreatedAt string
 		Verified                         bool
 		NotificationEmail                *string `json:"notification_email"`
+		CustomHeaders                    []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		} `json:"custom_headers"`
 	}
 	_ = json.Unmarshal(resp.Body, &ep)
 	detail := endpointDetail{
 		ID: ep.ID, Name: ep.Name, URL: ep.URL, Status: ep.Status,
 		Verified: ep.Verified, Paused: ep.Status == "paused", CreatedAt: ep.CreatedAt,
+	}
+	for _, h := range ep.CustomHeaders {
+		detail.CustomHeaders = append(detail.CustomHeaders, headerRow{Name: h.Name, Value: h.Value})
 	}
 	if ep.NotificationEmail != nil {
 		detail.NotificationEmail = *ep.NotificationEmail
