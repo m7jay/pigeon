@@ -969,12 +969,17 @@ behaviour: `Flusher.insert` acknowledged on the pass's own context - the one `Ru
   group's own bookkeeping on the same live connection at each sweep, an entry still in flight is
   pending and so anchors the bound below itself, and every sweep keeps everything at or above the
   bound it computed. A strand is an anomaly - it means a retirement was torn - so what the sweep
-  removes is logged at warn, with the count.
+  removes is logged at warn, with the count, and a sweep that removed anything also records the
+  depth it left (`Flusher.depth`). That second half is not incidental: the trim moves `XLEN` with no
+  insert behind it, so without it the gauge OBS-9 reads keeps the skewed depth until some later
+  batch commits - on an idle process, forever.
 - The three failure shapes are each closed: a graceful SIGTERM can no longer revoke a retirement
   (the bounded context); a hard kill or a dropped connection mid-retirement cannot leave half of one
   (the transaction); and a Redis-side tear that splits the transaction anyway - a SIGKILL between
   the two commands inside `EXEC`, or a crash whose AOF replay stops after the `XACK` - is repaired
-  by the sweep, which is also when the gauge it skewed is corrected. The cadence is what makes that
+  by the sweep, which is also when the gauge it skewed is corrected - the sweep records the depth it
+  left behind, because a trim moves `XLEN` with no insert behind it and the gauge would otherwise
+  keep the skew until the next batch. The cadence is what makes that
   repair unconditional: the bound is wherever the pending list puts it at each sweep, so a strand a
   start's own sweep had to leave - because an older entry was still pending and held the bound below
   it - is retired by a later sweep in the same process, once the retry has retired that entry.
@@ -1000,9 +1005,12 @@ batch and bumps the conflict counter, and the stream grows behind it. `XTRIM`/`M
 a bound on the stream is worse: trimming does not consult the pending list, so it drops entries
 nobody has read - the evidence loss that `XADD` → read → commit exists to prevent. What the sweep
 accepts is one cadence of latency, for two strand shapes. A strand created after this process swept
-is seen by the next sweep in the same process - at most `StaleAfter` later, which is the interval a
-peer's untouched pending batch gets before the flusher takes it over anyway - and logged at warn
-there, rather than never until the next start. A strand already in the stream, newer than the oldest
+is seen by the next sweep in the same process - at most `StaleAfter` later - and logged at warn
+there, rather than never until the next start. That sweep retires it when nothing older is pending;
+when something older is pending it holds the bound down, so the strand waits for that entry's own
+retirement - up to `StaleAfter` of it when the entry is a peer's untouched batch that only the stale
+reclaim takes over - plus the sweep that follows: the two-interval worst case D-9 scopes. A strand
+already in the stream, newer than the oldest
 pending entry at that sweep - the shape a single sweep cannot reach at all - needs a sweep whose
 bound has moved up: the startup reclaim's insert or its retirement can fail (a Redis or Postgres
 hiccup, an `AckTimeout` expiry), which leaves the entry it holds pending while that start's sweep
@@ -1010,12 +1018,17 @@ runs, and the retry retires it a moment after the sweep has gone. Measured again
 (throwaway probe, miniredis, `fbebd60`): in that state the live process reads `XLEN = 1` with
 `pending = 0`, `Reclaim(min-idle 0)` and `Read(">")` both return 0 entries, and a second sweep -
 which that `Run` never issued - retires it (`removed = 1`). With the cadence that second sweep is
-the loop's, so the strand costs at most one pending-batch interval of an inflated
-`AttemptBufferPending` instead of the process's life - which is what NFR-6's ten-minute return to
-baseline needs - and the retire is logged rather than silent.
+the loop's, so the strand costs one pending-batch interval of an inflated `AttemptBufferPending` in
+this state - the retry retires the entry holding the bound down within `FailBackoff`, and the sweep
+that follows is at most one `StaleAfter` away - instead of the process's life, which is what NFR-6's
+ten-minute return to baseline needs. It is two intervals in the worst case, when the bound-holder is
+a peer's untouched batch and only the stale reclaim takes it over; either way the retire is logged
+rather than silent.
 `internal/attemptbuf`'s `TestStrandAboveTheBoundIsRetiredByALaterSweep` pins it end to end through
-`Run`: while the run is live and after it settles, `Depth() == 0` with an empty pending set, and
-every record inserted exactly once.
+`Run`: while the run is live and after it settles, `Depth() == 0` with an empty pending set and
+`AttemptBufferPending` back at 0 - read at each `XTRIM` the run issues, so the trim that retired the
+strand is what returned the gauge to baseline rather than a later insert - and every record inserted
+exactly once.
 
 What the cadence does not do is reach a strand directly, and that is deliberate: the bound stays
 what keeps the trim off an entry nobody has acknowledged, so an entry above it is retired only once
