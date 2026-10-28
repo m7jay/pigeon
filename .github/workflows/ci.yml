@@ -140,6 +140,15 @@ jobs:
             TestConsumerPortalSelfService \
             TestConsumerPortalForeignResourcesAreNotFound \
             TestConsumerPortalSubscribableGate \
+            TestConsumerPortalDeliveryLogEndToEnd \
+            TestConsumerDeliveryLogListsItsOwnConsumer \
+            TestConsumerDeliveryLogShowsTheAPIsOwnRefusalOfAFilter \
+            TestConsumerDeliveryLogNeverNamesAConsumer \
+            TestConsumerDeliveryDetailShowsResponseBodies \
+            TestDeliveryDetailRendersTheEffectiveAttemptNotAnEmptyTrail \
+            TestForeignDeliveryIsNotFoundFromThePortal \
+            TestConsumerReplayIsConfirmedByTheAPIsOwnCountAndRate \
+            TestConsumerReplayShowsTheAPIsBoundWhereTheUserActed \
             TestCoreDoesNotDependOnThePortal \
             TestRetryThenDelivered \
             TestTerminalFailureOn404 \
