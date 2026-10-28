@@ -19,6 +19,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -110,6 +112,13 @@ type Store struct {
 	// PIGEON_DELIVERY_MAX_BODY_BYTES through WithAttemptBodyCap so the cap is a
 	// setting rather than a constant.
 	attemptBodyCap int
+
+	// ensured caches which daily partitions this process has already confirmed
+	// exist, so fan-out does not call the partition DDL primitive once per event
+	// (SB-1). Entries expire quickly; the sweeper keeps partitions created ahead,
+	// so a miss here is the rare backlog case, not the common path.
+	ensureMu sync.Mutex
+	ensured  map[string]time.Time
 }
 
 // DefaultAttemptBodyCap is SB-4's default per-row cost control: the first 2 KB
@@ -128,7 +137,7 @@ func WithAttemptBodyCap(n int) Option {
 
 // New wraps a pool. A nil pool is a programming error, not a runtime condition.
 func New(pool *pgxpool.Pool, opts ...Option) *Store {
-	s := &Store{pool: pool, attemptBodyCap: DefaultAttemptBodyCap}
+	s := &Store{pool: pool, attemptBodyCap: DefaultAttemptBodyCap, ensured: map[string]time.Time{}}
 	for _, o := range opts {
 		o(s)
 	}
