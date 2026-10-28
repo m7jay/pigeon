@@ -99,6 +99,13 @@ func (w *Worker) deliver(ctx context.Context, req signedRequest, maxConns, maxBo
 	httpReq.Header.Set(headerWebhookID, req.webhookID)     // FR-1001
 	httpReq.Header.Set(headerWebhookTime, req.webhookTime) // FR-1001
 	httpReq.Header.Set(headerWebhookSig, req.webhookSig)   // FR-1001
+	// FR-405: the endpoint's own headers, after the platform's. Set (not Add) so a
+	// name can appear once; the registration path refuses the platform's names and
+	// duplicates, so a custom entry can neither overwrite a signature header nor
+	// silently become two headers on the wire.
+	for _, h := range req.customHeaders {
+		httpReq.Header.Set(h.Name, h.Value)
+	}
 
 	start := time.Now()
 	resp, err := w.clients.clientFor(req.endpointID, maxConns).Do(httpReq)

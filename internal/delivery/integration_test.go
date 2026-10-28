@@ -98,6 +98,15 @@ func testOptions(timeout, backoffBase, backoffMax time.Duration) Options {
 // id, the endpoint's plaintext signing secret (FR-1001), and the delivery id.
 func seedHarness(t *testing.T, st *store.Store, admin *pgxpool.Pool, url string) (eventID, secret string, deliveryID int64) {
 	t.Helper()
+	return seedHarnessWithHeaders(t, st, admin, url, nil)
+}
+
+// seedHarnessWithHeaders is seedHarness with FR-405 headers on the endpoint, for
+// the tests that assert on what a delivery puts on the wire and on what a failed
+// decrypt drops (FR-1006). The list is sealed by the store's own write path, so a
+// test never has to know how the value is encrypted.
+func seedHarnessWithHeaders(t *testing.T, st *store.Store, admin *pgxpool.Pool, url string, headers []store.CustomHeader) (eventID, secret string, deliveryID int64) {
+	t.Helper()
 	ctx := context.Background()
 	if _, err := admin.Exec(ctx,
 		`truncate table events, outbox, event_types, consumers, endpoints, subscriptions, deliveries cascade`); err != nil {
@@ -125,6 +134,7 @@ func seedHarness(t *testing.T, st *store.Store, admin *pgxpool.Pool, url string)
 	}
 	created, err := st.CreateEndpoint(ctx, sc, store.NewEndpoint{
 		ConsumerID: con.ID, Name: "e1", URL: url, Internal: true, // internal: allow the loopback httptest URL
+		CustomHeaders: headers,
 	})
 	if err != nil {
 		t.Fatalf("CreateEndpoint: %v", err)
