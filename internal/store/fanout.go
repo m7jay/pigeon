@@ -71,18 +71,28 @@ func (s *Store) FanOutEvent(ctx context.Context, sc Scope, eventID string) (FanO
 		// Read the event under the caller's scope: a foreign event id is ErrNotFound
 		// (FR-108), and the routing fields are what fan-out intersects.
 		var routingMode, eventType, consumerRef string
+		var eventAt time.Time
 		if err := tx.QueryRow(ctx, `
-			select routing_mode, event_type, coalesce(consumer_ref, '')
+			select routing_mode, event_type, coalesce(consumer_ref, ''), created_at
 			from events
 			where producer_id = $1 and env = $2 and id = $3`,
 			sc.ProducerID, sc.Env, eventID,
-		).Scan(&routingMode, &eventType, &consumerRef); err != nil {
+		).Scan(&routingMode, &eventType, &consumerRef, &eventAt); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrNotFound
 			}
 			return err
 		}
 		result.RoutingMode = routingMode
+
+		// SB-1/FR-704: deliveries are partitioned by day and stamped with the
+		// EVENT's day, so a retried fan-out lands in the same partition and still
+		// conflicts on (event_id, endpoint_id, created_at). The partition for that
+		// day is created before the insert; the cached check costs nothing on the
+		// normal path because the sweeper creates partitions ahead.
+		if err := s.EnsurePartitionCached(ctx, "deliveries", eventAt); err != nil {
+			return err
+		}
 
 		// Broadcast events carry no consumer (§7.5a). The M0 endpoint model is a
 		// consumer-owned endpoint, so there is nothing to intersect; broadcast
@@ -139,12 +149,12 @@ func (s *Store) FanOutEvent(ctx context.Context, sc Scope, eventID string) (FanO
 			}
 		}
 
-		if n, err := insertDeliveries(ctx, tx, sc, eventID, consumerID, deliverable); err != nil {
+		if n, err := insertDeliveries(ctx, tx, sc, eventID, consumerID, eventAt, deliverable); err != nil {
 			return err
 		} else {
 			result.Deliveries = n
 		}
-		if n, err := insertSkippedDeliveries(ctx, tx, sc, eventID, consumerID, result.Skipped); err != nil {
+		if n, err := insertSkippedDeliveries(ctx, tx, sc, eventID, consumerID, eventAt, result.Skipped); err != nil {
 			return err
 		} else {
 			// Skipped rows are terminal; they advance nothing but the record.
@@ -201,17 +211,17 @@ func queryFanOutMatches(ctx context.Context, tx pgx.Tx, sc Scope, eventType, con
 // (event_id, endpoint_id) DO NOTHING makes a re-fan-out a no-op (FR-704). Returns
 // how many rows were actually inserted (0 on a replay,
 // when every row already exists), which the caller reports as the delivery count.
-func insertDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, consumerID string, endpoints []string) (int, error) {
+func insertDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, consumerID string, eventAt time.Time, endpoints []string) (int, error) {
 	if len(endpoints) == 0 {
 		return 0, nil
 	}
 	res, err := tx.Exec(ctx, `
 		insert into deliveries
-			(event_id, endpoint_id, producer_id, env, consumer_id, status, lease_expires_at)
-		select $1, ep, $2, $3, $4, 'pending', now()
+			(event_id, endpoint_id, producer_id, env, consumer_id, status, lease_expires_at, created_at)
+		select $1, ep, $2, $3, $4, 'pending', now(), $6
 		from unnest($5::text[]) as ep
-		on conflict (event_id, endpoint_id) where replay_of_delivery_id is null do nothing`,
-		eventID, sc.ProducerID, sc.Env, consumerID, endpoints)
+		on conflict (event_id, endpoint_id, created_at) where replay_of_delivery_id is null do nothing`,
+		eventID, sc.ProducerID, sc.Env, consumerID, endpoints, eventAt)
 	if err != nil {
 		return 0, fmt.Errorf("insert deliveries: %w", err)
 	}
@@ -220,7 +230,7 @@ func insertDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, consume
 
 // insertSkippedDeliveries batch-inserts the skipped (matched-but-undeliverable)
 // rows with their endpoint-level reason, same batching and idempotency rules.
-func insertSkippedDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, consumerID string, skipped []SkippedDelivery) (int, error) {
+func insertSkippedDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, consumerID string, eventAt time.Time, skipped []SkippedDelivery) (int, error) {
 	if len(skipped) == 0 {
 		return 0, nil
 	}
@@ -238,11 +248,11 @@ func insertSkippedDeliveries(ctx context.Context, tx pgx.Tx, sc Scope, eventID, 
 	// the FR-508 metric label derived from it.
 	res, err := tx.Exec(ctx, `
 		insert into deliveries
-			(event_id, endpoint_id, producer_id, env, consumer_id, status, non_delivery_reason, lease_expires_at)
-		select $1, x.endpoint_id, $2, $3, $4, 'skipped', x.reason, null
+			(event_id, endpoint_id, producer_id, env, consumer_id, status, non_delivery_reason, lease_expires_at, created_at)
+		select $1, x.endpoint_id, $2, $3, $4, 'skipped', x.reason, null, $7
 		from unnest($5::text[], $6::text[]) as x(endpoint_id, reason)
-		on conflict (event_id, endpoint_id) where replay_of_delivery_id is null do nothing`,
-		eventID, sc.ProducerID, sc.Env, consumerID, endpoints, reasons)
+		on conflict (event_id, endpoint_id, created_at) where replay_of_delivery_id is null do nothing`,
+		eventID, sc.ProducerID, sc.Env, consumerID, endpoints, reasons, eventAt)
 	if err != nil {
 		return 0, fmt.Errorf("insert skipped deliveries: %w", err)
 	}
