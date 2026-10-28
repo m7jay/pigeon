@@ -295,3 +295,134 @@ func TestDialPingsTheServer(t *testing.T) {
 		t.Fatalf("Dial returned the context error instead of a ping failure: %v", err)
 	}
 }
+
+// ackPipelineHook records the command names of every pipeline go-redis sends.
+// That is the only observable seam the transaction has: a tear between two
+// commands cannot be injected without a special Redis, so the mechanism - one
+// pipeline carrying both commands, in order - is what the test asserts.
+type ackPipelineHook struct {
+	mu        sync.Mutex
+	pipelines [][]string
+}
+
+func (h *ackPipelineHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *ackPipelineHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+
+func (h *ackPipelineHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		names := make([]string, 0, len(cmds))
+		for _, c := range cmds {
+			names = append(names, c.Name())
+		}
+		h.mu.Lock()
+		h.pipelines = append(h.pipelines, names)
+		h.mu.Unlock()
+		return next(ctx, cmds)
+	}
+}
+
+// seen copies the recorded pipelines, so a test reads them without holding the
+// hook's lock.
+func (h *ackPipelineHook) seen() [][]string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([][]string, len(h.pipelines))
+	copy(out, h.pipelines)
+	return out
+}
+
+// pendingCount is XPENDING's summary count: the entries the group holds as
+// unacknowledged. Tests assert it separately from XLEN, because the two
+// disagreeing is exactly the strand this package must not produce.
+func pendingCount(t *testing.T, b *Buffer) int64 {
+	t.Helper()
+	sum, err := b.rdb.XPending(context.Background(), b.Key(), b.group).Result()
+	if err != nil {
+		t.Fatalf("XPENDING: %v", err)
+	}
+	return sum.Count
+}
+
+// TestAckIsOneTransaction: the retirement is ONE transaction - multi, xack, xdel,
+// exec, in that order - and it leaves nothing behind (D-9). Two sequential
+// commands do not appear as a pipeline at all, and the window between them is the
+// strand no recovery path in this package can reach.
+func TestAckIsOneTransaction(t *testing.T) {
+	ctx := context.Background()
+	b, _ := newTestBuffer(t)
+	hook := &ackPipelineHook{}
+	b.rdb.AddHook(hook)
+
+	for i := 1; i <= 2; i++ {
+		if err := b.Push(ctx, rec(int64(i), 1)); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+	entries, err := b.Read(ctx, 10)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("Read = %d entries, %v; want 2", len(entries), err)
+	}
+
+	if err := b.Ack(ctx, IDs(entries)); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+
+	pipelines := hook.seen()
+	if len(pipelines) != 1 {
+		t.Fatalf("Ack sent %d pipelines, want exactly 1 carrying both commands: %v", len(pipelines), pipelines)
+	}
+	want := []string{"multi", "xack", "xdel", "exec"}
+	if len(pipelines[0]) != len(want) {
+		t.Fatalf("the retire pipeline carried %v, want %v", pipelines[0], want)
+	}
+	for i, name := range want {
+		if pipelines[0][i] != name {
+			t.Fatalf("the retire pipeline carried %v, want %v (the xack precedes the xdel)", pipelines[0], want)
+		}
+	}
+	if got := pendingCount(t, b); got != 0 {
+		t.Fatalf("pending after the ack = %d, want 0", got)
+	}
+	if depth, err := b.Depth(ctx); err != nil || depth != 0 {
+		t.Fatalf("XLEN after the ack = %d, %v; want 0", depth, err)
+	}
+}
+
+// TestAckCancelledBeforeTheTransactionAppliesNothing: a context already cancelled
+// when the retire is attempted applies NEITHER command, so the entry stays pending
+// AND in the stream. The failed retire leaves the batch recoverable, which a
+// half-applied one would not: D-9 is both-or-neither in both directions.
+func TestAckCancelledBeforeTheTransactionAppliesNothing(t *testing.T) {
+	ctx := context.Background()
+	b, _ := newTestBuffer(t)
+	if err := b.Push(ctx, rec(1, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	entries, err := b.Read(ctx, 10)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("Read = %d entries, %v; want 1", len(entries), err)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	err = b.Ack(cancelled, IDs(entries))
+	if err == nil {
+		t.Fatal("Ack on a cancelled context returned nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Ack returned %v, want a context.Canceled error", err)
+	}
+	if got := pendingCount(t, b); got != 1 {
+		t.Fatalf("pending after the cancelled ack = %d, want 1 (nothing may be acked)", got)
+	}
+	if depth, err := b.Depth(ctx); err != nil || depth != 1 {
+		t.Fatalf("XLEN after the cancelled ack = %d, %v; want 1 (nothing may be trimmed)", depth, err)
+	}
+	// Still the flusher's to hand back: reclaim with no idle requirement finds
+	// it, which is what makes a failed retire a delay rather than a loss.
+	reclaimed, err := b.Reclaim(ctx, 10, 0)
+	if err != nil || len(reclaimed) != 1 {
+		t.Fatalf("Reclaim(0) = %d entries, %v; want the entry still pending", len(reclaimed), err)
+	}
+}

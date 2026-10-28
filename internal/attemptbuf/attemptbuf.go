@@ -322,23 +322,33 @@ func (b *Buffer) Reclaim(ctx context.Context, count int, minIdle time.Duration) 
 	return decodeMessages(msgs), nil
 }
 
-// Ack retires entries from the pending list and removes them from the stream.
-// It is called only after the Postgres transaction has committed, so an entry is
+// Ack retires entries from the pending list and removes them from the stream. It
+// is called only after the Postgres transaction has committed, so an entry is
 // never retired before the row exists. A duplicate ack (two flushers that
 // reclaimed the same batch) is a no-op in Redis.
+//
+// The two commands ride one MULTI/EXEC, so a cancellation or a dropped
+// connection applies both or neither (D-9). That matters in one direction only:
+// an entry acked without its removal has left the pending list, where no reclaim
+// can reach it, and only XLEN - the depth gauge OBS-9 watches - still counts it,
+// for the life of the stream. Removing the acked entries is what keeps the
+// stream from growing without bound, and it costs a peer that still holds one of
+// these ids in its pending list nothing: the peer already re-inserted the row
+// (the unique (delivery_id, attempt) key makes that a no-op) and its XAck of a
+// deleted id answers 0 rather than failing.
 func (b *Buffer) Ack(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	if err := b.rdb.XAck(ctx, b.key, b.group, ids...).Err(); err != nil {
-		return fmt.Errorf("ack %d buffered attempts: %w", len(ids), err)
-	}
-	// Remove the acked entries so the stream does not grow without bound. A peer
-	// that still holds one of these ids in its pending list is unaffected: it
-	// already re-inserted the row (the unique (delivery_id, attempt) key makes
-	// that a no-op) and its XAck of a deleted id answers 0 rather than failing.
-	if err := b.rdb.XDel(ctx, b.key, ids...).Err(); err != nil {
-		return fmt.Errorf("trim %d acked attempt entries: %w", len(ids), err)
+	// TxPipelined is MULTI/EXEC: both commands are queued, sent together, and
+	// applied by the server in one transaction, in this order.
+	_, err := b.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.XAck(ctx, b.key, b.group, ids...)
+		pipe.XDel(ctx, b.key, ids...)
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("ack and trim %d buffered attempts: %w", len(ids), err)
 	}
 	return nil
 }
