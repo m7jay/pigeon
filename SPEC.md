@@ -952,11 +952,11 @@ behaviour: `Flusher.insert` acknowledged on the pass's own context - the one `Ru
   `removed = 1`, `XLEN` 4 → 3, `XRANGE` at its id empty, and `Reclaim(min-idle 0)` then returned
   nothing to re-insert. A bound too high is therefore not a larger trim but silent evidence loss, and
   the id it takes stays in the PEL as a dangling reference (`XPENDING` counts an entry `XRANGE` can
-  no longer return) until a reclaim scan clears the reference without recovering a record. Every entry
-  below the bound has been delivered (`last-delivered-id` only moves forward, and only a read or a
-  claim moves it) and is not pending, so it has already been acknowledged; entries at or above it are
-  pending or not yet read, and are kept. A strand is an anomaly - it means a retirement was torn - so
-  what the sweep removes is logged at warn, with the count.
+  no longer return) until a reclaim scan clears the reference without recovering a record. Every
+  entry below the bound has been delivered (`last-delivered-id` only moves forward, and only a read
+  or a claim moves it) and is not pending, so it has already been acknowledged; entries at or above it
+  are pending or not yet read, and are kept. A strand is an anomaly - it means a retirement was torn -
+  so what the sweep removes is logged at warn, with the count.
 - The three failure shapes are each closed: a graceful SIGTERM can no longer revoke a retirement (the
   bounded context); a hard kill or a dropped connection mid-retirement cannot leave half of one (the
   transaction); and a Redis-side tear that splits the transaction anyway - a SIGKILL between the two
@@ -979,11 +979,11 @@ durable.
 Two alternatives are rejected outright. Retaining the batch in `f.stuck` after a failed
 acknowledgement would let one unackable batch stall the whole evidence path: `readBatch` returns the
 retry slot first, so nothing new is read while Redis is unhappy, every retry re-inserts a committed
-batch and bumps the conflict counter, and the stream grows behind it. `XTRIM`/`MAXLEN` on `Push` as a
-bound on the stream is worse: trimming does not consult the pending list, so it drops entries nobody
-has read - the evidence loss that `XADD` → read → commit exists to prevent. What the sweep accepts is
-the one shape left: a strand created after startup waits for the next start, where the operator sees
-it as a warn line rather than never.
+batch and bumps the conflict counter, and the stream grows behind it. `XTRIM`/`MAXLEN` on `Push` as
+a bound on the stream is worse: trimming does not consult the pending list, so it drops entries
+nobody has read - the evidence loss that `XADD` → read → commit exists to prevent. What the sweep
+accepts is the one shape left: a strand created after startup waits for the next start, where the
+operator sees it as a warn line rather than never.
 
 **Encoded by.** D-9 (added), §6's attempt-evidence row (the acknowledgement after the commit is one
 transaction and is not revocable by the cancellation that ends a pass), §19's decision row;
