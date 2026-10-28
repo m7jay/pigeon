@@ -382,6 +382,12 @@ func TestNoSecretAppearsInAnyRendering(t *testing.T) {
 	for _, tc := range []struct{ in, want, never string }{
 		{"postgres://u:p@h/db", "postgres://u:REDACTED@h/db", "p"},
 		{"redis://h:6379", "redis://h:6379", ""},
+		// The documented form of PIGEON_REDIS_URL (docs/load-test.md's launcher,
+		// .env.example) is a bare host:port. It is not a URL at all, and it
+		// cannot carry userinfo, so AC-22's message must still name it: a
+		// withheld address is the one thing the operator needs to see.
+		{"127.0.0.1:6399", "127.0.0.1:6399", ""},
+		{"localhost:6379", "localhost:6379", ""},
 		{"not a url ://%%%", "(unparseable url, contents withheld)", ""},
 		{"", "(unset)", ""},
 	} {

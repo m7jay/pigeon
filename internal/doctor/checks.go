@@ -511,12 +511,23 @@ func (d Deps) redacted(raw string) string {
 // Redact strips userinfo from a URL, keeping the shape an operator needs to see
 // (the host, the port, the database) and nothing they must not. It is exported so
 // the command's own output path can reuse it.
+//
+// A bare `host:port` - the documented form of PIGEON_REDIS_URL - is not a URL at
+// all: `url.Parse` reads it as an opaque URL whose scheme starts with a digit,
+// which is invalid ("first path segment in URL cannot contain colon"), so the
+// parse fails on every healthy Redis line. That shape cannot carry userinfo
+// (there is no `@`), so withholding it would cost the operator exactly the
+// address AC-22's actionable message needs. Anything carrying a `://` or an `@`
+// is withheld instead: those are the shapes a password hides in.
 func Redact(raw string) string {
 	if raw == "" {
 		return "(unset)"
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
+		if !strings.Contains(raw, "://") && !strings.Contains(raw, "@") {
+			return raw
+		}
 		return "(unparseable url, contents withheld)"
 	}
 	if u.User != nil {
