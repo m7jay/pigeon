@@ -20,7 +20,7 @@ configurable down to 0, SB-4).
 |---|---|---|---|
 | `deliveries` | ~200 B (ids, event type, endpoint, state, timestamps) | event type, URL, headers copied per subscription | **≈ 400 B** |
 | `attempts` | ~150 B (ids, lease, status, timestamps) | response body, first 2 KB | **≈ 300 B** |
-| `delivery_dedupe` (the dedupe archive) | **≈ 200 B** (24 B tuple header, three 26-character text ids, one `timestamptz`, plus the primary-key btree entry) | — one row per `(endpoint, event)` pair, no payload | **≈ 200 B** |
+| `delivery_dedupe` (the dedupe archive) | **≈ 200 B** (24 B tuple header, two 26-character text ids, the bigint delivery id and a `timestamptz`, plus the primary-key btree entry) | — one row per `(endpoint, event)` pair, no payload | **≈ 200 B** |
 | `events` (not partitioned yet) | ~150 B | payload (bounded by the ingest limit) | ≈ 300 B + payload |
 
 A successful first attempt writes **no attempt row** (§8.1), so the common case is
