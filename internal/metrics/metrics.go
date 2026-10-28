@@ -52,7 +52,11 @@ const (
 	// FlushBatches counts flush transactions (the denominator of FR-815's rows
 	// per transaction, which is what the batching claim is about).
 	FlushBatches = "pigeon_attempt_flush_batches_total"
-	// FlushErrors counts flush attempts that failed; the batch stays in Redis.
+	// FlushErrors counts flush attempts that failed. A failed insert left the
+	// batch pending in Redis; a failed retirement left a batch whose rows are
+	// already committed and whose entries stay pending until the stale reclaim
+	// window. Either way nothing was lost, and the wrapped error says which half
+	// it was.
 	FlushErrors = "pigeon_attempt_flush_errors_total"
 	// SuccessLogsEmitted and SuccessLogsSuppressed are LOG-2's own accounting:
 	// the emitted/suppressed split is the evidence that the bound held.
