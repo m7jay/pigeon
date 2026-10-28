@@ -1206,16 +1206,22 @@ func TestFR1207ResumeExtendsThePromisedWindow(t *testing.T) {
 	if !out.Resumed {
 		t.Fatal("resume reported no transition on a paused subscription (FR-1205)")
 	}
+	if out.PausedFor < paused {
+		t.Errorf("the resume reported a %s pause, want at least the %s the scope was paused for: the period it added back has to be the one it recorded",
+			out.PausedFor, paused)
+	}
 	resumedAt := time.Now()
 
+	// The window is the promise plus the pause ONCE, measured against the period
+	// the resume RECORDED. The 30 s ceiling this replaces could not see a pause
+	// added twice (300 ms of it on this clock), which is one of the two shapes
+	// FR-1207 forbids; the other, a deadline derived from the resume rather than
+	// from the promise, lands about one pause short (t_3218398e).
+	want := time.Hour + out.PausedFor
 	used := f.retryDeadline(t, deliveryID).Sub(created)
-	if used < time.Hour+paused/2 {
-		t.Errorf("the resume granted a %s window, want the promised 1 h plus the %s pause: extending from the resume instead of from the promise is what consumes a held delivery's window (FR-1207)",
-			used, paused)
-	}
-	if used > time.Hour+30*time.Second {
-		t.Errorf("the resume granted a %s window, want the promised 1 h plus the pause: the paused period must be added once, not twice (and the base must be the promise, not the resume)",
-			used)
+	if used < want-2*time.Millisecond || used > want+2*time.Millisecond {
+		t.Errorf("the resume granted a %s window, want the promised 1 h plus the %s pause it recorded, added once (FR-1207)",
+			used, out.PausedFor)
 	}
 	// The schedule a never-scheduled row does not have is not invented: the row is
 	// claimable at the resume rather than one pause later.
@@ -1285,20 +1291,26 @@ func TestFR1207EndpointResumeExtendsThePromisedWindow(t *testing.T) {
 	if !out.Resumed {
 		t.Fatal("resume reported no transition on a paused endpoint (FR-1205)")
 	}
+	if out.PausedFor < paused {
+		t.Errorf("the resume reported a %s pause, want at least the %s the scope was paused for: the period it added back has to be the one it recorded",
+			out.PausedFor, paused)
+	}
 	resumedAt := time.Now()
 
-	// The window is the promise plus the pause ONCE. Both bounds sit inside one
-	// pause of the expected value on purpose: a resume that derives the deadline
-	// from now() grants about one pause (the old pigeon_resume_endpoint shape),
-	// and one that adds the paused period twice lands past the upper bound.
+	// The window is the promise plus the pause ONCE, and the pause is the period
+	// the resume RECORDED rather than the constant slept above: the row holds 72 h
+	// + the real elapsed pause, and on a loaded box - or under -race, where the
+	// base's own suite reddened here with 72h0m1.981377s against the 1 s curl the
+	// sleep intends - that overshoots any fixed ceiling (t_3218398e). Both shapes
+	// the requirement forbids are a whole pause away from this bound: a resume that
+	// derives the deadline from now() grants about one pause (the old
+	// pigeon_resume_endpoint shape), and one that adds the paused period twice
+	// lands a pause past it.
+	want := 72*time.Hour + out.PausedFor
 	used := f.retryDeadline(t, deliveryID).Sub(created)
-	if used < 72*time.Hour+paused/2 {
-		t.Errorf("the endpoint resume granted a %s window, want the promised 72 h plus the %s pause: deriving the deadline from the resume instead of from created_at is what consumes a held delivery's window (FR-1207)",
-			used, paused)
-	}
-	if used > 72*time.Hour+paused+paused/2 {
-		t.Errorf("the endpoint resume granted a %s window, want the promised 72 h plus the %s pause added once, not twice (FR-1207)",
-			used, paused)
+	if used < want-2*time.Millisecond || used > want+2*time.Millisecond {
+		t.Errorf("the endpoint resume granted a %s window, want the promised 72 h plus the %s pause it recorded, added once (FR-1207)",
+			used, out.PausedFor)
 	}
 	// A hold must not push a delivery into the future: the schedule a
 	// never-scheduled row does not have is not invented.
