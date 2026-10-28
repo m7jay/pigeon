@@ -112,6 +112,28 @@ func archiveRows(t *testing.T, admin *pgxpool.Pool, endpointID, eventID string) 
 	return firstID, seen, n
 }
 
+// resetArchiveDay clears the archive day a fixture is about to seed into, so the
+// exact counts it asserts belong to this run.
+//
+// `delivery_dedupe` is not part of the routing schema `resetRoutingTables` truncates
+// and only a partition drop removes its rows, so a second run against the same
+// database added its two pairs to the day partition the previous run had already
+// filled: 2 -> 4 -> ... and the `want 2` non-vacuity guard failed before any of the
+// isolation assertions below it ran. The caller asserts the day holds exactly its
+// own rows, so clearing the day is clearing its own state. `first_seen_at` is the
+// archive's partition key (0014), so the window is the day partition itself; the
+// bounds are rebuilt from midnight UTC rather than from the incoming time, which
+// carries the current clock time and would miss rows earlier in the day.
+func resetArchiveDay(t *testing.T, admin *pgxpool.Pool, day time.Time) {
+	t.Helper()
+	dayStart := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.UTC)
+	if _, err := admin.Exec(context.Background(),
+		`delete from delivery_dedupe where first_seen_at >= $1 and first_seen_at < $2`,
+		dayStart, dayStart.AddDate(0, 0, 1)); err != nil {
+		t.Fatalf("reset the archive day %s: %v", dayStart.Format("2006-01-02"), err)
+	}
+}
+
 // TestOrdinaryDropCopiesTheDedupeKeysInOneTransaction is FR-905's centre: an
 // ordinary drop copies the partition's dedupe keys into `delivery_dedupe` and
 // drops the partition, so at every instant either the `deliveries` row or the
@@ -515,6 +537,10 @@ func TestArchiveLeavesAreTenantIsolated(t *testing.T) {
 	// Two tenants in ONE deliveries day, so the copy puts both into one archive
 	// day partition and the leaf really is shared.
 	day := time.Now().UTC().AddDate(0, 0, -34)
+	// The archive day is the one relation resetRoutingTables does not reset, so the
+	// fixture owns it before it seeds: without this the copy of a previous run's two
+	// pairs is still in the day partition and the non-vacuity guard below reads 4.
+	resetArchiveDay(t, admin, day)
 	a := seedDedupeDay(t, admin, st, "dedupeiso-a", day)
 	b := seedDedupeDay(t, admin, st, "dedupeiso-b", day)
 	if a.leaf != b.leaf {
