@@ -478,3 +478,221 @@ func TestMetricsAdvanceOnFlush(t *testing.T) {
 		t.Fatalf("%s = %d, want 3", metrics.AttemptsFlushed, got)
 	}
 }
+
+// cancelAfterCommitSink fails the first insert, so the batch lands in the
+// flusher's retry slot, and cancels the pass's context from inside the retry's
+// own RecordAttempts. The cancellation therefore lands after the rows are
+// committed and before the flusher retires the entries - the exact window W1
+// measured - and it is driven by the sink rather than raced against the flusher,
+// so the instant is the same on every run.
+type cancelAfterCommitSink struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	calls  int
+	rows   int
+}
+
+func (s *cancelAfterCommitSink) RecordAttempts(_ context.Context, batch []store.AttemptRecord) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls == 1 {
+		return 0, errors.New("transient")
+	}
+	s.cancel()
+	s.rows += len(batch)
+	return len(batch), nil
+}
+
+// count is the race-free read of the sink's own state: Run's goroutine writes it
+// while the test goroutine reads it.
+func (s *cancelAfterCommitSink) count() (calls, rows int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, s.rows
+}
+
+// TestRunRetiresTheBatchEvenWhenThePassIsCancelled is D-9's property for W1: a
+// cancellation that lands after the rows are committed must not leave a batch the
+// process cannot hand back. The retry slot is already empty at that instant, the
+// stale window is an hour, and the entries are still pending - so if the
+// retirement is revocable, nothing short of the next start's reclaim(0) can
+// recover them (depth 1, pending 1, and a duplicate insert plus an
+// AttemptsConflicted bump next boot).
+func TestRunRetiresTheBatchEvenWhenThePassIsCancelled(t *testing.T) {
+	ctx := context.Background()
+	buf, _ := newTestBuffer(t)
+	if err := buf.Push(ctx, rec(1, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sink := &cancelAfterCommitSink{cancel: cancel}
+	fl, err := NewFlusher(buf, sink, FlusherOptions{
+		Batch:       10,
+		Interval:    10 * time.Millisecond,
+		StaleAfter:  time.Hour,
+		FailBackoff: 5 * time.Millisecond,
+		DrainGrace:  2 * time.Second,
+		Metrics:     metrics.New(),
+	})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- fl.Run(runCtx) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the cancelled pass")
+	}
+
+	if calls, rows := sink.count(); calls != 2 || rows != 1 {
+		t.Fatalf("the sink saw %d calls and %d rows, want 2 calls (the failure and its retry) and 1 row", calls, rows)
+	}
+	// Run has returned, so reading the flusher's own state is race-free here.
+	if got := len(fl.stuck); got != 0 {
+		t.Fatalf("the flusher still holds %d entries in its retry slot", got)
+	}
+	if depth, err := buf.Depth(ctx); err != nil || depth != 0 {
+		t.Fatalf("buffer depth after Run returned = %d, %v; want 0: a cancelled pass must not leave a batch nothing can hand back", depth, err)
+	}
+	if got := pendingCount(t, buf); got != 0 {
+		t.Fatalf("pending after Run returned = %d, want 0: the retirement must not be revocable by the cancellation", got)
+	}
+}
+
+// TestStrandedEntriesAreSweptAtStartup: a strand created before this process
+// started - the tear a transaction cannot cover - is retired by Run's startup
+// sweep, so the depth gauge OBS-9 watches stops counting entries that are not
+// work (D-9, OBS-9).
+func TestStrandedEntriesAreSweptAtStartup(t *testing.T) {
+	ctx := context.Background()
+	fl, sink, buf := newTestFlusher(t, 10)
+
+	for i := 1; i <= 3; i++ {
+		if err := buf.Push(ctx, rec(int64(i), 1)); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+	entries, err := buf.Read(ctx, 10)
+	if err != nil || len(entries) != 3 {
+		t.Fatalf("Read = %d entries, %v; want 3", len(entries), err)
+	}
+	// Strand the first two the way a torn retirement does, and leave the third
+	// pending for the startup reclaim to pick up.
+	if err := buf.rdb.XAck(ctx, buf.Key(), buf.group, entries[0].ID, entries[1].ID).Err(); err != nil {
+		t.Fatalf("XAck: %v", err)
+	}
+	// And one entry nobody has read.
+	if err := buf.Push(ctx, rec(4, 1)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- fl.Run(runCtx) }()
+
+	// The pending entry and the unread one are the run's to flush, so the only
+	// reason the depth can reach 0 is the sweep retiring the stranded pair.
+	if !waitFor(5*time.Second, func() bool {
+		depth, err := buf.Depth(ctx)
+		return err == nil && depth == 0
+	}) {
+		depth, _ := buf.Depth(ctx)
+		t.Fatalf("the buffer never drained: depth=%d pending=%d rows=%d (the startup sweep must retire the stranded entries)",
+			depth, pendingCount(t, buf), sink.rowCount())
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	// The flush path saw each real entry exactly once: the reclaimed pending one
+	// and the unread one. The two strands carry rows a previous process already
+	// committed, so they must not be inserted again.
+	if got := sink.rowCount(); got != 2 {
+		t.Fatalf("the sink inserted %d rows, want 2 (the pending entry and the unread one)", got)
+	}
+	if got := sink.batchCount(); got != 2 {
+		t.Fatalf("the sink was called %d times, want 2 (the startup reclaim and the read)", got)
+	}
+	if got := pendingCount(t, buf); got != 0 {
+		t.Fatalf("pending after the run = %d, want 0", got)
+	}
+	if depth, err := buf.Depth(ctx); err != nil || depth != 0 {
+		t.Fatalf("buffer depth after the run = %d, %v; want 0", depth, err)
+	}
+}
+
+// TestNewFlusherDefaultsTheAckTimeout: the retirement's bound defaults to 2 s and
+// lives on FlusherOptions rather than on a PIGEON_ knob, which is FailBackoff's
+// status too - an operator has no business tuning it.
+func TestNewFlusherDefaultsTheAckTimeout(t *testing.T) {
+	buf, _ := newTestBuffer(t)
+	fl, err := NewFlusher(buf, &fakeSink{}, FlusherOptions{})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+	if fl.opts.AckTimeout != 2*time.Second {
+		t.Fatalf("AckTimeout = %v, want the 2 s default", fl.opts.AckTimeout)
+	}
+	fl, err = NewFlusher(buf, &fakeSink{}, FlusherOptions{AckTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+	if fl.opts.AckTimeout != 50*time.Millisecond {
+		t.Fatalf("AckTimeout = %v, want the caller's 50 ms", fl.opts.AckTimeout)
+	}
+}
+
+// TestInsertRetiresWithinAckTimeoutOnAHungRedis: the retirement's non-revocable
+// context is bounded by AckTimeout and not by the client's read timeout, so a
+// Redis that has stopped answering cannot hold a pass open (D-9). The rows are
+// committed before the retirement, which is why this may fail as an error without
+// being a loss.
+func TestInsertRetiresWithinAckTimeoutOnAHungRedis(t *testing.T) {
+	rdb, err := clientFromURL("redis://" + hungListener(t).Addr().String() + "/0")
+	if err != nil {
+		t.Fatalf("clientFromURL: %v", err)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+	buf, err := New(rdb, Options{Consumer: "test-flusher"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	fl, err := NewFlusher(buf, &fakeSink{}, FlusherOptions{AckTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("NewFlusher: %v", err)
+	}
+
+	start := time.Now()
+	// The sink is a fake, so the insert commits and this is the retirement path:
+	// one MULTI/EXEC against a socket that accepts and never answers.
+	inserted, err := fl.insert(context.Background(), []Entry{{ID: "1-0", Record: rec(1, 1)}})
+	elapsed := time.Since(start)
+	if inserted != 1 {
+		t.Fatalf("insert reported %d rows, want 1: the commit happens before the retirement", inserted)
+	}
+	if err == nil {
+		t.Fatal("insert reported success against a Redis that never answers")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("insert returned %v, want a deadline error", err)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("the retirement took %v, want about AckTimeout (200 ms): the bound was not the one that was set", elapsed)
+	}
+}

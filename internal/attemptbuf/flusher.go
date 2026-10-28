@@ -42,6 +42,13 @@ type FlusherOptions struct {
 	// FailBackoff is how long to wait after a failed insert before retrying, so a
 	// database that is down does not spin. Defaults to 1 s.
 	FailBackoff time.Duration
+	// AckTimeout bounds the retirement of a batch whose rows are already
+	// committed: the XACK and the trim run on a context the pass's cancellation
+	// cannot revoke (D-9), so they need a deadline of their own. Defaults to 2 s.
+	// It is deliberately not a PIGEON_ knob, which is FailBackoff's status too: an
+	// operator has no business tuning it, and a Redis that has stopped answering
+	// must not hold a pass open.
+	AckTimeout time.Duration
 	// DrainGrace bounds the shutdown drain (D-3): the flusher keeps flushing
 	// after the parent context is cancelled until the buffer is empty or this
 	// elapses. Defaults to 10 s.
@@ -90,6 +97,9 @@ func NewFlusher(buf *Buffer, sink Sink, opts FlusherOptions) (*Flusher, error) {
 	if opts.FailBackoff <= 0 {
 		opts.FailBackoff = time.Second
 	}
+	if opts.AckTimeout <= 0 {
+		opts.AckTimeout = 2 * time.Second
+	}
 	if opts.DrainGrace <= 0 {
 		opts.DrainGrace = 10 * time.Second
 	}
@@ -105,7 +115,9 @@ func NewFlusher(buf *Buffer, sink Sink, opts FlusherOptions) (*Flusher, error) {
 //
 // The startup pass reclaims with no idle requirement, because the entries it
 // finds are exactly the ones a process that died mid-flush left pending: on a
-// restart they belong to nobody else (D-1's "0 lost on worker crash").
+// restart they belong to nobody else (D-1's "0 lost on worker crash"). It then
+// sweeps the entries a peer acknowledged but never removed, which no reclaim can
+// reach (D-9).
 func (f *Flusher) Run(ctx context.Context) error {
 	if n, err := f.reclaim(ctx, 0); err != nil {
 		if ctx.Err() == nil {
@@ -113,6 +125,24 @@ func (f *Flusher) Run(ctx context.Context) error {
 		}
 	} else if n > 0 {
 		f.log.Info("flusher: recovered a pending batch left by a previous flusher", "rows", n)
+	}
+
+	// The sweep runs after the reclaim, so every pending entry is accounted for
+	// before anything is trimmed. It removes only entries below the oldest
+	// pending entry (or below the group's last delivery when nothing is pending),
+	// i.e. entries that have been delivered, are not pending, and so are already
+	// acknowledged: a retirement that was torn.
+	if n, err := f.buf.SweepStranded(ctx); err != nil {
+		if ctx.Err() == nil {
+			f.log.Warn("flusher: could not sweep entries a peer acknowledged but never removed from the stream", "error", err)
+		}
+	} else if n > 0 {
+		// A strand means a retirement was torn - a hard kill inside the
+		// acknowledgement transaction, or a replay that stopped after the XACK.
+		// They had left the pending list, so this is the only path that could
+		// ever have retired them, and XLEN counted them until now (OBS-9).
+		f.log.Warn("flusher: swept entries a peer acknowledged but never removed from the stream; a retirement was torn and they had left the pending list",
+			"entries", n)
 	}
 
 	for {
@@ -125,7 +155,7 @@ func (f *Flusher) Run(ctx context.Context) error {
 				break
 			}
 			f.metrics.Inc(metrics.FlushErrors)
-			f.log.Warn("flusher: flush pass failed; the batch stays buffered", "error", err)
+			f.log.Warn("flusher: flush pass failed", "error", err)
 			if !sleep(ctx, f.opts.FailBackoff) {
 				break
 			}
@@ -284,12 +314,22 @@ func (f *Flusher) insert(ctx context.Context, entries []Entry) (int, error) {
 		f.log.Warn("flusher: retiring unreadable buffered attempt entries; the payload does not decode",
 			"entries", len(skipped), "first_id", skipped[0].ID, "raw", skipped[0].Raw)
 	}
-	if err := f.buf.Ack(ctx, IDs(entries)); err != nil {
-		// The rows are in Postgres, so this is not a data loss: the entries stay
-		// pending and are re-inserted later, which the primary key makes a no-op.
-		return inserted, fmt.Errorf("retire %d flushed attempts: %w", len(entries), err)
+	// The rows are committed, so the retirement runs on a context the pass's
+	// cancellation cannot revoke (D-9): after the commit the only thing a revoke
+	// could lose is the retirement, never the evidence, and an entry acked
+	// without being removed is unreachable to every recovery path this package
+	// has. AckTimeout is what keeps that non-revocable wait bounded.
+	ackCtx, cancelAck := context.WithTimeout(context.WithoutCancel(ctx), f.opts.AckTimeout)
+	defer cancelAck()
+	if err := f.buf.Ack(ackCtx, IDs(entries)); err != nil {
+		// Not data loss: the rows are in Postgres, and the entries stay pending
+		// until the stale window reclaims them, which the primary key makes a
+		// no-op. The message names the half that failed, because a pass failure
+		// here does not mean the batch is still only buffered.
+		return inserted, fmt.Errorf("inserted %d attempt rows in one transaction, but retiring the %d buffered entries failed; they stay pending until the stale reclaim window re-inserts them: %w",
+			inserted, len(entries), err)
 	}
-	f.depth(ctx)
+	f.depth(ackCtx)
 	return inserted, nil
 }
 
