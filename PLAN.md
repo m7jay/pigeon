@@ -61,8 +61,9 @@ disposes of them, and the split is deliberate:
 
 - **FR-1303 (P0) and FR-1304 are S11** (card `t_558a9f59`, `pigeon-dev`), because the shipped
   dispatch path *violates* them. `dispatch` claims a delivery and takes the process slot before
-  it asks the endpoint for a slot, then sleeps there (`internal/delivery/delivery.go:439-486`,
-  `:502-534`), so with the default `PIGEON_DELIVERY_WORKERS=1` one capped endpoint occupies a
+  it asks the endpoint for a slot, then sleeps there (`internal/delivery/delivery.go:439-486`, the
+  wait loops at `:502-514` and `:521-534`), so with the default `PIGEON_DELIVERY_WORKERS=1`
+  one capped endpoint occupies a
   process's only dispatch loop and nothing reports it. S11 adds no second endpoint limit:
   FR-1308 is untouched, and the retry budget it partitions is the worker's attempt budget.
 - **FR-1301's publish half is already shipped** as FR-207's per-key and per-producer rate
