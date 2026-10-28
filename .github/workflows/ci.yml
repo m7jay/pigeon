@@ -124,6 +124,12 @@ jobs:
           # (durable row and 72 h arithmetic), AC-36 (terminal row and <= 16
           # attempt bound) and AC-37 (governing window and the terminal it
           # causes) each name two, and both halves are registered.
+          #
+          # AC-46 (FR-905) registered its two halves the same way, after PR #37
+          # merged: the answer surviving the partition sweep
+          # (TestDedupeAnswerSurvivesTheSweep) and the archive's measured
+          # per-pair size agreeing with its exported gauge
+          # (TestDedupeArchiveSizingAndGaugeAgree).
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -200,7 +206,9 @@ jobs:
             TestSweeperStandbyTakesOverWhenTheHolderIsKilled \
             TestTwoSweepersDropExactlyOnePartition \
             TestPartitionLeavesEnforceTenantIsolation \
-            TestRunOnceLogsTheDroppedPartition
+            TestRunOnceLogsTheDroppedPartition \
+            TestDedupeAnswerSurvivesTheSweep \
+            TestDedupeArchiveSizingAndGaugeAgree
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
