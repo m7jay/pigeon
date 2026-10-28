@@ -29,13 +29,12 @@ func TestSuccessLogGateHoldsTheBoundAtLoad(t *testing.T) {
 			allowed++
 		}
 	}
-	// The bucket starts full and refills at 100/s, so one second of load yields
-	// at most 200 lines (the initial second's worth plus the second's refill).
-	// The strict bound §13.1 states is "at most rps per second"; the token
-	// bucket's ceiling over any one-second window is 2×rps because the initial
-	// bucket and the refill are counted separately. That is the documented
-	// behaviour of this gate (see successlog.go), and 200 lines for 10,000
-	// deliveries is still a 50× reduction.
+	// The bucket starts holding one second's allowance and refills at 100/s, so
+	// the first second of load yields at most 200 lines: §13.1's bound is rps
+	// sustained, and 2×rps in any one-second window, which is the ceiling this
+	// asserts. The shipped gate emits 199 here, because the refill that would
+	// complete the 200th token lands exactly at the window's edge (A-8). 199 lines
+	// for 10,000 deliveries is still a 50× reduction.
 	if allowed > 2*rps {
 		t.Fatalf("gate emitted %d lines for %d deliveries in one second, want at most %d", allowed, deliveries, 2*rps)
 	}
@@ -48,6 +47,30 @@ func TestSuccessLogGateHoldsTheBoundAtLoad(t *testing.T) {
 	if got, want := m.Counter(metrics.SuccessLogsSuppressed), int64(deliveries-allowed); got != want {
 		t.Fatalf("%s = %d, want %d", metrics.SuccessLogsSuppressed, got, want)
 	}
+
+	// The sustained leg of the same bound: a further synthetic second of the same
+	// load MUST emit at most rps lines, because the initial allowance is spent and
+	// only the refill remains. That second second is the number LOG-2 states as
+	// the bound, and it is what the first-second ceiling of 2×rps relaxes back to.
+	emittedBefore := m.Counter(metrics.SuccessLogsEmitted)
+	secondSecond := 0
+	for i := 0; i < deliveries; i++ {
+		now = now.Add(100 * time.Microsecond)
+		if g.allow() {
+			secondSecond++
+		}
+	}
+	if secondSecond > rps {
+		t.Fatalf("gate emitted %d lines in the second second of the same load, want at most %d (LOG-2's sustained bound)", secondSecond, rps)
+	}
+	if secondSecond < rps {
+		t.Fatalf("gate emitted %d lines in the second second of the same load, want the full rate %d: §13.1 states that while a load stays above the rate the gate emits at the rate", secondSecond, rps)
+	}
+	if got, want := m.Counter(metrics.SuccessLogsEmitted)-emittedBefore, int64(secondSecond); got != want {
+		t.Fatalf("%s advanced by %d in the second second, want %d", metrics.SuccessLogsEmitted, got, want)
+	}
+	t.Logf("rps=%d: first second emitted %d lines (ceiling %d), second second emitted %d (LOG-2's sustained bound %d)",
+		rps, allowed, 2*rps, secondSecond, rps)
 }
 
 // TestSuccessLogGateIsAFullBucketOnStart: the first successes after a quiet
@@ -93,7 +116,10 @@ func TestSuccessLogGateRefillsOverTime(t *testing.T) {
 
 // TestSuccessLogGateNilMeansNoGate is the pre-S6 escape hatch: a Worker built
 // without a gate logs every success. The S4 tests rely on this, and so does a
-// small deployment that explicitly sets a negative SuccessLogRPS.
+// caller that constructs a Worker directly with a negative
+// Options.SuccessLogRPS. The environment cannot ask for that: config.Load floors
+// PIGEON_SUCCESS_LOG_RPS below 1 to 1 before Validate runs (A-8), so a negative
+// value is a direct-caller path only.
 func TestSuccessLogGateNilMeansNoGate(t *testing.T) {
 	var g *successLogGate
 	if !g.allow() {
