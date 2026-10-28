@@ -279,7 +279,10 @@ func Load() (Config, error) {
 	}
 	// LOG-2 bounds per-success lines above 100/s. The floor is one line per
 	// second, not zero: an operator still needs a liveness signal, and the
-	// counters carry the volume either way.
+	// counters carry the volume either way. It is also LOG-2's guard for the
+	// environment: this runs before Validate, so no environment value turns the
+	// gate off (A-8). PIGEON_SUCCESS_LOG_RPS=0 and a negative value both arrive at
+	// Validate as 1, and main passes the floored value on.
 	if c.SuccessLogRPS < 1 {
 		c.SuccessLogRPS = 1
 	}
@@ -386,6 +389,9 @@ func (c Config) Validate() error {
 	if c.AttemptFlushStale < 0 {
 		problems = append(problems, "PIGEON_ATTEMPT_FLUSH_STALE must be >= 0")
 	}
+	// Unreachable through Load: the LOG-2 floor in Load raises anything below 1 to
+	// 1 before Validate runs, so no environment value disables the gate (A-8).
+	// Kept as the guard for a Config built and validated without Load.
 	if c.SuccessLogRPS < 0 {
 		problems = append(problems, "PIGEON_SUCCESS_LOG_RPS must be >= 0 (LOG-2)")
 	}
