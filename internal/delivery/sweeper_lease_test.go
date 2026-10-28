@@ -288,8 +288,8 @@ type dropRecord struct{ table, name string }
 // partition. The attempt is recorded even when the drop returns false, because
 // "this replica reached the drop path without the leadership lock" is the failure
 // AC-42 is about.
-func (r *replicaStore) DropPartition(ctx context.Context, table, name string) (bool, error) {
-	dropped, err := r.Store.DropPartition(ctx, table, name)
+func (r *replicaStore) DropPartition(ctx context.Context, table, name string, reason retention.DropReason) (bool, error) {
+	dropped, err := r.Store.DropPartition(ctx, table, name, reason)
 	r.mu.Lock()
 	r.attempts++
 	if dropped {

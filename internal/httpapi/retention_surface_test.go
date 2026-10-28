@@ -121,7 +121,13 @@ func TestUsageEndpointReportsDiskAgainstBudget(t *testing.T) {
 		Disk:          retention.Usage{UsedBytes: 900, TotalBytes: 1000, UsedPct: 90, Source: "test"},
 		MaxDiskPct:    80,
 		OverBudget:    true,
-		RetentionDays: map[string]int{"deliveries": 14, "attempts": 7},
+		RetentionDays: map[string]int{"deliveries": 14, "attempts": 7, "delivery_dedupe": 30},
+		// FR-905: the archive's measured size travels in the same payload, so the
+		// pressure the operator acts on includes the space the archive holds.
+		DedupeArchiveBytes: 21757952,
+		Partitions: map[string][]retention.Partition{
+			"delivery_dedupe": {{Table: "delivery_dedupe", Name: "delivery_dedupe_20261018", Bytes: 21757952}},
+		},
 	}
 	re := e.withRetention(t, &fakeRetention{status: st}, nil)
 
@@ -139,6 +145,129 @@ func TestUsageEndpointReportsDiskAgainstBudget(t *testing.T) {
 	}
 	if got.RetentionDays["deliveries"] != 14 || got.RetentionDays["attempts"] != 7 {
 		t.Fatalf("retention_days = %v, want the configured windows", got.RetentionDays)
+	}
+	if got.RetentionDays["delivery_dedupe"] != 30 || got.DedupeArchiveBytes != 21757952 {
+		t.Fatalf("payload = %+v, want the dedupe archive's 30 d window and its measured size (FR-905)",
+			got)
+	}
+	if len(got.Partitions["delivery_dedupe"]) != 1 {
+		t.Fatalf("partitions = %v, want the archive's day partition listed like the others",
+			got.Partitions)
+	}
+}
+
+// TestMetricsExportsTheDedupeArchiveGauge is FR-905's "the archive's size MUST be
+// exposed as a gauge read from pg_total_relation_size": the scrape carries the
+// value the sweeper measured, and it is typed gauge, so a Prometheus reader does
+// not rate() a level. The measurement itself is exercised against a real archive
+// in internal/delivery (TestDedupeArchiveSizingAndGaugeAgree).
+func TestMetricsExportsTheDedupeArchiveGauge(t *testing.T) {
+	e := setup(t)
+	m := metrics.New()
+	m.Set(metrics.DedupeArchiveBytes, 21757952)
+	re := e.withRetention(t, &fakeRetention{}, m)
+
+	code, raw := re.do(http.MethodGet, "/metrics", re.adminToken, nil)
+	mustStatus(t, code, raw, http.StatusOK)
+	body := string(raw)
+	if !strings.Contains(body, "# TYPE pigeon_dedupe_archive_bytes gauge") {
+		t.Fatalf("/metrics does not type the archive size as a gauge (FR-905):\n%s", body)
+	}
+	if !strings.Contains(body, "pigeon_dedupe_archive_bytes 21757952") {
+		t.Fatalf("/metrics is missing the measured archive size:\n%s", body)
+	}
+}
+
+// TestDedupeAnswerSurvivesTheSweep is AC-46 end to end at the API: with
+// `deliveries` retention set to an hour, a delivery is written into a day the
+// sweeper may drop, the sweep drops that partition (copying its dedupe keys into
+// the archive on the way), and the support question is then asked over HTTP. The
+// answer must be there, carrying the FIRST delivery and its ORIGINAL timestamp,
+// and it can only have come from Postgres: the live rows are gone (the answer
+// reports 0 deliveries) and nothing on this path touches Redis at all - the
+// handler issues one scoped query against delivery_dedupe_all, asserted by
+// TestDedupeAnswerNeverReachesForRedis in internal/store.
+func TestDedupeAnswerSurvivesTheSweep(t *testing.T) {
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+
+	// A published event with no fan-out: this test writes the one delivery itself,
+	// because fan-out stamps created_at from now() and AC-46 needs a day that has
+	// ended (the drop primitive refuses today).
+	eventID := e.publishFor(t, fx, fx.Ref)
+	day := time.Now().UTC().AddDate(0, 0, -1)
+	at := day.Add(12 * time.Hour)
+	leaf, err := e.st.EnsurePartition(ctx(), "deliveries", day)
+	if err != nil {
+		t.Fatalf("EnsurePartition: %v", err)
+	}
+	var deliveryID int64
+	if err := e.admin.QueryRow(ctx(), `
+		insert into deliveries (event_id, endpoint_id, producer_id, env, consumer_id, status, created_at)
+		values ($1, $2, $3, 'live', $4, 'delivered', $5) returning id`,
+		eventID, fx.EndpointID, tn.ID, fx.ConsumerID, at).Scan(&deliveryID); err != nil {
+		t.Fatalf("seed the delivery: %v", err)
+	}
+
+	ask := func() (int, []byte) {
+		return e.do(http.MethodGet,
+			"/v1/producer/deliveries/dedupe?env=live&endpoint_id="+fx.EndpointID+"&event_id="+eventID,
+			tn.OwnerToken, nil)
+	}
+
+	// Live first, so the fixture is known to answer before the drop.
+	code, raw := ask()
+	mustStatus(t, code, raw, http.StatusOK)
+	if live := decode[dedupeJSONBody](t, raw); !live.Duplicate || live.Deliveries != 1 {
+		t.Fatalf("the pre-sweep answer = %+v, want a duplicate of the live delivery", live)
+	}
+
+	// AC-46's setting: an hour of deliveries retention, then a sweep.
+	rm := retention.NewManager(e.st, nil, retention.Options{
+		DeliveriesRetention: time.Hour,
+		Logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	rep, err := rm.RunOnce(ctx())
+	if err != nil {
+		t.Fatalf("retention RunOnce: %v", err)
+	}
+	if len(rep.Dropped) == 0 {
+		t.Fatalf("the sweep dropped nothing; the day %s must be expired under a 1 h window", leaf)
+	}
+
+	var leafGone bool
+	if err := e.admin.QueryRow(ctx(), `select to_regclass($1) is null`, leaf).Scan(&leafGone); err != nil {
+		t.Fatalf("read the dropped leaf: %v", err)
+	}
+	if !leafGone {
+		t.Fatalf("%s is still there after the sweep", leaf)
+	}
+	var archived int
+	if err := e.admin.QueryRow(ctx(),
+		`select count(*) from delivery_dedupe where endpoint_id = $1 and event_id = $2`,
+		fx.EndpointID, eventID).Scan(&archived); err != nil {
+		t.Fatalf("read the archive: %v", err)
+	}
+	if archived != 1 {
+		t.Fatalf("the archive holds %d rows for the pair, want 1 (FR-905's copy at the drop)", archived)
+	}
+
+	// The question again, with the cache state a Redis wipe would leave: the answer
+	// is unchanged, and the 0 live deliveries are what say it came from the archive.
+	code, raw = ask()
+	mustStatus(t, code, raw, http.StatusOK)
+	after := decode[dedupeJSONBody](t, raw)
+	if !after.Duplicate {
+		t.Fatalf("the answer after the sweep = %+v, want the archived duplicate (FR-905)", after)
+	}
+	if after.FirstDeliveryID != deliveryID {
+		t.Fatalf("archived first_delivery_id = %d, want %d", after.FirstDeliveryID, deliveryID)
+	}
+	if after.FirstSeenAt == nil || *after.FirstSeenAt != at.Format(time.RFC3339) {
+		t.Fatalf("archived first_seen_at = %v, want the original %s", after.FirstSeenAt, at.Format(time.RFC3339))
+	}
+	if after.Deliveries != 0 {
+		t.Fatalf("the archived answer reports %d live deliveries, want 0: the partition was dropped", after.Deliveries)
 	}
 }
 
