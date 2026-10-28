@@ -1034,13 +1034,14 @@ Neither is the mechanism. The budget that separates is the worker's.
   (`0013_s5_retry_pause_limits.sql:308`), so the oldest row wins and a retry backlog is claimed
   ahead of every newer first attempt.
 - **Lane side.** The worker runs one claim loop per lane, and the two allowances are a **partition**
-  of the process's existing attempt budget, not an addition to it: with `C =
-  PIGEON_DELIVERY_CONCURRENCY` (FR-816's per-process cap, default 64) and the retry lane's
-  configurable allowance `R = PIGEON_DELIVERY_RETRY_CONCURRENCY` (default 16), the retry lane holds
-  `R` slots and the first-attempt lane holds `C - R` (default 48). Attempts in flight for one
-  process therefore still total at most `C`, the ceiling FR-816 already shipped; the trade-off
-  below is the price of the split, not a raised budget. `R = clamp(configured, 0, C - 1)`, so
-  `C - R >= 1` holds at every accepted `C` (`internal/config/config.go:420` rejects only `C < 1`).
+  of the process's existing attempt budget, not an addition to it: the process cap `C` is
+  `PIGEON_DELIVERY_CONCURRENCY` (FR-816's per-process cap, default 64), the retry lane's
+  configurable allowance `R` is `PIGEON_DELIVERY_RETRY_CONCURRENCY` (default 16), and the lanes hold
+  `R` and `C - R` slots respectively (48 first-attempt slots at those defaults). Attempts in flight
+  for one process therefore still total at most `C`, the ceiling FR-816 already shipped; the
+  trade-off below is the price of the split, not a raised budget. `R = clamp(configured, 0, C - 1)`,
+  so `C - R >= 1` holds at every accepted `C` (`internal/config/config.go:420` rejects only
+  `C < 1`).
   The boundary is `C = 1`: there `R = 0` means **no separate retry lane** - one lane serves both
   classes and the isolation above is not claimed - not a lane that can never run, because a
   degenerate partition MUST NOT starve FR-1201's retry policy. Both allowances are per process, the
