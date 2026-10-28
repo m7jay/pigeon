@@ -909,7 +909,7 @@ Neither is the mechanism. The budget that separates is the worker's.
   for one process therefore still total at most `C`, the ceiling FR-816 already shipped; the
   trade-off below is the price of the split, not a raised budget.
   `R = clamp(configured, 0, C - 1)`, with the knob validated `>= 1` at config load exactly as `C` is
-  (`internal/config/config.go:420-422`), so `C - R >= 1` holds at every accepted `C` and `R >= 1` at
+  (`internal/config/config.go:420-421`), so `C - R >= 1` holds at every accepted `C` and `R >= 1` at
   every `C >= 2`; a configured value above `C - 1` is clamped rather than refused, because the
   result still leaves the first-attempt lane one slot.
   `R = 0` is a defined state, not an error, and the clamp reaches it only at `C = 1`: it means **no
