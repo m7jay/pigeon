@@ -24,18 +24,25 @@ import (
 // read. The signing secret travels out only to the sign call: it is never logged,
 // stored in an attempt row, or returned by any API (FR-1008).
 type LeasedDelivery struct {
-	DeliveryID     int64
-	EventID        string
-	ProducerID     string
-	Env            string
-	EndpointID     string
-	EndpointURL    string
-	SigningSecret  string
-	EventType      string
-	PayloadVersion int
-	ConsumerRef    string
-	OccurredAt     time.Time
-	Payload        []byte
+	DeliveryID    int64
+	EventID       string
+	ProducerID    string
+	Env           string
+	EndpointID    string
+	EndpointURL   string
+	SigningSecret string
+	// PreviousSigningSecret is the secret this endpoint used before its most
+	// recent rotation, and PreviousSecretExpiresAt is when the 24 h overlap ends
+	// (FR-1004). Both are empty/nil for an endpoint that has never rotated, and
+	// the store clears them once the window has passed. The signer applies the
+	// expiry rather than the query, so the 24 h rule lives in one readable place.
+	PreviousSigningSecret   string
+	PreviousSecretExpiresAt *time.Time
+	EventType               string
+	PayloadVersion          int
+	ConsumerRef             string
+	OccurredAt              time.Time
+	Payload                 []byte
 	// PriorAttempts is how many failed attempt rows already exist. It is only
 	// for logging; the authoritative next number is NextAttemptNumber, derived
 	// from this and the delivery row's own counter (D-2).
@@ -178,15 +185,23 @@ func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow tim
 	var backoffBaseS, backoffMaxS, retryWindowS float64
 	var timeoutMS int
 	var sealedHeaders []byte
+	// previous_signing_secret is NULL for an endpoint that has never rotated, and
+	// pgx will not scan NULL into a *string: it needs a **string so it has
+	// somewhere to put the NULL. The field on the struct stays a plain string
+	// because "no previous secret" and "empty previous secret" are the same thing
+	// to every caller (FR-1004's overlap is decided by the expiry).
+	var previousSecret *string
 	err := s.pool.QueryRow(ctx, `select delivery_id, event_id, producer_id, env, endpoint_id,
-		endpoint_url, signing_secret, event_type, payload_version, coalesce(consumer_ref, ''),
+		endpoint_url, signing_secret, previous_signing_secret, previous_secret_expires_at,
+		event_type, payload_version, coalesce(consumer_ref, ''),
 		occurred_at, payload, prior_attempts, row_attempts, first_attempt_at,
 		next_attempt_at, retry_deadline,
 		max_retries, retry_backoff_base_s, retry_backoff_max_s, retry_window_s,
 		delivery_timeout_ms, max_concurrency, max_rps, held_back, custom_headers
 		from pigeon_claim_delivery($1, $2, $3)`, lease, defaultRetryWindow, string(class),
 	).Scan(&d.DeliveryID, &d.EventID, &d.ProducerID, &d.Env, &d.EndpointID,
-		&d.EndpointURL, &d.SigningSecret, &d.EventType, &d.PayloadVersion,
+		&d.EndpointURL, &d.SigningSecret, &previousSecret, &d.PreviousSecretExpiresAt,
+		&d.EventType, &d.PayloadVersion,
 		&d.ConsumerRef, &d.OccurredAt, &d.Payload, &d.PriorAttempts, &d.RowAttempts, &d.FirstAttemptAt,
 		&d.NextAttemptAt, &d.RetryDeadline,
 		&d.Endpoint.MaxRetries, &backoffBaseS, &backoffMaxS, &retryWindowS,
@@ -206,6 +221,9 @@ func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow tim
 		return d, false, fmt.Errorf("claim delivery: %w", err)
 	}
 	d.CustomHeaders, d.DroppedCustomHeaders = headers, dropped
+	if previousSecret != nil {
+		d.PreviousSigningSecret = *previousSecret
+	}
 	// The policy's durations arrive as epoch seconds (0013 casts them), so the
 	// whole per-endpoint policy is a value the worker can use directly.
 	d.Endpoint.BackoffBase = seconds(backoffBaseS)

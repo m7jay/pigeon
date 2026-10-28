@@ -251,6 +251,12 @@ type Worker struct {
 	// holder identifies this process in the concurrency set, so a release frees
 	// only its own slot.
 	holder string
+
+	// internalFlags caches FR-402's per-endpoint escape hatch for FR-1005's
+	// request-time check. The claim path does not carry it, and a query per
+	// attempt would sit on the delivery hot path for a value that changes only
+	// when an operator changes it.
+	internalFlags *endpointInternalCache
 }
 
 // attemptLane is one attempt-class lane (FR-1303): the class it claims and the
@@ -377,6 +383,8 @@ func New(st *store.Store, opts Options) *Worker {
 		notifier: opts.Notifier,
 		lanes:    newLanes(opts.Concurrency, opts.RetryConcurrency),
 		holder:   holderName(),
+
+		internalFlags: newEndpointInternalCache(),
 	}
 	// FR-1303: a configured retry allowance above C-1 is clamped rather than
 	// refused (the result still leaves the first-attempt lane a slot), and an
@@ -806,8 +814,19 @@ func (w *Worker) handle(ctx context.Context, d store.LeasedDelivery) {
 	}
 	// Per-attempt timeout (FR-819), derived from ctx so it is also cancelled on
 	// shutdown, bounding the attempt in both time and goroutine lifetime.
+	allowPrivate := w.endpointAllowsPrivate(ctx, d.EndpointID)
 	attemptCtx, cancel := context.WithTimeout(ctx, w.timeoutFor(d))
-	res := w.deliver(attemptCtx, req, w.effectiveConcurrency(d), w.opts.MaxBodyBytes)
+	var res attemptResult
+	if refusal, blocked := ssrfRefusal(d, allowPrivate); blocked {
+		// FR-1005 at request time: the URL is re-checked, and re-resolved, on
+		// every attempt rather than once at registration, because a name whose
+		// answer changed since then is exactly the rebinding case. The refusal is
+		// terminal: retrying a permanently blocked address fifteen times over 72
+		// hours would be a slow way of hammering the metadata service.
+		res = refusal
+	} else {
+		res = w.deliver(attemptCtx, req, w.effectiveConcurrency(d), w.opts.MaxBodyBytes, allowPrivate)
+	}
 	cancel()
 	duration := w.now().Sub(attemptStart)
 

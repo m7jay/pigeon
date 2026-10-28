@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/m7jay/pigeon/internal/ssrf"
 )
 
 // attemptResult is the outcome of one POST, before any database write.
@@ -49,7 +52,7 @@ func newTransportCache(fallbackCap int) *transportCache {
 // (FR-803). The client has no own Timeout: every attempt carries its own
 // context.WithTimeout (FR-819), which bounds the attempt in both time and
 // goroutine lifetime and is cancelled on shutdown.
-func (c *transportCache) clientFor(endpointID string, maxConns int) *http.Client {
+func (c *transportCache) clientFor(endpointID string, maxConns int, allowInternal bool) *http.Client {
 	if maxConns <= 0 {
 		maxConns = c.fallbackCap
 	}
@@ -61,6 +64,16 @@ func (c *transportCache) clientFor(endpointID string, maxConns int) *http.Client
 	if cl, ok := c.byEndpoint[endpointID]; ok {
 		return cl
 	}
+	// FR-1005's request-time half. The Control hook runs for every connection
+	// after the name has been resolved and immediately before connect(2), with the
+	// address the kernel is about to be asked for - so a name that pointed
+	// somewhere public at registration and resolves to the metadata service now
+	// cannot be reached. A dial-time check is the only one without a window.
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   ssrf.DialControl(allowInternal),
+	}
 	cl := &http.Client{
 		Timeout: 0,
 		// FR-803: do not follow redirects. Returning this sentinel makes
@@ -70,6 +83,7 @@ func (c *transportCache) clientFor(endpointID string, maxConns int) *http.Client
 			return http.ErrUseLastResponse
 		},
 		Transport: &http.Transport{
+			DialContext:         dialer.DialContext,
 			MaxConnsPerHost:     maxConns,
 			MaxIdleConns:        maxConns,
 			MaxIdleConnsPerHost: maxConns,
@@ -85,7 +99,7 @@ func (c *transportCache) clientFor(endpointID string, maxConns int) *http.Client
 // and closes the response body (FR-817), captures the first MaxBodyBytes for the
 // attempt trail (FR-804), and never follows a redirect (FR-803). ctx carries the
 // per-attempt timeout (FR-819).
-func (w *Worker) deliver(ctx context.Context, req signedRequest, maxConns, maxBody int) attemptResult {
+func (w *Worker) deliver(ctx context.Context, req signedRequest, maxConns, maxBody int, allowInternal bool) attemptResult {
 	var body bytes.Reader
 	body.Reset(req.body)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.url, &body)
@@ -108,7 +122,7 @@ func (w *Worker) deliver(ctx context.Context, req signedRequest, maxConns, maxBo
 	}
 
 	start := time.Now()
-	resp, err := w.clients.clientFor(req.endpointID, maxConns).Do(httpReq)
+	resp, err := w.clients.clientFor(req.endpointID, maxConns, allowInternal).Do(httpReq)
 	res := attemptResult{duration: time.Since(start), sendErr: err}
 	if err != nil {
 		res.outcome, res.errorClass = classifySendErr(err)
