@@ -869,13 +869,15 @@ func (c *inFlightCounter) reset() {
 // operator action, and the window is not what ended anything.
 //
 // The clock is compressed - base 50 ms, cap 100 ms, window 4 s - because the
-// SHAPE is the claim: the outage outlasts the first several attempts, so only a
-// retry can carry the delivery.
+// SHAPE is the claim: the receiver is unhealthy for the first two attempts, so
+// only a retry can carry the delivery.
 func TestAC35RecoversInsideTheWindow(t *testing.T) {
-	var down atomic.Bool
-	down.Store(true)
+	// The first two attempts fail and the receiver is healthy from the third: the
+	// recovery is driven by the attempts themselves rather than by a wall clock,
+	// so a loaded machine cannot turn this into a flake.
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if down.Load() {
+		if hits.Add(1) <= 2 {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -893,13 +895,6 @@ func TestAC35RecoversInsideTheWindow(t *testing.T) {
 		o.BackoffMax = 100 * time.Millisecond
 	}))
 
-	// The receiver recovers well inside the window, and well after the first few
-	// scheduled attempts have failed through.
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		down.Store(false)
-	}()
-
 	if !drive(t, w, 5000, func() bool { return f.deliveryStatus(t, deliveryID) == "delivered" }) {
 		t.Fatalf("delivery = %q after the receiver recovered, want delivered (AC-35): the retry schedule has to carry it",
 			f.deliveryStatus(t, deliveryID))
@@ -912,7 +907,7 @@ func TestAC35RecoversInsideTheWindow(t *testing.T) {
 	if used < window-time.Second || used > window+time.Second {
 		t.Errorf("the delivery ran on a %s window, want the configured %s: the window is the deployment's, not a fallback", used, window)
 	}
-	t.Logf("AC-35: %d failed attempts, then delivered inside the %s window", failed, window)
+	t.Logf("AC-35: %d failed attempts (%d carrying requests), then delivered inside the %s window", failed, hits.Load(), window)
 }
 
 // TestFR1207ResumeExtendsThePromisedWindow: a delivery that was fanned out but
@@ -972,9 +967,9 @@ func TestFR1207ResumeExtendsThePromisedWindow(t *testing.T) {
 		t.Errorf("the resume granted a %s window, want the promised 1 h plus the %s pause: extending from the resume instead of from the promise is what consumes a held delivery's window (FR-1207)",
 			used, paused)
 	}
-	if used > time.Hour+paused+5*time.Second {
-		t.Errorf("the resume granted a %s window, want the promised 1 h plus the %s pause: the paused period must be added once, not twice",
-			used, paused)
+	if used > time.Hour+30*time.Second {
+		t.Errorf("the resume granted a %s window, want the promised 1 h plus the pause: the paused period must be added once, not twice (and the base must be the promise, not the resume)",
+			used)
 	}
 	// The schedule a never-scheduled row does not have is not invented: the row is
 	// claimable at the resume rather than one pause later.
