@@ -6,28 +6,44 @@ import (
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
 
-// TestAttemptFanOutIsBounded is AC-34's census.
+// TestAttemptFanOutIsBounded is AC-34's census, in three legs.
 //
 // AC-34 asks that 2,500 concurrent attempts on a 2 vCPU machine stay bounded by
 // "the pool plus the per-endpoint caps", with file descriptors inside the
 // documented ulimit and the CPU largely idle. The thing that makes that true is a
 // bound, so that is what this asserts: the concurrent attempt count - and the
-// goroutines and sockets behind it - is a function of the caps, not of the offered
-// load.
+// goroutines, sockets and CPU behind it - is a function of the caps, not of the
+// offered load.
 //
-// Hence a comparison rather than a magic number. One endpoint capped at FR-1302's
-// documented 10 concurrent is offered two backlogs six times apart, and the peak
-// goroutine count and peak open file descriptor count must not follow the load: a
-// goroutine or a descriptor per offered delivery would make the second run's
-// figures six times the first's, and that is what this fails on. The figures do
-// track *concurrency* - more attempts in flight is more goroutines and more sockets,
-// and that is correct - but concurrency is itself capped, so the growth is bounded
-// by the cap rather than by the queue behind it.
+// Legs 1 and 2 are the comparison: one endpoint capped at FR-1302's documented 10
+// concurrent is offered two backlogs six times apart, and the peak goroutine
+// count and peak open file descriptor count must not follow the load. A goroutine
+// or a descriptor per offered delivery would make the second run's figures six
+// times the first's, and that is what this fails on. The figures do track
+// *concurrency* - more attempts in flight is more goroutines and more sockets, and
+// that is correct - but concurrency is itself capped, so the growth is bounded by
+// the cap rather than by the queue behind it.
+//
+// Leg 3 is the criterion's own number rather than a proxy for it: 2,500 due
+// deliveries offered at once to the same capped endpoint. It exists because the
+// earlier version of this test argued that the literal figure "needs the soft
+// ulimit raised first, roughly 5,000 descriptors for 2,500 in-flight attempts" -
+// which is the goroutine-per-offered-delivery model this test exists to refute.
+// If the footprint is a function of the caps it needs no raise at all, and the
+// measurement says so: the leg reports the process's RLIMIT_NOFILE, the peak
+// descriptors and the CPU cores used. It also raises the soft limit to the hard
+// limit itself (RLIMIT_NOFILE is self-raisable without privilege) so that "the
+// limit was raised" is a fact in the log rather than a claim in a document - and
+// then shows the peak is far under both.
 //
 // The peak in-flight count is asserted to stay at or under the endpoint's cap and to
 // overlap more than one attempt, so a run cannot pass by never running concurrently
@@ -46,22 +62,35 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 		concurrencyCap = 10 // FR-1302's documented per-endpoint default
 		processCap     = 4 * concurrencyCap
 		eventType      = "order.created"
-		// One second of service time, not 200 ms. The worker's claim loop is
-		// serialised on database round-trips, and on a loaded box those round-trips
-		// are tens of milliseconds each; with a short service time the loop cannot
-		// refill the endpoint's slots fast enough and the observed concurrency
-		// measures the box's latency rather than the cap. A service time several
-		// times the claim latency is what lets the cap be the binding constraint,
-		// which is the property under test. (The cap itself is also asserted
-		// exactly by TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas.)
-		serviceTime  = time.Second
-		smallBacklog = 20  //  2x the endpoint's cap: enough to saturate it
-		largeBacklog = 120 // 12x the cap, and 6x the small run
+		// One second of service time for the comparative legs, not 200 ms. The
+		// worker's claim loop is serialised on database round-trips, and on a
+		// loaded box those round-trips are tens of milliseconds each; with a short
+		// service time the loop cannot refill the endpoint's slots fast enough and
+		// the observed concurrency measures the box's latency rather than the cap.
+		// A service time several times the claim latency is what lets the cap be
+		// the binding constraint, which is the property under test. (The cap itself
+		// is also asserted exactly by TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas.)
+		comparativeService = time.Second
+		// The literal leg's service time is short because 2,500 deliveries are
+		// offered: at the comparative second each delivery would take 250 s at the
+		// endpoint's cap of 10 and the leg would be measuring the test's patience.
+		// 50 ms keeps the run in the tens of seconds while leaving the service time
+		// several times the claim latency, so the cap still binds.
+		literalService = 50 * time.Millisecond
+		smallBacklog   = 20   //  2x the endpoint's cap: enough to saturate it
+		largeBacklog   = 120  // 12x the cap, and 6x the small run
+		literalBacklog = 2500 // AC-34's own figure
 		// Slack on the comparative assertions. Not zero because a low pass from the
 		// sampler, a GC cycle and the connection pool warming up are all real, and
-		// none of them scales with the backlog; a leak would blow past this by 6x.
+		// none of them scales with the backlog; a leak would blow past this by 6x
+		// (leg 2) or 20x (leg 3).
 		slack = 40
 	)
+
+	// The receiver's service time is per-leg state; the handler reads it atomically
+	// because the legs share one server.
+	var service atomic.Int64
+	service.Store(int64(comparativeService))
 
 	var counter inFlightCounter
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -71,7 +100,7 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 		// would keep counting after a client timeout tore a request down, and would
 		// then be measuring the test rather than the cap.)
 		counter.enter()
-		time.Sleep(serviceTime)
+		time.Sleep(time.Duration(service.Load()))
 		counter.leave()
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -82,14 +111,19 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 
 	baseline := runtime.NumGoroutine()
 
-	census := func(backlog int) (inFlight, goroutines, fds, attempts int) {
+	census := func(backlog int, serviceTime time.Duration) figures {
 		t.Helper()
+		service.Store(int64(serviceTime))
 		counter.reset()
 
 		// Enqueue the WHOLE backlog before the worker starts. Publishing while it
 		// drains would measure the arrival rate rather than the cap: the due set
 		// would never be bigger than a handful of rows, so in-flight requests
 		// would never reach the limit and the assertion below would be vacuous.
+		//
+		// The ingest half of the leg is counted separately: it is CPU the run
+		// spends before any attempt exists, and AC-34's "CPU largely idle" is about
+		// the attempt fan-out.
 		for i := 0; i < backlog; i++ {
 			f.publish(t, eventType, `{"id":"bound"}`)
 		}
@@ -101,6 +135,9 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 		var sampler sync.WaitGroup
 		sampler.Add(1)
 		maxGoroutines, maxFDs := 0, 0
+		var cpuCores float64
+		started := time.Now()
+		cpuAtStart := processCPUSeconds()
 		go func() {
 			defer sampler.Done()
 			for {
@@ -115,6 +152,7 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 				if n := openFileDescriptors(); n > maxFDs {
 					maxFDs = n
 				}
+				cpuCores = (processCPUSeconds() - cpuAtStart) / time.Since(started).Seconds()
 				time.Sleep(10 * time.Millisecond)
 			}
 		}()
@@ -142,7 +180,7 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 		// Wait for the receiver to have served every attempt AND the worker to have
 		// finished every delivery, so the maxima cover the whole load rather than
 		// the moment the last publish returned.
-		deadline := time.Now().Add(3 * time.Minute)
+		deadline := time.Now().Add(5 * time.Minute)
 		for time.Now().Before(deadline) {
 			cur, _, started := counter.snapshot()
 			if cur == 0 && started >= backlog && f.pendingDeliveries(t) == 0 {
@@ -152,9 +190,9 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 		}
 		close(stop)
 		sampler.Wait()
-		_, peak, started := counter.snapshot()
+		_, peak, attemptsServed := counter.snapshot()
 		if pending := f.pendingDeliveries(t); pending != 0 {
-			t.Fatalf("offered %d: %d deliveries still pending after 3m", backlog, pending)
+			t.Fatalf("offered %d: %d deliveries still pending after 5m", backlog, pending)
 		}
 		cancel()
 		wg.Wait()
@@ -167,41 +205,62 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		return peak, maxGoroutines, maxFDs, started
+		return figures{
+			backlog: backlog, inFlight: peak, goroutines: maxGoroutines,
+			fds: maxFDs, attempts: attemptsServed, cpuCores: cpuCores,
+		}
 	}
 
-	type figures struct{ inFlight, goroutines, fds, attempts int }
 	seen := map[int]figures{}
-	for _, backlog := range []int{smallBacklog, largeBacklog} {
-		inFlight, goroutines, fds, attempts := census(backlog)
-		seen[backlog] = figures{inFlight, goroutines, fds, attempts}
-		t.Logf("offered %d deliveries: peak in-flight %d, peak goroutines %d, peak fds %d, attempts served %d",
-			backlog, inFlight, goroutines, fds, attempts)
+	record := func(fig figures) {
+		seen[fig.backlog] = fig
+		t.Logf("offered %d deliveries: peak in-flight %d, peak goroutines %d, peak fds %d, attempts served %d, CPU %.2f cores",
+			fig.backlog, fig.inFlight, fig.goroutines, fig.fds, fig.attempts, fig.cpuCores)
 
-		if inFlight > concurrencyCap {
+		if fig.inFlight > concurrencyCap {
 			t.Errorf("offered %d: %d attempts in flight for an endpoint capped at %d (FR-1302)",
-				backlog, inFlight, concurrencyCap)
+				fig.backlog, fig.inFlight, concurrencyCap)
 		}
-		if inFlight < 2 {
+		if fig.inFlight < 2 {
 			t.Errorf("offered %d: peak in-flight was %d; the load never overlapped more than one attempt, so this run says nothing about concurrency",
-				backlog, inFlight)
+				fig.backlog, fig.inFlight)
 		}
-		if inFlight < concurrencyCap {
+		if fig.inFlight < concurrencyCap {
 			// Not a failure: the cap is an upper bound, and a box slow enough that
 			// the claim loop cannot refill it measures the box rather than the cap.
 			// Logged rather than asserted, and the cap's exact behaviour has its own
 			// test (TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas).
 			t.Logf("offered %d: peak in-flight %d did not reach the %d cap; the dispatch loop, not the cap, was the binding constraint in this run",
-				backlog, inFlight, concurrencyCap)
+				fig.backlog, fig.inFlight, concurrencyCap)
 		}
-		if attempts < backlog {
-			t.Errorf("offered %d: only %d attempts were served", backlog, attempts)
+		if fig.attempts < fig.backlog {
+			t.Errorf("offered %d: only %d attempts were served", fig.backlog, fig.attempts)
+		}
+		// An absolute ceiling on every leg, so a run in which BOTH footprints are
+		// broken fails rather than agreeing with itself.
+		if fig.goroutines > baseline+processCap+128 {
+			t.Errorf("offered %d: %d goroutines with a process cap of %d and a baseline of %d; the pool bound is not holding",
+				fig.backlog, fig.goroutines, processCap, baseline)
+		}
+		if fig.fds > 512 {
+			t.Errorf("offered %d: %d open file descriptors, which a default ulimit -n of 1024 would not survive alongside the rest of a replica",
+				fig.backlog, fig.fds)
 		}
 	}
 
-	small, large := seen[smallBacklog], seen[largeBacklog]
+	record(census(smallBacklog, comparativeService))
+	record(census(largeBacklog, comparativeService))
 
-	// Six times the work, the same footprint. This is AC-34's bound.
+	// AC-34's literal figure, and the limit AC-34's third clause is about. Both are
+	// reported: nothing here turns on the raise succeeding, because the assertion is
+	// that the footprint never approaches either value.
+	before, after := raiseSoftNoFile(t)
+	t.Logf("RLIMIT_NOFILE soft/hard: %d/%d before the literal leg, %d/%d for it", before.Cur, before.Max, after.Cur, after.Max)
+	record(census(literalBacklog, literalService))
+
+	small, large, literal := seen[smallBacklog], seen[largeBacklog], seen[literalBacklog]
+
+	// Six times the work, the same footprint. This is AC-34's bound, comparatively.
 	if large.goroutines > small.goroutines+slack {
 		t.Errorf("AC-34: peak goroutines %d when offering %d deliveries against %d when offering %d; the count tracks the backlog instead of the caps (FR-816)",
 			large.goroutines, largeBacklog, small.goroutines, smallBacklog)
@@ -210,15 +269,87 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 		t.Errorf("AC-34: peak open file descriptors %d when offering %d deliveries against %d when offering %d; descriptors track the backlog instead of the caps",
 			large.fds, largeBacklog, small.fds, smallBacklog)
 	}
-	// An absolute ceiling too, so a run in which BOTH footprints are broken fails
-	// rather than agreeing with itself.
-	if large.goroutines > baseline+processCap+128 {
-		t.Errorf("AC-34: %d goroutines with a process cap of %d and a baseline of %d; the pool bound is not holding",
-			large.goroutines, processCap, baseline)
+	// Twenty times the work again, and still the same footprint: this is the leg
+	// that refutes "2,500 in-flight attempts hold roughly 5,000 descriptors".
+	if literal.goroutines > large.goroutines+slack {
+		t.Errorf("AC-34: peak goroutines %d when offering the criterion's literal %d deliveries against %d when offering %d; the count tracks the backlog instead of the caps",
+			literal.goroutines, literalBacklog, large.goroutines, largeBacklog)
 	}
-	if large.fds > 512 {
-		t.Errorf("AC-34: %d open file descriptors, which a default ulimit -n of 1024 would not survive alongside the rest of a replica", large.fds)
+	if literal.fds > large.fds+slack {
+		t.Errorf("AC-34: peak open file descriptors %d when offering the criterion's literal %d deliveries against %d when offering %d; descriptors track the backlog instead of the caps",
+			literal.fds, literalBacklog, large.fds, largeBacklog)
 	}
+	// "FD usage within the documented ulimit": the literal leg's peak, against the
+	// actual limit it ran under. This is the clause that is about the operator.
+	if literal.fds > int(after.Cur) {
+		t.Errorf("AC-34: %d open descriptors inside an RLIMIT_NOFILE of %d", literal.fds, after.Cur)
+	}
+	// "CPU largely idle". Half a core, against a 2 vCPU reference machine: the
+	// fan-out is I/O-bound, so a figure near the cap would mean the run was
+	// measuring the box's CPU rather than the delivery path.
+	if literal.cpuCores > 0.5 {
+		t.Errorf("AC-34: the attempt fan-out used %.2f cores on a 2 vCPU reference machine; the capped fan-out is supposed to leave the CPU largely idle",
+			literal.cpuCores)
+	}
+}
+
+// figures is one leg's census.
+type figures struct {
+	backlog, inFlight, goroutines, fds, attempts int
+	cpuCores                                     float64
+}
+
+// raiseSoftNoFile lifts this process's soft RLIMIT_NOFILE to the hard limit and
+// returns the limit before and after. It cannot fail usefully: an unprivileged
+// process may always raise its soft limit up to the hard one, and if the raise is
+// refused the measurement is still valid - the test then reports the limit it
+// actually ran under.
+func raiseSoftNoFile(t *testing.T) (before, after syscall.Rlimit) {
+	t.Helper()
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &before); err != nil {
+		t.Logf("RLIMIT_NOFILE could not be read: %v", err)
+		return before, before
+	}
+	raised := before
+	raised.Cur = raised.Max
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &raised); err != nil {
+		t.Logf("RLIMIT_NOFILE could not be raised from %d to %d: %v", before.Cur, before.Max, err)
+		return before, before
+	}
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &after); err != nil {
+		return before, raised
+	}
+	return before, after
+}
+
+// processCPUSeconds is this process's user+system CPU time in seconds, read from
+// /proc/self/stat. A read failure (a non-Linux host) reports 0, which makes the
+// CPU assertion vacuous rather than failing on the platform.
+func processCPUSeconds() float64 {
+	raw, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		return 0
+	}
+	// The comm field (2) is parenthesised and can contain spaces, so the fields
+	// after it are counted from the last ')'.
+	s := string(raw)
+	idx := strings.LastIndex(s, ")")
+	if idx < 0 {
+		return 0
+	}
+	fields := strings.Fields(s[idx+1:])
+	// After comm, field 1 is state; utime and stime are fields 14 and 15 of the
+	// whole line, so indexes 11 and 12 here (0-based, state = 0).
+	if len(fields) < 13 {
+		return 0
+	}
+	utime, err1 := strconv.ParseFloat(fields[11], 64)
+	stime, err2 := strconv.ParseFloat(fields[12], 64)
+	if err1 != nil || err2 != nil {
+		return 0
+	}
+	const clockTicksPerSecond = 100 // USER_HZ on Linux/amd64
+	return (utime + stime) / clockTicksPerSecond
 }
 
 // openFileDescriptors counts this process's open descriptors. AC-34's "FD usage
