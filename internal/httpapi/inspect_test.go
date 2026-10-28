@@ -229,7 +229,7 @@ func (e *env) completeDelivery(t *testing.T, id, attempts int64, started, done t
 }
 
 // failDelivery runs S4's terminal path: one failed attempt row (FR-804) and a
-// delivery left `failed` (FR-806).
+// delivery left `failed_terminal` (FR-806, the name I-4 gives that state).
 func (e *env) failDelivery(t *testing.T, id int64, status int, attempts int, started time.Time) {
 	t.Helper()
 	for n := 1; n <= attempts; n++ {
@@ -493,8 +493,10 @@ func TestDeliveryDetailExposesOrderedAttempts(t *testing.T) {
 	mustStatus(t, code, raw, http.StatusOK)
 	detail := decode[deliveryJSON](t, raw)
 
-	if detail.Status != "failed" || detail.Attempts != 2 {
-		t.Fatalf("detail = status %q attempts %d, want failed/2", detail.Status, detail.Attempts)
+	// I-4/FR-1201: `failed_terminal` is the terminal status name S5 lands
+	// (0013 migrates the data and replaces the check constraint).
+	if detail.Status != "failed_terminal" || detail.Attempts != 2 {
+		t.Fatalf("detail = status %q attempts %d, want failed_terminal/2", detail.Status, detail.Attempts)
 	}
 	if len(detail.AttemptsRows) != 2 {
 		t.Fatalf("detail returned %d attempt rows, want 2", len(detail.AttemptsRows))
@@ -747,7 +749,7 @@ func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
 	// The filter is this test's own endpoint: the tenant is shared with its
 	// siblings, and a replay that selected their deliveries would be a bug this
 	// test could not see.
-	body := map[string]any{"status": "failed", "endpoint_id": fx.EndpointID, "idempotency_key": "ac12-request-key"}
+	body := map[string]any{"status": "failed_terminal", "endpoint_id": fx.EndpointID, "idempotency_key": "ac12-request-key"}
 	code, raw := e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken, body)
 	mustStatus(t, code, raw, http.StatusOK)
 	first := decode[replayJSONBody](t, raw)
@@ -856,7 +858,7 @@ func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
 
 	// A replay needs a request key: without one a retry would double the batch.
 	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
-		map[string]any{"status": "failed"})
+		map[string]any{"status": "failed_terminal"})
 	mustStatus(t, code, raw, http.StatusBadRequest)
 	if got := errorCode(t, raw); got != "idempotency_key_required" {
 		t.Fatalf("error code = %q, want idempotency_key_required", got)
@@ -864,7 +866,7 @@ func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
 
 	// A dry run answers the count and the bound without writing.
 	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
-		map[string]any{"status": "failed", "endpoint_id": fx.EndpointID, "idempotency_key": "ac12-dry-run", "dry_run": true})
+		map[string]any{"status": "failed_terminal", "endpoint_id": fx.EndpointID, "idempotency_key": "ac12-dry-run", "dry_run": true})
 	mustStatus(t, code, raw, http.StatusOK)
 	dry := decode[replayJSONBody](t, raw)
 	if dry.Matched != 2 || dry.Created != 0 || !dry.DryRun {
@@ -1173,7 +1175,7 @@ func TestConsumerSeesOnlyItsOwnDeliveries(t *testing.T) {
 	// the claim decides, so the selection is the caller's own.
 	e.failDelivery(t, siblingIDs[0], 500, 1, time.Now().Add(-time.Minute))
 	code, raw = e.do(http.MethodPost, "/v1/consumer/deliveries/replay", mine.ConsumerToken,
-		map[string]any{"consumer_id": siblingConsumer, "status": "failed", "idempotency_key": "s7-consumer-replay"})
+		map[string]any{"consumer_id": siblingConsumer, "status": "failed_terminal", "idempotency_key": "s7-consumer-replay"})
 	mustStatus(t, code, raw, http.StatusOK)
 	result := decode[replayJSONBody](t, raw)
 	if result.Matched != 0 || result.Created != 0 {
@@ -1192,11 +1194,12 @@ func TestConsumerSeesOnlyItsOwnDeliveries(t *testing.T) {
 	// Its own consumer's deliveries are replayable from the portal (UI-16),
 	// which is the API's own bound and rate, not a portal-invented one.
 	if _, err := e.admin.Exec(context.Background(),
-		`update deliveries set status = 'failed' where consumer_id = $1 and status = 'pending'`, mine.ConsumerID); err != nil {
+		// `failed_terminal`, not `failed`: I-4's vocabulary, enforced by 0013's check.
+		`update deliveries set status = 'failed_terminal' where consumer_id = $1 and status = 'pending'`, mine.ConsumerID); err != nil {
 		t.Fatal(err)
 	}
 	code, raw = e.do(http.MethodPost, "/v1/consumer/deliveries/replay", mine.ConsumerToken,
-		map[string]any{"status": "failed", "idempotency_key": "s7-consumer-replay-own"})
+		map[string]any{"status": "failed_terminal", "idempotency_key": "s7-consumer-replay-own"})
 	mustStatus(t, code, raw, http.StatusOK)
 	own := decode[replayJSONBody](t, raw)
 	if own.Matched != 1 || own.Created != 1 {
