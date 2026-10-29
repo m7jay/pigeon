@@ -2,8 +2,10 @@ package doctor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/m7jay/pigeon/internal/db"
+	"github.com/m7jay/pigeon/internal/redisconn"
 )
 
 // The production probes. They are thin on purpose: doctor's behaviour lives in
@@ -65,13 +68,35 @@ type RedisProbeImpl struct{ rdb *redis.Client }
 
 // OpenRedis connects for the diagnostics. As with Postgres, a failure means the
 // caller passes nil and the Redis checks skip with the reason.
+//
+// The client is built through internal/redisconn, the one reading of
+// PIGEON_REDIS_URL every production caller shares. Doctor has to accept what the
+// deployment ships - .env.example and compose.yaml both set
+// `redis://redis:6379/0` - and the URL's database index has to reach the client:
+// a host-only parse still connects, so the CONFIG GETs would quietly read DB 0
+// while the deployment's own database went unexamined.
+//
+// redis.NewClient(&redis.Options{Addr: url}) was the defect here. go-redis dials
+// Addr verbatim, so the documented URL became a *hostname* and doctor reported
+//
+//	dial tcp: address redis://redis:6379/0: too many colons in address
+//
+// on a healthy box: a false Redis failure, with D-5's appendonly check skipped
+// behind it, on exactly the box the operator ran doctor on because something was
+// wrong. (OPS-7, FR-705, FR-1307.)
 func OpenRedis(ctx context.Context, url string) (*RedisProbeImpl, error) {
 	if url == "" {
 		return nil, fmt.Errorf("PIGEON_REDIS_URL is not set")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	rdb := redis.NewClient(&redis.Options{Addr: url})
+	rdb, err := redisconn.Client(url)
+	if err != nil {
+		// redisconn's message quotes the value it refused, and a Redis URL may
+		// carry a password in its userinfo. Doctor's lines redact the URL
+		// (FR-1008), so the reason must not smuggle the raw one past them.
+		return nil, errors.New(strings.ReplaceAll(err.Error(), url, Redact(url)))
+	}
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
 		return nil, err
