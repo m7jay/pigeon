@@ -14,9 +14,11 @@ import (
 // event is about (consumer_ref / consumer_id), and each consumer declared which
 // event types it wants on which endpoints (subscriptions). Fan-out computes that
 // intersection and writes one delivery row per match BEFORE any attempt is made
-// (FR-703), in one transaction per event, idempotent on (event_id, endpoint_id)
-// (FR-704), batched so N rows are one round trip (FR-706). The lease is set here,
-// at creation, never at claim (FR-813).
+// (FR-703), idempotent on (event_id, endpoint_id) (FR-704), batched so N rows are
+// one round trip (FR-706). One event's fan-out set is never split across
+// transactions - how many events one transaction carries is the entry point's
+// choice, and the two below differ exactly there (FR-703 as amended by `SPEC.md`
+// A-11, FR-818). The lease is set here, at creation, never at claim (FR-813).
 //
 // There are two entry points, and they differ only in how many events one
 // transaction carries:
