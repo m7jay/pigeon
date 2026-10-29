@@ -13,12 +13,16 @@ The claim this document publishes is the measured result, not the design target:
 > 250 × 10 = 2,500 deliveries/s target**.
 >
 > **§8.1's 2,500 deliveries/s is the target this run missed, not a number it
-> measured.** The two causes are named below and neither is tuned around: FR-818's
-> bounded batch queue is implemented nowhere, so the instance never sheds and never
-> reaches a ceiling; and the relay fans out one row per iteration, so deliveries
-> stop before they reach the dispatch loop. What the run does *not* show is that
-> this machine class cannot do better - it shows that two required paths are
-> missing, and a ceiling cannot be measured on a tree that has none.
+> measured.** The two causes are named below and neither is tuned around: at the
+> time of this run FR-818's bounded batch queue was implemented nowhere, so the
+> instance never shed and never reached a ceiling; and the relay still fans out one
+> row per iteration, so deliveries stop before they reach the dispatch loop. FR-818
+> has since landed on the base as slice **S12** (`t_c6afa452`, `SPEC.md` A-11), and
+> the graded re-run that exercises it, including the §8.1 `-class` comparison, is
+> **`t_0bf3effa`**; the figures in this document are the pre-FR-818 baseline that
+> run is measured against. What the run does *not* show is that this machine class
+> cannot do better - it shows that two required paths were missing, and a ceiling
+> cannot be measured on a tree that has none.
 
 Two units are always reported together, because they are not the same workload and
 conflating them is the defect §8.1's "Capacity basis" paragraph fixes: ingest is two
@@ -236,7 +240,7 @@ Two independent defects, both owned by other cards. Neither is tuned around here
    Both legs are real and both are required for the delivery unit; they are simply
    two mechanisms, and sending this one to S11's dispatch scope would have lost it.
 
-### Why nothing was shed: FR-818 is implemented nowhere
+### Why nothing was shed: the measured tree had no FR-818 (it has landed since)
 
 AC-30's second leg is "no silent latency growth", and this run shows exactly that
 growth - p99 moved 3,593.4 ms → 4,281.6 ms across the graded window while **zero**
@@ -246,17 +250,20 @@ publishes were refused. The cause is not a tuned threshold. It is that FR-818
 > the relay and delivery workers MUST block and propagate backpressure to ingest
 > (`429`), never grow goroutines or drop accepted events.
 
-has no implementation in this tree, and never had one. `handlePublish`
+had no implementation on the tree this run measured (`b65d9c7`). `handlePublish`
 (`internal/httpapi/events.go`) calls `s.deps.Data.PublishEvent` synchronously; the
-only `429` on that path is SB-7's disk-budget gate. There is no bounded batch
-queue between ingest and Postgres, so when the write path saturates the instance
-queues on the connection pool instead of shedding, and the latency grows silently.
+only `429` on that path was SB-7's disk-budget gate. There was no bounded batch
+queue between ingest and Postgres, so when the write path saturated the instance
+queued on the connection pool instead of shedding, and the latency grew silently.
 The pool measurement above is the same fact from the other side: at the shipped
 `PIGEON_DB_MAX_CONNS=10`, a single publish took 10.2 s.
 
-So AC-30 cannot pass on this tree at any rate, and it is not this slice's to fix:
-FR-818 is a P0 with no owning slice. It is carded against the slice table rather
-than fixed here.
+So AC-30 could not pass on the measured tree at any rate, and it was not this
+slice's to fix: FR-818 was a P0 with no owning slice. It is now slice **S12**
+(`t_c6afa452`, `SPEC.md` A-11), landed on the base after this run, and the graded
+run that exercises the mechanism is **`t_0bf3effa`**. This card keeps the report and
+the harness; the numbers above are the pre-FR-818 baseline the graded run is
+measured against.
 
 ## What this run does not prove
 
@@ -290,8 +297,10 @@ Reported here so the gap is a sentence rather than a discovery:
 - **AC-30's "the ceiling matches the §8.1 table within 20%" is not implemented by
   this harness and is therefore not decided by any run in this repository.** There
   is no `-class` comparison, no §8.1 table in `cmd/loadgen`, and `compare` is the
-  AC-43 scaling comparison only. That leg needs the instance to reach its ceiling,
-  which the FR-818 gap above prevents. Recorded as a gap, not claimed.
+  AC-43 scaling comparison only. That leg needs the instance to reach its ceiling -
+  which the measured tree could not, because it had no FR-818 - and it is carded as
+  **`t_0bf3effa`** (the `-class` comparison and the graded run on a rated host).
+  Recorded as a gap here, not claimed.
 - **AC-34 is measured at the criterion's own figure, and the earlier reading of it
   was wrong.** `TestAttemptFanOutIsBounded` (`internal/delivery`) has three legs, and
   the third drives AC-34's literal **2,500 due deliveries offered at once** to one
