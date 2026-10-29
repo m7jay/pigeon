@@ -183,6 +183,62 @@ func TestOpenSealedHeadersIsBoundToTheEndpoint(t *testing.T) {
 	}
 }
 
+// TestOpenSealedHeadersIsBoundToTheHeaderName (FR-1006): the AAD carries the
+// field as well as the row. One endpoints row holds up to five values (FR-405),
+// so with the row alone a ciphertext copied from one header onto another inside
+// the same row would still authenticate, and the value would be delivered under
+// a name it was never sealed for - the move the row-level AAD cannot see.
+func TestOpenSealedHeadersIsBoundToTheHeaderName(t *testing.T) {
+	st := &Store{headersKey: headersTestKey(t)}
+	sealed, err := st.sealHeaders("end_1", []CustomHeader{
+		{Name: "X-Api-Key", Value: "***"},
+		{Name: "X-Tenant", Value: "acme"},
+	})
+	if err != nil {
+		t.Fatalf("sealHeaders: %v", err)
+	}
+	entries, err := sealedHeaderEntries(sealed)
+	if err != nil {
+		t.Fatalf("sealedHeaderEntries: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("the sealed column holds %d entries, want 2", len(entries))
+	}
+
+	// Swap the row's own two ciphertexts and leave the names where they are. The
+	// column stays well-formed and every value_ct in it was sealed by this
+	// deployment under this endpoint's row - only the field each belongs to has
+	// changed.
+	swapped, err := json.Marshal([]sealedHeader{
+		{Name: entries[0].Name, ValueCT: entries[1].ValueCT},
+		{Name: entries[1].Name, ValueCT: entries[0].ValueCT},
+	})
+	if err != nil {
+		t.Fatalf("marshal the swapped column: %v", err)
+	}
+	headers, dropped, err := st.openSealedHeaders("end_1", swapped)
+	if err != nil {
+		t.Fatalf("openSealedHeaders(the swapped column): %v", err)
+	}
+	if len(headers) != 0 {
+		t.Fatalf("a ciphertext moved between two names in one row opened: %+v", headers)
+	}
+	if len(dropped) != 2 || dropped[0] != "X-Api-Key" || dropped[1] != "X-Tenant" {
+		t.Fatalf("dropped = %v, want both names so the worker logs what it refused", dropped)
+	}
+
+	// The control: the column as written opens both values, so the refusal above
+	// is the name and not something else about the entry.
+	headers, dropped, err = st.openSealedHeaders("end_1", sealed)
+	if err != nil {
+		t.Fatalf("openSealedHeaders(as written): %v", err)
+	}
+	if len(headers) != 2 || len(dropped) != 0 {
+		t.Fatalf("openSealedHeaders(as written) = %+v dropped %v, want both values and no drops",
+			headers, dropped)
+	}
+}
+
 // TestOpenSealedHeadersDropsUnderAnotherKey: a rotated (or wrong) deployment key
 // must not send a garbage value - the header is dropped, the delivery is not
 // wedged, and the failure is attributed by name.

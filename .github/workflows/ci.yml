@@ -157,6 +157,13 @@ jobs:
           # "redactable" is TestEndpointCustomHeadersRoundTripIsRedacted (API
           # reads), TestEndpointDetailShowsHeaderNamesAndMasks (the portal's UI)
           # and TestCustomHeaderValuesNeverReachTheLogs (logs).
+          #
+          # The AAD's second leg registered last, with the change that added it:
+          # TestOpenSealedHeadersIsBoundToTheHeaderName pins that a ciphertext
+          # moved between two header names inside one endpoint's row does not
+          # authenticate, which the row-only AAD (FR-1006 as first shipped) could
+          # not catch. The row-level leg is TestOpenSealedHeadersIsBoundToTheEndpoint
+          # and the moved-row leg is TestClaimDropsACiphertextMovedToAnotherEndpointsRow.
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -252,7 +259,8 @@ jobs:
             TestCreateEndpointStoresHeaderValuesEncrypted \
             TestEndpointCustomHeadersRoundTripIsRedacted \
             TestEndpointDetailShowsHeaderNamesAndMasks \
-            TestCustomHeaderValuesNeverReachTheLogs
+            TestCustomHeaderValuesNeverReachTheLogs \
+            TestOpenSealedHeadersIsBoundToTheHeaderName
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
