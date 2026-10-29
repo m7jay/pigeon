@@ -22,6 +22,7 @@ import (
 	"github.com/m7jay/pigeon/internal/ratelimit"
 	"github.com/m7jay/pigeon/internal/retention"
 	"github.com/m7jay/pigeon/internal/store"
+	"github.com/m7jay/pigeon/internal/writeq"
 )
 
 // Lookup authenticates a plaintext bearer key. Declared as a function type so the
@@ -150,6 +151,25 @@ type Deps struct {
 	// signal": the usage route answers 503 and publish never sheds, which is what
 	// the unit tests want. *retention.Manager implements it.
 	Retention Retention
+
+	// Writes is FR-818's bounded write budget (SPEC.md A-11): the publish path
+	// asks it for a slot and is refused with a 429 when the budget stays full for
+	// PIGEON_INGEST_ADMIT_TIMEOUT. It is the SAME queue the store's control-state
+	// writers submit to, so "full" means the machine's write capacity rather than
+	// one subsystem's queue. Nil means "no budget": publish never sheds for write
+	// pressure, which is what the handler tests that do not exercise the write
+	// path want. *writeq.Queue implements it.
+	Writes WriteBudget
+}
+
+// WriteBudget is FR-818's admission half. Admitting is all the publish path
+// needs: a slot is held for the request's one transaction and released when it
+// commits, which is the resource a pool connection would otherwise have made the
+// request wait for with no deadline. The interface exists so a handler test can
+// refuse admission without building a queue, and so *writeq.Queue's own tests do
+// not need an HTTP server.
+type WriteBudget interface {
+	Admit(ctx context.Context) (writeq.Release, error)
 }
 
 // Retention is the read side of the storage budget. The interface exists so the
@@ -279,7 +299,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP pigeon_partition_drops_total Partitions dropped by retention because of the disk budget or age (SB-3).\n")
 	_, _ = fmt.Fprintf(w, "# TYPE pigeon_partition_drops_total counter\n")
 	_, _ = fmt.Fprintf(w, "pigeon_partition_drops_total %d\n", s.deps.Metrics.PartitionDropCount())
-	_, _ = fmt.Fprintf(w, "# HELP pigeon_publishes_shed_total Publishes refused with 429 because the disk was over budget (SB-7).\n")
+	_, _ = fmt.Fprintf(w, "# HELP pigeon_publishes_shed_total Publishes refused with 429 because the disk was over budget (SB-7) or the write path was saturated (FR-818).\n")
 	_, _ = fmt.Fprintf(w, "# TYPE pigeon_publishes_shed_total counter\n")
 	_, _ = fmt.Fprintf(w, "pigeon_publishes_shed_total %d\n", s.deps.Metrics.ShedCount())
 	// OBS-13, per endpoint (FR-1304): how often an endpoint's limits refused to
