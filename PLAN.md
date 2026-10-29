@@ -87,11 +87,14 @@ disposes of them, and the split is deliberate:
   set it. §7.13's row names both halves so it no longer reads as one unowned claim.
 
 **Consequence for S10, recorded rather than acted on.** AC-16's "hanging endpoint capped" leg
-is measured in S10, and its NFR-2 leg (normal publish to first attempt ≤ 60 s) cannot pass
-while the dispatch path parks behind the first capped endpoint. S11 is a precondition for that
-measurement, not a replacement for it: AC-16 and AC-17 stay S10's. Whether that re-gates S10's
-`Depends on` is the leader's call, so the dependency is written here instead of by editing the
-row under a running card.
+is measured in S10, and its NFR-2 leg (normal publish to first attempt ≤ 60 s) could not pass
+while the dispatch path parked behind the first capped endpoint. S11 was a precondition for that
+measurement, not a replacement for it. AC-16, AC-17 and AC-43 are measured on the 8 vCPU / 16 GB
+class by card `t_94f397ba`; S10 records them as deferred with the measured legs named (`t_bcfda850`),
+because this project has no host that carries the rating. AC-16's NFR-2 leg was blocked on S11,
+which has landed (PR #54); the measurement it enables is now waiting only on the rated host. Whether
+that re-gates S10's `Depends on` was the leader's call and is answered by the disposition ruling:
+the dependency is written here instead of by editing the row under a running card.
 
 ## Current state (S0) — closed
 
@@ -245,8 +248,8 @@ Per-requirement map, corrected:
 | OPS-10 | `TestConnectionBudgetNamesTheArithmetic` (check id `db.connection_budget`, substituted formula as the observed value) |
 | OPS-11 | `TestObservedValuesAreSingleLine`, `TestNoSecretAppearsInAnyRendering`, `TestNothingToObserveIsExitThree`, `TestJSONMatchesTheLineOutput`, `TestChecksAreBoundedAndOrdered` |
 | AC-22 | OPS-4's rows; `TestAConfiguredDependencyThatWillNotAnswerIsAFailure` and `TestArithmeticChecksSkipWhenTheConfigurationDidNotLoad` pin the two kinds of silence |
-| AC-30, AC-31, AC-34 | `docs/load-test.md` and the runnable harness `cmd/loadgen` (`run`, `seed`, `sink`, `compare`); the document reports what was measured and names AC-34 as outstanding |
-| AC-43 | **not measured here** — one host cannot show per-doubling scaling; `docs/load-test.md` says so |
+| AC-30, AC-31, AC-34 | `docs/load-test.md` and the runnable harness `cmd/loadgen` (`run`, `seed`, `sink`, `compare`); the document reports what was measured; AC-34 is measured by `TestAttemptFanOutIsBounded` (its literal 2,500 leg included) and AC-30's ceiling comparison is a harness gap owned by `t_8e39d4eb` |
+| AC-43 | **not measured here** - one host cannot show per-doubling scaling; `docs/load-test.md` says so; owned by `t_94f397ba`, with AC-16/AC-17 |
 | §16.5 / AC-42 | `internal/faults/faults_test.go` behind `-tags faults`, run nightly by `.github/workflows/nightly-faults.yml` |
 
 Honest limits — the next slices own these:

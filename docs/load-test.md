@@ -190,9 +190,15 @@ FAIL AC-30  refusals were 429 only: false (errors 1); p99 3593.4 ms -> 4281.6 ms
 FAIL AC-31  accepted 207.1 of 250 events/s (82.8%) with p99 4281.6 ms (NFR-1
             ceiling 100 ms); 82.0 deliveries/s at 10 subscription(s) per event
 FAIL AC-34  under a sustained 207 events/s the ingest path reported 1 errors and
-            p99 4281.6 ms
+            p99 4281.6 ms; the attempt census itself is TestAttemptFanOutIsBounded
 FAIL §16    reconciliation: events 438998, outbox 438998 against 438997 accepted
 ```
+
+AC-34's criterion (goroutines bounded by the caps, FDs within the documented
+`ulimit`, CPU largely idle) is decided by `TestAttemptFanOutIsBounded`, which drives
+the literal 2,500 and passes in CI on this head; the harness's AC-34 line is its
+ingest-path proxy, so its FAIL is AC-30/AC-31's saturation seen a second time, not
+the bound.
 
 ### Why the delivery number is 3.3% of the claim
 
@@ -259,11 +265,18 @@ Reported here so the gap is a sentence rather than a discovery:
   binary was built from `b65d9c7`, which predates the base branch's FR-905
   landing (dedupe archive, `internal/retention`, `internal/store/retention.go`,
   `internal/db/migrations/0014_dedupe_archive.sql`), the attempt-buffer strand
-  sweep and their configuration knobs. The delivery and ingest hot path is
-  byte-identical between the two (`internal/delivery/delivery.go`,
-  `internal/store/delivery.go`, `internal/store/fanout.go` are untouched by the
-  base delta), so the *shape* of the result stands, but the numbers were not taken
-  on the published head and are labelled as what they are. A re-run on the head
+  sweep, their configuration knobs, and **S11's dispatch fix (PR #54,
+  FR-1303/FR-1304)**. The ingest hot path (`internal/store/delivery.go`,
+  `internal/store/fanout.go`) is untouched by the base delta; the dispatch path is
+  not - S11 replaced the `acquireEndpointLimits` wait this run measured with a
+  non-blocking `admit` and lane partitioning - so the *shape* of the result stands,
+  but the numbers were not taken on the published head and are labelled as what they
+  are. The published **82.0 deliveries/s is therefore a lower bound on the landed
+  tree**, not that tree's number: the run could not approach the ceiling while
+  dispatch parked on a capped endpoint, and S11's fix removes that cause. The
+  compliant-host re-measurement is `t_b9850e1b`'s; this card does not re-measure,
+  because §16 forbids a generator on the same cores and this box cannot offer a
+  clean run. A re-run on the head
   was not possible: this is a shared 2 vCPU container whose load average sat
   between 17 and 28 during the session, with another slice's test suites running,
   and §16 already forbids measuring the instance against a generator on the same
@@ -319,12 +332,14 @@ Reported here so the gap is a sentence rather than a discovery:
 - **AC-43 (1 → 2 → 4 replicas scaling ≥ 80% per doubling, and no improvement above
   the Postgres ceiling)** needs more than one host, and `compare` needs at least
   two reports to say anything. This run is a single replica and cannot speak to it.
-- **AC-16 and AC-17 are this card's, and this box cannot rate them.** Both are
-  recorded here explicitly rather than dropped: `PLAN.md:77-82` and S11's card both
-  say AC-16 and AC-17 remain S10's measurements, and silence in this document would
-  delete two criteria from the project. Each is split into the part that is
-  measured, the part that is unmeasurable here, and the part that is blocked on
-  another slice - and each needs a ruling, requested on the card.
+  Owned by `t_94f397ba`, with AC-16 and AC-17 (`t_bcfda850`).
+- **AC-16 and AC-17 were this card's to record, and this box cannot rate them.**
+  Both are recorded here explicitly rather than dropped: `PLAN.md`'s slice notes
+  and S11's card both said AC-16 and AC-17 remain S10's measurements, and silence
+  in this document would delete two criteria from the project. Each is split into the part
+  that is measured, the part that is unmeasurable here, and the part that needs the
+  rated host - all three are dispositioned on `t_bcfda850`, and the unmeasured parts
+  move to `t_94f397ba`.
   - **AC-16** asks for 1,000 events/s with 10 subscriptions and one hanging endpoint
     on **8 vCPU / 16 GB**. This box is 2 vCPU / 7.9 GB, a quarter of the cores, and
     it accepted 207.1 of 250 offered events/s with a 4.3 s p99: a 1,000 events/s run
@@ -337,15 +352,18 @@ Reported here so the gap is a sentence rather than a discovery:
       1,638.74 rows per transaction.
     - *NFR-1 at 1,000 events/s* - **unmeasurable on this machine class**; needs the
       8 vCPU / 16 GB reference host.
-    - *NFR-2 (publish -> first attempt <= 60 s)* - **blocked on S11**: `dispatch`
-      claims a delivery and then waits synchronously for the endpoint's slot or
-      token, so one capped endpoint parks the process's only dispatch loop
-      (`PIGEON_DELIVERY_WORKERS=1` by default). Recorded before this run by
-      pigeon-arch on this card and in `SPEC.md` A-10.
+    - *NFR-2 (publish -> first attempt <= 60 s)* - **unmeasured because the rated
+      load cannot be offered on this machine class**, not blocked on S11: S11 has
+      landed (PR #54, FR-1303/FR-1304) and removed the synchronous
+      `acquireEndpointLimits` wait that used to park the process's only dispatch
+      loop. The measurement it enables is now waiting only on the 8 vCPU / 16 GB
+      reference host.
+    - **Owner: `t_94f397ba`** (pigeon-ops), which owns AC-16, AC-17 and AC-43 on
+      that machine class and blocks `capability` rather than measuring on this box.
 
-    **Disposition requested:** a ruling on whether that split - two legs measured,
-    one unmeasurable here, one blocked on S11 - discharges AC-16, or whether the
-    card should be re-gated behind S11 and the 8 vCPU host.
+    **Disposition (`t_bcfda850`):** the split above is accepted as S10's recording -
+    the two measured legs stand, and the remaining legs are deferred to
+    `t_94f397ba` with the measured legs named. AC-16 is not S10's exit leg.
   - **AC-17** asks that with one producer at 50% of the load the other producer's
     p99 degrades by <= 20%. It is not a machine rating, but it *is* a differential
     measurement, and on a box already saturated at 207 of 250 events/s with a 4.3 s
@@ -354,9 +372,9 @@ Reported here so the gap is a sentence rather than a discovery:
     than producer isolation. It needs a host with headroom at the rated load (the
     8 vCPU class again) and two independent generators.
 
-    **Disposition requested:** a ruling on whether AC-17 stays S10's (to be measured
-    on the 8 vCPU host), moves to that measurement card, or is descoped. It is not
-    claimed by this run.
+    **Disposition (`t_bcfda850`):** AC-17 moves to `t_94f397ba` and is measured on
+    the 8 vCPU / 16 GB host with two independent generators. It is not claimed by
+    this run and is not S10's exit leg.
 - **A first full run was discarded, and why it is worth saying so.** It was taken
   while the test suites were also running on the same 2 vCPU box, which is a
   measurement error: the instance shared its cores with `go test`. It also exposed
@@ -372,10 +390,20 @@ Reported here so the gap is a sentence rather than a discovery:
 
 ## The §16.5 fault-injection matrix
 
-Separate document, separate job: the seven-scenario matrix lives in
+Separate document, separate job: the seven-scenario matrix of §16.5 lives in
 `internal/faults/faults_test.go` behind the `faults` build tag, and
 `.github/workflows/nightly-faults.yml` runs it every night against a real Postgres
 and Redis, plus two process-level scenarios against the real binary (SIGKILL a
 worker mid-flight; stop Postgres for 30 s). It is behind a build tag so the pull
 request gate stays fast and deterministic while the chaotic half runs on a schedule
 that can afford it.
+
+The job migrates its own disposable database before the matrix runs (`fix(ci): the
+fault matrix migrates its own disposable database`), which is what makes it passable
+on a fresh `postgres:16` service container: it was red on its first night without
+that, with 6 of 8 scenarios dying on `relation "producers" does not exist`. The
+matrix is 8 PASS / 0 FAIL / 0 SKIP on a freshly created empty database - the seven
+§16.5 scenarios plus the guard that asserts the matrix names every one of them. Its
+**first real scheduled run is the run after this branch merges**, because GitHub only
+schedules or dispatches a workflow that is present on the default branch; that
+residual is stated rather than hidden.
