@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -129,10 +128,26 @@ type endpointDetail struct {
 	AvailableTypes []string
 }
 
+// snippetView is UI-18's page: the endpoint id (carried forward), the submitted
+// secret so the form can tell it was used, and the four rendered snippets. It no
+// longer carries a single hand-written snippet - the shared renderer in
+// internal/portal produces all four, so this portal and the producer portal
+// implement the signature rules once rather than twice.
 type snippetView struct {
 	EndpointID string
 	Whsec      string
-	Snippet    string
+	Snippet    []snippetRow
+	Note       string
+}
+
+// snippetRow is one snippet as the template renders it. It mirrors
+// portal.Snippet's shape so the shared renderer's output can be shown without the
+// template reaching into another package's type.
+type snippetRow struct {
+	Language string
+	Label    string
+	Source   string
+	Note     string
 }
 
 // --- core response shapes --------------------------------------------------
@@ -148,11 +163,16 @@ type listEndpointsResponse struct {
 	} `json:"endpoints"`
 }
 
-// listSubscribableTypesResponse is GET /v1/consumer/event-types (UI-14): the types
-// the producer has left open to public subscription.
+// listSubscribableTypesResponse is GET /v1/consumer/event-types: the types the
+// producer has left open to public subscription (UI-14), each carrying the live
+// contract UI-9's consumer guide renders. S9a added payload_version and
+// payload_schema to this response; the schema is kept as raw JSON so the guide can
+// pretty-print the API's own document rather than a normalised copy of it.
 type listSubscribableTypesResponse struct {
 	EventTypes []struct {
-		Name string `json:"name"`
+		Name           string          `json:"name"`
+		PayloadVersion int             `json:"payload_version"`
+		PayloadSchema  json.RawMessage `json:"payload_schema"`
 	} `json:"event_types"`
 }
 
@@ -706,15 +726,20 @@ func (h *Handler) unsubscribe(w http.ResponseWriter, r *http.Request) {
 // snippetForm renders the verification-snippet form (UI-18). A logged-in user only;
 // the secret is entered on the next request, never in a query string.
 func (h *Handler) snippetForm(w http.ResponseWriter, r *http.Request) {
-	h.renderPage(w, r, "snippet", "Webhook snippet", "snippet", snippetView{
+	h.renderPage(w, r, "snippet", "Verification snippets", "snippet", snippetView{
 		EndpointID: r.URL.Query().Get("endpoint"),
+		Note:       portal.SnippetTemplateNote,
 	})
 }
 
-// snippetSubmit renders a Standard Webhooks verification snippet for a whsec secret
+// snippetSubmit renders Standard Webhooks verification snippets for a whsec secret
 // (UI-18). The secret arrives in the POST body - not a GET query parameter, where it
 // would land in access logs, browser history and any shared link - and it is used
 // only to render this page: it is not forwarded to the core API and not stored.
+//
+// The four samples come from the shared renderer in internal/portal, the same one
+// the producer portal's UI-7 page calls: the signature rules have one
+// implementation, so the two portals cannot drift about what a valid verifier is.
 func (h *Handler) snippetSubmit(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -723,11 +748,16 @@ func (h *Handler) snippetSubmit(w http.ResponseWriter, r *http.Request) {
 	view := snippetView{
 		EndpointID: strings.TrimSpace(r.FormValue("endpoint")),
 		Whsec:      strings.TrimSpace(r.FormValue("whsec")),
+		Note:       portal.SnippetTemplateNote,
 	}
 	if view.Whsec != "" {
-		view.Snippet = webhookSnippet(view.Whsec)
+		for _, s := range portal.Snippets(view.Whsec) {
+			view.Snippet = append(view.Snippet, snippetRow{
+				Language: string(s.Language), Label: s.Label, Source: s.Source, Note: s.Note,
+			})
+		}
 	}
-	h.renderPage(w, r, "snippet", "Webhook snippet", "snippet", view)
+	h.renderPage(w, r, "snippet", "Verification snippets", "snippet", view)
 }
 
 // --- fragments -------------------------------------------------------------
@@ -786,37 +816,3 @@ func isLocalPath(p string) bool {
 // "next" redirect so a login round-trip preserves the target path without
 // becoming an open-redirect.
 func urlEscape(s string) string { return url.QueryEscape(s) }
-
-// webhookSnippet renders a copy-paste Standard Webhooks verification snippet
-// tailored to the caller's own endpoint signing secret (UI-18). It is generated
-// server-side from the whsec the user already holds and is never sent to the
-// core API; the verifier is the Standard Webhooks Go reference library, so
-// signatures are validated by a maintained implementation rather than ad-hoc
-// HMAC code. strconv.Quote embeds the secret as an inert Go string literal.
-func webhookSnippet(whsec string) string {
-	const head = `// Verify an incoming webhook signature with the Standard Webhooks Go library.
-//   go get github.com/standard-webhooks/standard-webhooks/libraries/go
-
-import (
-	"io"
-	"net/http"
-
-	standardwebhooks "github.com/standard-webhooks/standard-webhooks/libraries/go"
-)
-
-var webhookSecret = `
-	const tail = `
-func verify(r *http.Request) error {
-	wh, err := standardwebhooks.NewWebhook(webhookSecret)
-	if err != nil {
-		return err
-	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	return wh.Verify(body, r.Header)
-}
-`
-	return head + strconv.Quote(whsec) + tail
-}

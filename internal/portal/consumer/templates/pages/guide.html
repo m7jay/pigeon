@@ -1,0 +1,30 @@
+{{define "content"}}
+<h1>Integration guide</h1>
+<p class="page-sub">Rendered from the live event types this producer exposes to you (UI-9). This page and the producer portal render the same source - the event-type table - rather than a copy of a guide, so every name, version and schema below is the live contract, not a copy of one: bump a schema at the source and both pages show it.</p>
+
+{{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+
+{{if .Data.EventTypes}}
+{{range .Data.EventTypes}}
+<div class="card">
+  <h2 class="mono">{{.Name}}</h2>
+  <dl class="kv">
+    <dt>Payload version</dt><dd>{{.PayloadVersion}}</dd>
+  </dl>
+
+  <h3>Payload schema</h3>
+  {{if .Schema}}<pre class="snippet">{{.Schema}}</pre>{{else}}<p class="empty">This event type carries no payload schema, so any JSON object is accepted.</p>{{end}}
+
+  <h3>Subscribing and fan-out</h3>
+  <p class="page-sub">Subscribe one of your endpoints to this type; the API validates each event's payload against the schema above before anything else happens, and the payload version is the one this page shows. Fan-out is the active endpoints of your consumer intersected with the active subscriptions for this type (FR-505, FR-507), so subscribing an endpoint is what makes it receive the type. Each delivery that fan-out produces is signed with its endpoint's own secret, retried independently, and kept with its full attempt trail - so what you see in the delivery log is what you receive.</p>
+
+  <h3>Verifying what you receive</h3>
+  <p class="page-sub">Signatures are Standard Webhooks. Take the endpoint's <span class="mono">whsec_</span> secret to the <a href="/snippet">snippets page</a> for a verifier in curl, Go, Node or Python - during a rotation, accept the old and the new signature until the overlap window closes (UI-6).</p>
+</div>
+{{end}}
+{{else}}
+<div class="card">
+  <p class="empty">No event types are open to public subscription yet, so there is no contract to integrate against. When the producer opens one, it appears here with its live schema.</p>
+</div>
+{{end}}
+{{end}}

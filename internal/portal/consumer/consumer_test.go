@@ -1,6 +1,7 @@
 package consumer
 
 import (
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -138,6 +139,16 @@ func (f *fakeCore) lastRequest(method, path string) captured {
 		}
 	}
 	return captured{}
+}
+
+// allRequests is every request the portal made to the core stand-in, most recent
+// last. Tests that assert an absence - "the secret is in no request" - read this:
+// the portal's own response cannot show what it did not send, and only the core's
+// side of the wire can.
+func (f *fakeCore) allRequests() []captured {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]captured(nil), f.reqs...)
 }
 
 // signedIn drives the portal's own handler with a valid session cookie.
@@ -609,5 +620,106 @@ func TestDetailPageActionsAnswerWithPagesNotFragments(t *testing.T) {
 	}
 	if body := swapped.Body.String(); !strings.Contains(body, `<div id="endpoints-list">`) {
 		t.Fatalf("the htmx pause fragment does not carry its swap target on its root:\n%s", body)
+	}
+}
+
+// TestConsumerSnippetRendersEveryLanguageAndNeverSendsTheSecret is UI-18's shared
+// renderer from the consumer side. UI-7 (producer) and UI-18 (consumer) are the
+// same page for two audiences, so the consumer portal calls the one renderer in
+// internal/portal and shows the same four languages the producer portal does -
+// curl, Go, Node and Python - rather than a second, drifting implementation of the
+// signature rules.
+//
+// The other half is the property the page must not break: the secret the user
+// submits is rendered by this process only and is never sent to the core API. The
+// fake core records every request in full - the URI with its query, and the body -
+// so "never sent" is asserted on what the portal actually put on the wire rather
+// than on what the page shows.
+func TestConsumerSnippetRendersEveryLanguageAndNeverSendsTheSecret(t *testing.T) {
+	core := newFakeCore(t)
+	h := testHandlerAt(t, core.srv.URL)
+	const secret = "whsec_RENDER_ONCE_1234567890"
+
+	rec := signedIn(t, h, http.MethodPost, "/snippet", url.Values{
+		"endpoint": {"end1"}, "whsec": {secret},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /snippet status = %d, want 200", rec.Code)
+	}
+	text := rec.Body.String()
+
+	// All four languages, each as its tab label and its stable language id, and
+	// each backed by its published verifier (the shell sample uses the spec's own
+	// algorithm, so it names openssl).
+	for _, want := range []string{
+		"(go)", "(node)", "(python)", "(curl)", "curl / shell",
+		"standardwebhooks", "pip install standardwebhooks", "openssl",
+		secret, // the secret really was rendered
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("the snippet page did not render %q:\n%s", want, text)
+		}
+	}
+
+	// Rendering the snippets consults nothing: the whole page is built from the
+	// value the user posted.
+	if got := core.calls(); len(got) != 0 {
+		t.Fatalf("the portal asked the core API for something while rendering the snippets: %v", got)
+	}
+	// And in no request the portal did make does the secret appear - not the path,
+	// not the query string, not the body.
+	for _, req := range core.allRequests() {
+		if strings.Contains(req.Path, secret) || strings.Contains(req.URI, secret) || strings.Contains(req.Body, secret) {
+			t.Fatalf("the secret was sent to the core API in %s %s: uri=%q body=%q",
+				req.Method, req.Path, req.URI, req.Body)
+		}
+	}
+}
+
+// TestConsumerGuideRendersTheLiveEventTypeSchemas is UI-9 on the consumer side: the
+// integration guide is rendered from the live event-type schemas the core exposes
+// to this consumer, and from nothing else. The fake core answers one
+// GET /v1/consumer/event-types carrying two subscribable types with their versions
+// and schemas; the page must show both names, both versions and the schema text,
+// and read exactly that one route - the same read UI-14's subscribe control uses,
+// so the guide cannot disagree with what the API will accept.
+func TestConsumerGuideRendersTheLiveEventTypeSchemas(t *testing.T) {
+	core := newFakeCore(t)
+	core.on(http.MethodGet, "/v1/consumer/event-types",
+		`{"event_types":[`+
+			`{"name":"order.shipped","payload_version":3,"payload_schema":{"type":"object","required":["data"]}},`+
+			`{"name":"order.refunded","payload_version":2,"payload_schema":{"type":"object","properties":{"amount":{"type":"number"}}}}`+
+			`]}`, http.StatusOK)
+	h := testHandlerAt(t, core.srv.URL)
+
+	rec := signedIn(t, h, http.MethodGet, "/guide", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /guide status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	// html/template escapes quotes in text nodes as &#34;; the browser shows the
+	// schema's own characters, so the assertions read the page as a browser does.
+	plain := html.UnescapeString(body)
+
+	for _, want := range []string{
+		"order.shipped", "order.refunded", // both names
+		"Payload version", ">3<", ">2<", // both versions
+		`"required"`, `"properties"`, "amount", // both schemas' text
+		"live contract", // the page says this is the live contract, not a copy
+	} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("the guide is missing %q:\n%s", want, body)
+		}
+	}
+	// The schema is the producer's own document, pretty-printed rather than
+	// re-serialised into a normalised shape.
+	if !strings.Contains(plain, "\"type\": \"object\"") {
+		t.Fatalf("the guide does not pretty-print the schema:\n%s", body)
+	}
+
+	// One read, and only the live list: the guide decides nothing the API did not
+	// answer.
+	if got := core.calls(); len(got) != 1 || got[0] != "GET /v1/consumer/event-types" {
+		t.Fatalf("the guide made core calls %v, want only GET /v1/consumer/event-types", got)
 	}
 }
