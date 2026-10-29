@@ -120,6 +120,15 @@ func reconcileDB(ctx context.Context, c config, run, graded window, xactBase int
 	// is left zero and FR-815's batching is read from the run window's figures.
 	fillRate(&gradedOut, graded, 0)
 	gradedOut.XactPS, gradedOut.RowsPerXact = 0, 0
+	// Say why the graded window's match flags are false rather than leaving a reader
+	// to read them as a mismatch: it is counted the same way as the run window, and
+	// the two halves are deliberately not equated.
+	gradedNote := "the graded window's edges are the in-flight set at both ends, so its generator tally is carried as a cross-check rather than equated (events_match and outbox_match are false by design) and its commit rate is not a figure about the window; AC-30's third clause grades the database's counts (§16)"
+	if gradedOut.Note != "" {
+		gradedOut.Note += "; " + gradedNote
+	} else {
+		gradedOut.Note = gradedNote
+	}
 	// The generator's count is the number of 202s it saw. Equality is exact, not
 	// approximate: a tolerance here would hide precisely the defect the check
 	// exists to catch. It is compared per-table so the failing half is named.
@@ -296,6 +305,9 @@ func printReport(r *report) {
 			// rather than from the generator's tally (§16).
 			fmt.Printf("graded window (last %s of the measurement, %.0f s): %.1f events/s and %.1f deliveries/s in the database; the generator's tally was %d accepted\n",
 				r.Evaluated.Name, r.Graded.WindowS, r.Graded.EventsPS, r.Graded.DeliveriesPS, r.Graded.Accepted)
+			if r.Graded.Note != "" {
+				fmt.Printf("  graded window note: %s\n", r.Graded.Note)
+			}
 		}
 	} else if r.Reconcile.Note != "" {
 		fmt.Println("reconciliation:", r.Reconcile.Note)
@@ -314,6 +326,13 @@ func printReport(r *report) {
 			fmt.Printf("§8.1 row the machine itself matches: %s\n", r.Machine.ObservedClass)
 		} else {
 			fmt.Printf("§8.1 row the machine itself matches: none (its class must be attested, not observed)\n")
+		}
+		if r.MachineUnderTest != nil {
+			fmt.Printf("machine under test: %s; AC-30's third clause checks the declared class against it\n",
+				r.MachineUnderTest.describe())
+		} else if r.Class != nil {
+			fmt.Println("machine under test: not recorded, so AC-30's third clause will refuse this artifact " +
+				"(declare it with -sut-cpus/-sut-mem-gib when the generator runs off that machine)")
 		}
 	}
 }
