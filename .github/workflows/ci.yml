@@ -181,6 +181,27 @@ jobs:
           # authenticate, which the row-only AAD (FR-1006 as first shipped) could
           # not catch. The row-level leg is TestOpenSealedHeadersIsBoundToTheEndpoint
           # and the moved-row leg is TestClaimDropsACiphertextMovedToAnotherEndpointsRow.
+          #
+          # The relay's batch drain (FR-815 and FR-818 as amended by SPEC.md A-11,
+          # card `t_b9850e1b`) is registered here in three parts, because the defect
+          # it fixes was a missing shape rather than a wrong value: the lease is one
+          # call for a batch of outbox rows (TestRelayFanOutBatchWritesOneTransaction
+          # and TestRelayBatchSizeFormsTheTransaction count the transactions a batch
+          # opens - one, not one per event - and TestRelayBatchSizeOneDrainsPerEvent
+          # is the control), the fan-out of that batch is one transaction per pack
+          # that fills the write budget's row bound
+          # (TestRelayFanOutSplitsAPassIntoPacksAtTheRowBound and
+          # TestPackFanOutSplitsAtTheRowBound), and the batched path keeps every
+          # property the per-event path had: the tenant scope per producer
+          # (TestRelayFanOutBatchKeepsEachProducersScope), idempotency on a
+          # re-submitted batch (TestRelayFanOutBatchIsIdempotentOnResubmit), the
+          # §7.5a reasons on the durable rows
+          # (TestRelayFanOutBatchRecordsReasonsAndIdleEvents), the acknowledged
+          # prefix when a publish fails mid-batch
+          # (TestRelayBatchHonoursTheAcknowledgedPrefix), a failed transaction
+          # leaving the outbox pending (TestRelayFanOutBatchFailureRollsBackAndLeavesTheOutboxPending)
+          # and the single-event escape hatch for a fan-out wider than the bound
+          # (TestRelayOversizedEventTakesItsOwnTransaction).
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -260,6 +281,18 @@ jobs:
             TestLanesAtTheTwoBoundaries \
             TestFR1207ResumeExtendsThePromisedWindow \
             TestRelayFlushWhilePendingRepublishesAll \
+            TestRelayDrainsABatchInOneTransaction \
+            TestRelayFanOutSplitsAPassIntoPacksAtTheRowBound \
+            TestRelayBatchSizeOneDrainsPerEvent \
+            TestRelayBatchSizeFormsTheTransaction \
+            TestRelayBatchHonoursTheAcknowledgedPrefix \
+            TestRelayOversizedEventTakesItsOwnTransaction \
+            TestRelayFanOutBatchWritesOneTransaction \
+            TestRelayFanOutBatchKeepsEachProducersScope \
+            TestRelayFanOutBatchIsIdempotentOnResubmit \
+            TestRelayFanOutBatchRecordsReasonsAndIdleEvents \
+            TestRelayFanOutBatchFailureRollsBackAndLeavesTheOutboxPending \
+            TestPackFanOutSplitsAtTheRowBound \
             TestRunOnceOverBudgetDropsOldestPartitionFirst \
             TestPublishShedsWith429OverDiskBudget \
             TestUsageEndpointIs503WithoutDiskSignal \
