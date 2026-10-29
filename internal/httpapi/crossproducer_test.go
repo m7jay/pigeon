@@ -49,6 +49,11 @@ func (e *env) withLog(t *testing.T) (*env, *logBuffer) {
 		SessionTTL:      time.Hour,
 		KeyLimiter:      ratelimit.New(1000, 1000),
 		ProducerLimiter: ratelimit.New(1000, 1000),
+		// Retention is wired so the member usage route (S9a's UI-8 panel,
+		// GET /v1/producer/usage) answers its own reading rather than the 503
+		// an unconfigured instance returns; IngestGate is false, so the publish
+		// path is unchanged.
+		Retention: &fakeRetention{},
 	}, slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	out := &env{admin: e.admin, app: e.app, st: e.st, api: api, adminToken: e.adminToken, tenants: e.tenants}
 	out.srv = httptest.NewServer(api.Handler())
@@ -456,6 +461,75 @@ var crossProducerCases = map[string]cpCase{
 		},
 	},
 
+	// --- S9a: the producer portal's member routes (M2a, §14) ---------------
+	//
+	// The same operations the producer key routes above perform, but the
+	// producer comes from the session claim rather than from a key. The two
+	// collection routes are scoped by the credential, the two id-addressed
+	// routes are aimed at B's real ids and must 404, and the usage panel takes
+	// no identifier: it is the producer's own read of deployment telemetry.
+	"GET /v1/producer/event-types": {
+		build: func(a, b *tenant) (string, any) { return "/v1/producer/event-types?env=live", nil },
+		want:  http.StatusOK,
+		leaks: func(a, b *tenant) []string { return []string{b.EventTypeName} },
+	},
+	"POST /v1/producer/event-types": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/event-types?env=live", map[string]any{
+				"name": "cpmember.event", "payload_schema": map[string]any{"type": "object"},
+			}
+		},
+		want: http.StatusCreated,
+		after: func(t *testing.T, e *env, created []byte) {
+			b := e.tenantFor(t, "cp-beta")
+			code, raw := e.do(http.MethodGet, "/v1/producer/event-types?env=live", b.OwnerToken, nil)
+			mustStatus(t, code, raw, http.StatusOK)
+			if strings.Contains(string(raw), "cpmember.event") {
+				t.Fatalf("an event type created through producer A's session is visible in producer B: %s", raw)
+			}
+		},
+	},
+	"POST /v1/producer/events": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/events?env=live", map[string]any{
+				"event_type": a.EventTypeName, "payload": map[string]any{"note": "cp-member-publish"},
+			}
+		},
+		want: http.StatusAccepted,
+		after: func(t *testing.T, e *env, created []byte) {
+			a := e.tenantFor(t, "cp-alpha")
+			pub := decode[publishResponse](t, created)
+			var producerID string
+			if err := e.admin.QueryRow(context.Background(),
+				`select producer_id from events where id = $1`, pub.ID).Scan(&producerID); err != nil {
+				t.Fatalf("read the member-published event: %v", err)
+			}
+			if producerID != a.ID {
+				t.Fatalf("a member publish landed under producer %q, want the session's %q", producerID, a.ID)
+			}
+		},
+	},
+	"GET /v1/producer/usage": {
+		// No identifier to aim at another tenant, so the case presents A's
+		// session and proves the answer names B nowhere, and that it is the
+		// producer's view (no operator partition catalogue).
+		build: func(a, b *tenant) (string, any) { return "/v1/producer/usage?env=live", nil },
+		want:  http.StatusOK,
+		leaks: func(a, b *tenant) []string { return []string{b.ID, b.ConsumerRef, `"partitions"`} },
+	},
+	"GET /v1/producer/consumers/{consumerID}/events": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/consumers/" + b.ConsumerID + "/events?env=live", nil
+		},
+		want: http.StatusNotFound,
+	},
+	"POST /v1/producer/consumers/{consumerID}/endpoints/{endpointID}/rotate": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/consumers/" + b.ConsumerID + "/endpoints/" + b.EndpointID + "/rotate?env=live", nil
+		},
+		want: http.StatusNotFound,
+	},
+
 	// --- S7: the inspect and replay surface (§11, FR-1101..FR-1111) --------
 
 	"GET /v1/producer/deliveries": {
@@ -559,13 +633,22 @@ var crossProducerCases = map[string]cpCase{
 // added without a classification fails instead of being skipped silently (which is
 // how /v1/whoami and /v1/consumer/me escaped the first version of this suite).
 var notProducerScoped = map[string]string{
-	"GET /health":                                   "liveness: no credential and no tenant",
-	"GET /health/ready":                             "readiness: no credential and no tenant",
-	"POST /v1/session":                              "login: obtains the credential, so it cannot require one",
-	"GET /v1/session":                               "self-description: scoped to the caller's own claims, no tenant id in the request",
-	"DELETE /v1/session":                            "logout: acts on the presented token only",
-	"POST /v1/session/password":                     "FR-101 forced change: acts on the caller's own account only",
-	"POST /v1/invites/accept":                       "accepts an invitation: the token identifies the tenant, and an existing account must present its own session",
+	"GET /health":               "liveness: no credential and no tenant",
+	"GET /health/ready":         "readiness: no credential and no tenant",
+	"POST /v1/session":          "login: obtains the credential, so it cannot require one",
+	"GET /v1/session":           "self-description: scoped to the caller's own claims, no tenant id in the request",
+	"DELETE /v1/session":        "logout: acts on the presented token only",
+	"POST /v1/session/password": "FR-101 forced change: acts on the caller's own account only",
+	"POST /v1/invites/accept":   "accepts an invitation: the token identifies the tenant, and an existing account must present its own session",
+	// S9a's anonymous surfaces. FR-111's reset is a public form: the account
+	// asking has no session (that is the problem it solves), so it cannot be
+	// tenant-scoped, and its whole design is that asking reveals nothing.
+	"POST /v1/password-resets":        "FR-111 password reset request: anonymous by design, answers the same 202 whether or not the address exists, so it carries no tenant and must not",
+	"POST /v1/password-resets/accept": "FR-111 password reset accept: the token is the only credential, and accepting grants a password, never a claim or a tenant",
+	// FR-106's OIDC login is anonymous for the same reason as password login: it
+	// is how the credential is obtained, and its optional-ness is a 404 when no
+	// provider is configured rather than a scope.
+	"POST /v1/session/oidc":                         "FR-106 OIDC login: obtains the credential, so it cannot require one; absent (404) when no provider is configured",
 	"POST /v1/admin/producers":                      "instance-admin surface: no producer scope by design (FR-102)",
 	"GET /v1/admin/producers":                       "instance-admin surface: lists tenants, so it cannot be tenant-scoped",
 	"GET /v1/admin/producers/{producerID}":          "instance-admin surface: the admin may address any tenant (FR-102)",

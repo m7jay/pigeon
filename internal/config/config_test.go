@@ -74,6 +74,10 @@ func valid() Config {
 		WriteQueueDepth:    0,
 		WriteQueueWorkers:  DefaultWriteQueueWorkers,
 		IngestAdmitTimeout: DefaultIngestAdmitTimeout,
+		// FR-111's reset window (S9a). It is a refusal when it is not positive,
+		// for the same reason the session TTL is: a window of zero mints tokens
+		// that are already dead, so a "valid config" carries the shipped default.
+		PasswordResetTTL: time.Hour,
 	}
 }
 
@@ -85,12 +89,17 @@ func TestValidateAcceptsAReferenceDeployment(t *testing.T) {
 
 func TestValidateRefusesUnsafeConfigurations(t *testing.T) {
 	cases := map[string]func(*Config){
-		"no database":     func(c *Config) { c.DatabaseURL = "" },
-		"no admin secret": func(c *Config) { c.InstanceAdminPassword = "" },
-		"weak admin":      func(c *Config) { c.InstanceAdminPassword = "password" },
-		"short admin":     func(c *Config) { c.InstanceAdminPassword = "short" },
-		"tiny pool":       func(c *Config) { c.DBMaxConns = 1 },
-		"zero session":    func(c *Config) { c.SessionTTL = 0 },
+		"no database":       func(c *Config) { c.DatabaseURL = "" },
+		"no admin secret":   func(c *Config) { c.InstanceAdminPassword = "" },
+		"weak admin":        func(c *Config) { c.InstanceAdminPassword = "password" },
+		"short admin":       func(c *Config) { c.InstanceAdminPassword = "short" },
+		"tiny pool":         func(c *Config) { c.DBMaxConns = 1 },
+		"zero session":      func(c *Config) { c.SessionTTL = 0 },
+		"zero reset window": func(c *Config) { c.PasswordResetTTL = 0 },
+		// FR-106's optional login: half-configured is refused rather than half
+		// working (the issuer finds the keys, the client id checks the audience).
+		"oidc issuer without client id": func(c *Config) { c.OIDCIssuer = "https://idp.example" },
+		"oidc client id without issuer": func(c *Config) { c.OIDCClientID = "pigeon" },
 		// S5: the §9/FR-1302 bounds are refused where they are set, so a typo
 		// cannot ship a policy the requirements do not describe.
 		"window under an hour":   func(c *Config) { c.DeliveryRetryWindow = time.Minute },

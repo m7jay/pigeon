@@ -50,9 +50,10 @@ func TestRouteInventoryHasNoDuplicates(t *testing.T) {
 
 // TestAnonymousRoutesAreOnlyTheOnesThatMustBe is FR-111 and FR-102's default read
 // at the routing layer: with self-registration off, the only anonymous routes are
-// health, login and invitation acceptance. Every other route must have a
-// credential, which is the S1 done-condition "no route is reachable without a
-// producer scope".
+// health, the two ways to obtain a credential (the password login and S9a's
+// optional OIDC login), invitation acceptance, and S9a's two password-reset
+// routes. Every other route must have a credential, which is the S1
+// done-condition "no route is reachable without a producer scope".
 func TestAnonymousRoutesAreOnlyTheOnesThatMustBe(t *testing.T) {
 	s := newAuthServer(t, nil, nil, false)
 	allowed := map[string]bool{
@@ -60,6 +61,15 @@ func TestAnonymousRoutesAreOnlyTheOnesThatMustBe(t *testing.T) {
 		"GET /health/ready":       true,
 		"POST /v1/session":        true,
 		"POST /v1/invites/accept": true,
+		// FR-106's optional OIDC login (S9a): the second half of the flow, where
+		// the core verifies the portal's id_token. It obtains the credential, so
+		// it cannot require one; with no provider configured it answers 404.
+		"POST /v1/session/oidc": true,
+		// FR-111's password reset (S9a): the account asking has no session, which
+		// is the problem the flow solves. The request answers the same 202 either
+		// way, so it is not an account-enumeration oracle.
+		"POST /v1/password-resets":        true,
+		"POST /v1/password-resets/accept": true,
 	}
 	for _, rt := range s.routes() {
 		if rt.Kind != kindAnonymous {
