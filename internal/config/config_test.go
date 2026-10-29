@@ -207,6 +207,9 @@ func TestDeliveryRetryConcurrencyHasAShippedDefault(t *testing.T) {
 	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon@localhost/pigeon")
 	t.Setenv("PIGEON_REDIS_URL", "redis://localhost:6379/0")
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+	// FR-1006's at-rest key is required as well, so a config with only the
+	// database, the Redis URL and an admin password no longer loads.
+	t.Setenv("PIGEON_HEADERS_KEY", testHeadersKey)
 
 	c, err := Load()
 	if err != nil {

@@ -38,6 +38,20 @@ import (
 // The durable pause flag, the notification record and the retry window are all
 // Postgres, which is the real thing.
 
+// setAtRestKey sets FR-1006's at-rest encryption key for a test that boots the
+// shipped configuration through config.Load. The key is REQUIRED, so a test that
+// sets only the "required variables" it used to need is refused the same way a
+// deployment would be; internal/config owns the refusal itself. The value is
+// generated per test and protects nothing.
+func setAtRestKey(t *testing.T) {
+	t.Helper()
+	_, encoded, err := atrest.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate the at-rest key: %v", err)
+	}
+	t.Setenv("PIGEON_HEADERS_KEY", encoded)
+}
+
 // s5Fixture is one seeded endpoint with its subscriptions, plus the Redis the
 // pause counters and the per-endpoint limits share.
 type s5Fixture struct {
@@ -889,11 +903,7 @@ func TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas(t *testing.T) {
 	t.Setenv("PIGEON_REDIS_URL", "redis://unused:6379/0")
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "not-the-documented-weak-default")
 	// FR-1006's at-rest key is required too: config refuses to boot without one.
-	_, headersKey, keyErr := atrest.GenerateKey()
-	if keyErr != nil {
-		t.Fatalf("generate the at-rest key: %v", keyErr)
-	}
-	t.Setenv("PIGEON_HEADERS_KEY", headersKey)
+	setAtRestKey(t)
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("config.Load with the required variables set: %v", err)
@@ -1580,6 +1590,10 @@ func TestAC52DeliveryLanesPartitionTheProcessBudget(t *testing.T) {
 	t.Setenv("PIGEON_DATABASE_URL", "postgres://unused/unused?sslmode=disable")
 	t.Setenv("PIGEON_REDIS_URL", "redis://unused:6379/0")
 	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "not-the-documented-weak-default")
+	// FR-1006's at-rest key is required too, and this test boots the shipped
+	// configuration: without it the load is refused before the lane defaults are
+	// ever read.
+	setAtRestKey(t)
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("config.Load with the required variables set: %v", err)
