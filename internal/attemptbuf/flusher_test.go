@@ -200,7 +200,28 @@ func TestFlushFailureKeepsTheBatchPending(t *testing.T) {
 // more than one full batch, one pass keeps flushing full batches instead of
 // stopping after the first. The transaction size stays at the floor, not "whatever
 // one poll happened to see". The floor is 2,000, so the load here is 2,500 rows.
+//
+// The retirement is a STATE here, not a deadline. A pass inserts its batch in one
+// transaction and only then retires it, and the retirement is one MULTI/EXEC
+// carrying an XACK and an XDEL for every id in that batch - 2,000 of each on the
+// first one - against this package's test Redis, which is miniredis: in-process,
+// and scheduled like everything else on the box. go-redis bounds the reply to any
+// one command by a socket read deadline, min(the context's deadline, ReadTimeout),
+// 3 s by default - and newTestBuffer's client sets neither ContextTimeoutEnabled
+// nor ReadTimeout, so on the fixture path the bound that fires is one the platform
+// never chose (clientFromURL, what production dials with, sets the first of the
+// two). Measured on 2 vCPU at load 15-20 (a competing -race suite plus two
+// spinners): a 2,000-entry retirement takes 3.5-4 s, and the command comes back as
+// `read tcp 127.0.0.1:A->127.0.0.1:B: i/o timeout` - the shape this test failed
+// with under a full -p 1 suite - while miniredis applies the MULTI/EXEC anyway:
+// the next read of the books shows the pending list empty and XLEN down by the
+// batch size. Reading that socket error as the verdict said nothing about the
+// flush, so the verdict is the state: the rows are in Postgres, and the entries
+// leave both the pending list and the stream. The bound below is only what
+// waitFor's bound is to the rest of this package - what turns a retirement that
+// never happens into a failure instead of a hang.
 func TestPassDrainsMultipleFullBatches(t *testing.T) {
+	const retireWait = 30 * time.Second
 	ctx := context.Background()
 	fl, sink, buf := newTestFlusher(t, config.MinFlushBatch)
 	for i := 1; i <= config.MinFlushBatch+500; i++ {
@@ -210,21 +231,50 @@ func TestPassDrainsMultipleFullBatches(t *testing.T) {
 	}
 
 	n, err := fl.pass(ctx)
+	// FR-815's half, and the half a loaded box cannot move: a pass that returns
+	// without an error must have drained the whole backlog in full batches. A pass
+	// that stops after a full batch while the buffer still holds one is the defect
+	// this test exists for, and that defect reports no error at all - so this is
+	// asserted for every pass that did not end on its retirement.
+	if err == nil && n != config.MinFlushBatch+500 {
+		t.Fatalf("pass inserted %d rows and reported no error, want %d: a pass must not stop short of the backlog (FR-815)", n, config.MinFlushBatch+500)
+	}
 	if err != nil {
-		t.Fatalf("pass: %v", err)
+		t.Logf("pass ended on its retirement (the socket's read deadline, above); the state below is the verdict")
 	}
-	if n != config.MinFlushBatch+500 {
-		t.Fatalf("pass inserted %d rows, want %d", n, config.MinFlushBatch+500)
+
+	// The rest of the backlog is what the pass left unread, because a pass returns
+	// as soon as a batch's retirement fails - exactly as production does, where
+	// Run retries the pass after FailBackoff. So drive it until the state holds.
+	deadline := time.Now().Add(retireWait)
+	lastErr := err
+	for {
+		depth, derr := buf.Depth(ctx)
+		pending := pendingCount(t, buf)
+		if derr == nil && depth == 0 && pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the buffer did not retire the batches within %s: depth=%d (%v), pending=%d, transactions=%d, rows=%d, last pass error=%v",
+				retireWait, depth, derr, pending, sink.batchCount(), sink.rowCount(), lastErr)
+		}
+		if _, lastErr = fl.pass(ctx); lastErr != nil {
+			t.Logf("pass ended on its retirement again: %v", lastErr)
+		}
 	}
+
 	// 2,000 then 500: two full-then-short reads, i.e. two transactions.
 	if got := sink.batchCount(); got != 2 {
-		t.Fatalf("pass made %d transactions, want 2 (batches of 2000 and 500)", got)
+		t.Fatalf("the drain made %d transactions, want 2 (batches of 2000 and 500)", got)
 	}
 	if got := len(sink.batches[0]); got != config.MinFlushBatch {
 		t.Fatalf("first batch carried %d rows, want FR-815's floor %d", got, config.MinFlushBatch)
 	}
-	if depth, _ := buf.Depth(ctx); depth != 0 {
-		t.Fatalf("buffer depth after the pass = %d, want 0", depth)
+	if got := len(sink.batches[1]); got != 500 {
+		t.Fatalf("second batch carried %d rows, want the 500 left over the floor (a batch read twice or dropped is not FR-815)", got)
+	}
+	if got := sink.rowCount(); got != config.MinFlushBatch+500 {
+		t.Fatalf("the sink inserted %d rows, want %d", got, config.MinFlushBatch+500)
 	}
 }
 
