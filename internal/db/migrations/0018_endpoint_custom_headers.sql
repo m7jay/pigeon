@@ -1,4 +1,4 @@
--- 0017_endpoint_custom_headers.sql — FR-405 + FR-1006: custom endpoint headers,
+-- 0018_endpoint_custom_headers.sql — FR-405 + FR-1006: custom endpoint headers,
 -- with their values encrypted at rest.
 --
 -- FR-405 lets an endpoint carry up to 5 custom headers, and refuses four names
@@ -27,17 +27,26 @@
 -- holding six headers or a JSON object, whatever the code in front of it does.
 --
 -- ---------------------------------------------------------------------------
--- Why this file is 0017 and not 0015
+-- Why this file is 0018, and how the number was picked
 --
 -- This slice first landed as `0015_endpoint_custom_headers.sql`, and S11 took
 -- 0016 around it. 0016 re-creates `pigeon_claim_delivery` to select by attempt
 -- class (FR-1303) and to report `held_back` (FR-1304), and it runs *after* 0015 -
 -- so its version of the function, which knows nothing about headers, replaced the
 -- one 0015 had written and the claim would have stopped returning the column. The
--- file therefore moves to the number that runs last on this base, and re-creates
+-- file therefore moves to a number that runs last on this base, and re-creates
 -- the claim as 0016's function *plus* the `custom_headers` OUT column: S11's lane
 -- predicate and hold flag are kept intact rather than reverted. The column, its
 -- constraints and its comment are unaffected by 0016 and are unchanged.
+--
+-- 0017 was the next free number on `feat/m0-skeleton`, and it is taken all the
+-- same: two live refs hold lower numbers (`wt/t_b5272d2d-hardening` holds 0015,
+-- `wt/t_9d89f53a-env-example-reland` holds 0017), so 0018 is the lowest number no
+-- live ref holds. The number is chosen from the refs, not from the base's
+-- directory listing, because a collision with a slice in flight only shows up at
+-- merge time as `migrate: duplicate migration version` in every DB-backed
+-- package. Nothing here depends on running before either of them: 0015 and 0017
+-- touch other tables.
 -- ---------------------------------------------------------------------------
 
 alter table endpoints add column custom_headers jsonb not null default '[]'::jsonb;
