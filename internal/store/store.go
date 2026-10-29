@@ -29,6 +29,7 @@ import (
 	"github.com/m7jay/pigeon/internal/apikey"
 	"github.com/m7jay/pigeon/internal/atrest"
 	"github.com/m7jay/pigeon/internal/db"
+	"github.com/m7jay/pigeon/internal/writeq"
 )
 
 // ErrNotFound is the only "no such thing" answer the API may give for a
@@ -126,6 +127,11 @@ type Store struct {
 	// value rather than writing it in the clear, and every read is redacted
 	// regardless, because no read decrypts.
 	headersKey atrest.Key
+
+	// writes is FR-818's bounded write budget (SPEC.md A-11): the batched
+	// control-state path runs through it, and the HTTP layer's ingest admission
+	// draws on the same instance (main hands it over with Writes()).
+	writes *writeq.Queue
 }
 
 // DefaultAttemptBodyCap is SB-4's default per-row cost control: the first 2 KB
@@ -151,13 +157,69 @@ func WithHeadersKey(k atrest.Key) Option {
 	return func(s *Store) { s.headersKey = k }
 }
 
+// WithWriteQueue replaces the store's own write budget (FR-818). main builds the
+// queue from configuration and passes it in, so the values
+// PIGEON_WRITE_QUEUE_DEPTH, PIGEON_WRITE_QUEUE_WORKERS and
+// PIGEON_INGEST_ADMIT_TIMEOUT actually decide the budget the process runs with,
+// and so the HTTP layer can be handed the very same instance.
+func WithWriteQueue(q *writeq.Queue) Option {
+	return func(s *Store) { s.writes = q }
+}
+
 // New wraps a pool. A nil pool is a programming error, not a runtime condition.
 func New(pool *pgxpool.Pool, opts ...Option) *Store {
 	s := &Store{pool: pool, attemptBodyCap: DefaultAttemptBodyCap, ensured: map[string]time.Time{}}
 	for _, o := range opts {
 		o(s)
 	}
+	if s.writes == nil {
+		s.writes = newWriteQueue(pool)
+	}
 	return s
+}
+
+// newWriteQueue is FR-818's write budget as a process configures it by default.
+// The budget follows the pool, because the slot that holds a connection and the
+// budget that admits one are the same resource; the writer pool is fixed at boot
+// (FR-816) and the accumulation buffer is FR-815's floor in rows. main replaces
+// the values it has knobs for (PIGEON_WRITE_QUEUE_DEPTH,
+// PIGEON_WRITE_QUEUE_WORKERS, PIGEON_INGEST_ADMIT_TIMEOUT) by building the queue
+// itself with NewWriteQueue and handing it over with WithWriteQueue.
+func newWriteQueue(pool *pgxpool.Pool) *writeq.Queue {
+	var poolSize int
+	if pool != nil {
+		poolSize = int(pool.Config().MaxConns)
+	}
+	return NewWriteQueue(pool, writeq.Options{Pool: poolSize})
+}
+
+// NewWriteQueue builds a write budget whose transactions run through
+// internal/db's control-state policy (FR-812's synchronous_commit=on class and
+// the AC-29 marker), which is the half of the wiring the queue cannot do itself
+// without depending on the pool. Every option but Tx is the caller's: the knobs
+// are the caller's configuration and the budget has no opinion about them.
+func NewWriteQueue(pool *pgxpool.Pool, o writeq.Options) *writeq.Queue {
+	o.Tx = func(ctx context.Context, fn func(pgx.Tx) error) error {
+		return db.ControlTx(ctx, pool, fn)
+	}
+	return writeq.New(o)
+}
+
+// Writes is the process's bounded write budget. main hands this same queue to the
+// HTTP layer, so ingest is admitted against the budget the relay's and the
+// delivery workers' control-state writes draw on: one budget per process, which
+// is what makes "full" mean the machine's write capacity rather than one
+// subsystem's queue.
+func (s *Store) Writes() *writeq.Queue { return s.writes }
+
+// Close stops the write budget's writer pool once it has written what is already
+// buffered. D-3's shutdown rule is why it exists: in-flight control-state writes
+// drain before the process exits, so a completion that was accepted is not lost
+// to a restart.
+func (s *Store) Close() {
+	if s.writes != nil {
+		s.writes.Close()
+	}
 }
 
 // Pool exposes the pool for the few callers that run their own transaction

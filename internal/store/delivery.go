@@ -358,31 +358,42 @@ func (s *Store) RecordAttempts(ctx context.Context, batch []AttemptRecord) (int,
 // delivery whose completion it lost, is a no-op rather than a duplicate. Returns
 // true when this call performed the transition, false when the row had already
 // left pending.
+//
+// The write goes through FR-818's budget as a one-row batch: it blocks while the
+// budget is full rather than parking on the pool, it commits in the transaction
+// the budget's writer pool opened (so it is batched with whatever else was in
+// flight), and it still returns only once that transaction has committed - a
+// caller that gets (true, nil) can trust the delivered row is durable.
 func (s *Store) CompleteDelivery(ctx context.Context, deliveryID int64, attempts int, firstAttempt, deliveredAt time.Time) (bool, error) {
-	var done bool
-	err := db.ControlTx(ctx, s.pool, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `select pigeon_complete_delivery($1,$2,$3,$4)`,
-			deliveryID, attempts, firstAttempt, deliveredAt).Scan(&done)
+	batch := NewDeliveryBatch()
+	i := batch.Add(DeliveryWrite{
+		Op:           ControlComplete,
+		DeliveryID:   deliveryID,
+		Attempts:     attempts,
+		FirstAttempt: firstAttempt,
+		At:           deliveredAt,
 	})
-	if err != nil {
+	if err := s.writes.Submit(ctx, batch); err != nil {
 		return false, fmt.Errorf("complete delivery: %w", err)
 	}
-	return done, nil
+	return batch.Applied(i), nil
 }
 
 // FinalizeDelivery ends a delivery as terminally failed (FR-806): the last
 // attempt gave a terminal response, or the retry budget is spent. Idempotent like
-// CompleteDelivery.
+// CompleteDelivery, and batched the same way.
 func (s *Store) FinalizeDelivery(ctx context.Context, deliveryID int64, attempts int, firstAttempt time.Time) (bool, error) {
-	var done bool
-	err := db.ControlTx(ctx, s.pool, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `select pigeon_finalize_delivery($1,$2,$3)`,
-			deliveryID, attempts, firstAttempt).Scan(&done)
+	batch := NewDeliveryBatch()
+	i := batch.Add(DeliveryWrite{
+		Op:           ControlFinalize,
+		DeliveryID:   deliveryID,
+		Attempts:     attempts,
+		FirstAttempt: firstAttempt,
 	})
-	if err != nil {
+	if err := s.writes.Submit(ctx, batch); err != nil {
 		return false, fmt.Errorf("finalize delivery: %w", err)
 	}
-	return done, nil
+	return batch.Applied(i), nil
 }
 
 // RequeueDelivery schedules the next attempt after a retryable failure: the next
@@ -401,12 +412,24 @@ func (s *Store) FinalizeDelivery(ctx context.Context, deliveryID int64, attempts
 //
 // It runs with synchronous_commit=on: it is control state. A lost requeue just
 // leaves the lease at the claim value and the sweeper covers it (D-6).
+//
+// Like Complete and Finalize it submits through FR-818's budget, so a requeue
+// waiting on a full budget blocks the attempt's own goroutine (the retry is at
+// least a backoff away, so it blocks nothing that matters) instead of taking a
+// pool connection out of the same budget ingest is admitted against.
 func (s *Store) RequeueDelivery(ctx context.Context, deliveryID int64, next, retryDeadline time.Time, attempt int) error {
-	return db.ControlTx(ctx, s.pool, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `select pigeon_requeue_delivery($1,$2,$3,$4)`,
-			deliveryID, next, retryDeadline, attempt)
-		return err
+	batch := NewDeliveryBatch()
+	batch.Add(DeliveryWrite{
+		Op:            ControlRequeue,
+		DeliveryID:    deliveryID,
+		Attempts:      attempt,
+		At:            next,
+		RetryDeadline: retryDeadline,
 	})
+	if err := s.writes.Submit(ctx, batch); err != nil {
+		return fmt.Errorf("requeue delivery: %w", err)
+	}
+	return nil
 }
 
 // SweeperRequeue re-queues ANY delivery whose lease has lapsed (D-6) and returns
