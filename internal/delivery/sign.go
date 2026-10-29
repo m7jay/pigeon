@@ -121,11 +121,13 @@ func dualSignature(env envelope.Envelope, d store.LeasedDelivery, key []byte, ts
 	}
 	previousKey, err := envelope.SecretBytes(d.PreviousSigningSecret)
 	if err != nil {
-		// The stored value is not a decodable whsec_. Signing with the raw bytes
-		// would produce a signature no conforming receiver can verify, so the
-		// header carries only the signature that can be verified and the
-		// unreadable secret is reported by the caller's own error path at the
-		// next rotation.
+		// The stored previous value is not a decodable whsec_. The raw bytes are
+		// signed and appended all the same: this header is a space-separated list
+		// that a verifier checks entry by entry, so a second entry nobody can
+		// verify costs nothing, and the current secret's signature - always the
+		// first entry - still authenticates the delivery. The unreadable value is
+		// reported by the caller's own error path on the attempt that uses it
+		// (delivery.go, buildSignedRequest's signErr branch).
 		previousKey = []byte(d.PreviousSigningSecret)
 	}
 	return sig + " " + env.Signature(previousKey, ts, body)
