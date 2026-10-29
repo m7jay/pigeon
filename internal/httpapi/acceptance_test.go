@@ -427,13 +427,19 @@ func TestConsumerUserIsBoundToOneConsumerAndRevocable(t *testing.T) {
 
 	// FR-111: there is no route by which a user adds themselves to a producer.
 	// The only anonymous writes are login, invitation acceptance and (when
-	// enabled) producer self-registration.
+	// enabled) producer self-registration - plus S9a's credential checks:
+	// FR-106's optional OIDC login (another way to obtain a session) and
+	// FR-111's reset request/accept, which mint and redeem a token for an
+	// ALREADY-existing account. Accepting a reset rewrites one password, revokes
+	// that account's sessions and grants no producer claim (FR-111), so none of
+	// these is a way into a tenant.
 	for _, rt := range e.routes() {
 		if rt.Kind != kindAnonymous || rt.Method != http.MethodPost {
 			continue
 		}
 		switch rt.Path {
-		case "/v1/session", "/v1/invites/accept", "/v1/producers":
+		case "/v1/session", "/v1/invites/accept", "/v1/producers",
+			"/v1/session/oidc", "/v1/password-resets", "/v1/password-resets/accept":
 		default:
 			t.Fatalf("anonymous write route %s %s exists; every producer write must need a credential", rt.Method, rt.Path)
 		}
