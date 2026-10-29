@@ -33,6 +33,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/m7jay/pigeon/internal/redisconn"
 )
 
 // KeyPrefix namespaces the limiter's keys so they are recognisable next to the
@@ -90,9 +92,16 @@ type Redis struct {
 }
 
 // NewRedis connects a client to url. It PINGs, so a wrong URL fails at boot
-// rather than silently disabling the P0 limits.
+// rather than silently disabling the P0 limits. url is the documented
+// PIGEON_REDIS_URL form (redis://host:port/db) or a bare host:port, and the
+// database index the URL names is the one the limits live in - FR-1307's promise
+// is that replicas sharing a Redis share its keyspace, so a client in a database
+// other than the one the DSN named would break exactly that, silently.
 func NewRedis(ctx context.Context, url string) (*Redis, error) {
-	rdb := redis.NewClient(&redis.Options{Addr: url})
+	rdb, err := redisconn.Client(url)
+	if err != nil {
+		return nil, err
+	}
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
 		return nil, fmt.Errorf("limit: ping %s: %w", url, err)

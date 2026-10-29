@@ -15,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/m7jay/pigeon/internal/envelope"
+	"github.com/m7jay/pigeon/internal/redisconn"
 )
 
 // Broker accepts a published envelope onto the events stream.
@@ -35,9 +36,16 @@ type Redis struct {
 }
 
 // NewRedis connects to the broker at url and PINGs it, so a misconfigured URL
-// fails the boot (OPS-7) rather than silently dropping every publish.
+// fails the boot (OPS-7) rather than silently dropping every publish. url is the
+// documented PIGEON_REDIS_URL form (redis://host:port/db) or a bare host:port,
+// and the database index the URL names is the one the broker publishes in: a
+// client built from the URL's host alone would still connect, then put the class
+// streams in DB 0 instead of the database the DSN asked for.
 func NewRedis(ctx context.Context, url string) (*Redis, error) {
-	rdb := redis.NewClient(&redis.Options{Addr: url})
+	rdb, err := redisconn.Client(url)
+	if err != nil {
+		return nil, err
+	}
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
 		return nil, fmt.Errorf("broker ping: %w", err)
