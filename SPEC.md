@@ -1199,7 +1199,28 @@ pass).
 row, §19's decision row; `internal/store`'s claim, `internal/delivery`'s dispatch and limiter wait,
 `PIGEON_DELIVERY_RETRY_CONCURRENCY` in `internal/config`; slice S11, card `t_558a9f59`.
 
-## Gap list — eleven decided, one open
+### A-11 — FR-818 is a bounded write budget, not a batched publish
+
+**Found** by S10's load test (card `t_b5272d2d`, `docs/load-test.md`, artifact `run3-250x10.json`): FR-818 was a P0 with no owning slice in `PLAN.md` and no implementation in the tree. `handlePublish` (`internal/httpapi/events.go`) calls `store.PublishEvent` synchronously, one transaction per request, and takes its pool connection with no deadline - `pgxpool.Acquire` waits until one frees. There is therefore nothing that can be "full" and nothing that can shed. Measured on the 2 vCPU reference box: 250 events/s offered for 30 minutes produced **zero** `429`s on the publish path, p99 grew 3,593.4 → 4,281.6 ms across the graded window, a single publish took **10.2 s** with the shipped `PIGEON_DB_MAX_CONNS=10` at 40 concurrent publishes and **86 ms** at a pool of 40, and the only publish-path `429` is SB-7's disk gate (`over_budget`). The worker write paths are unbatched the same way: every delivery completion is its own `ControlTx`, and the relay leases one outbox row per iteration.
+
+**Decision.** FR-818 is *owned*, not descoped, and its text is narrowed to the mechanism that is implementable and testable:
+
+- **one bounded write budget per process**, shared by every control-state writer, with a fixed worker pool (FR-816). A slot is held for one database write - one batch transaction, or one publish transaction - and released on completion.
+- **`Submit` blocks** for the relay and delivery workers, which batch what §8.1's table binds on (fan-out delivery rows, delivery completion and terminal updates, outbox marks) into one transaction per batch (FR-815).
+- **`Admit` waits at most `PIGEON_INGEST_ADMIT_TIMEOUT` (default 100 ms, the rated publish p99) for ingest**, which then sheds `429` with `code=over_capacity`, `Retry-After` and the shed counter. Saturation becomes visible as shedding instead of as latency.
+- **the publish transaction stays one transaction per publish.** FR-604 makes the `202` the commit; FR-815's 2,000-row floor on that path is a 4 s window at the reference rate (250 events/s) against NFR-1's 100 ms, and batching it further needs a savepoint per job to preserve FR-303's failing pointer, FR-508's test-mode refusal and FR-603's idempotency - for two rows per event against the fan-out's ten.
+- **`PIGEON_DB_MAX_CONNS` moves 10 → 40** (the measured-good value; `1 × 40 + 5 = 45 ≤ 100` at one replica and 85 at two), because AC-45 requires **zero** `429` at the reference class's rated ingest load: a shipped default that sheds at the rated load is a defect, not a knob an operator is expected to find.
+- **evidence writes are untouched**: D-1's Redis buffer and the flusher already bound and batch them (FR-815).
+
+**Trade-off, stated.** The amendment gives up "every database write is batched through one queue" as a literal reading of FR-818. What it keeps is every clause the requirement exists for and AC-30 grades: publishes shed `429` past the ceiling, latency is bounded rather than silently growing, goroutines and buffers are bounded by configuration, and an accepted event is never dropped. It also reads FR-815's floor where it binds - §8.1's aggregate insert rate, not a per-request-path one - and names the ingest path as the place that floor cannot hold.
+
+**Rejected.** Batching the publish transaction through the same queue (FR-818 read literally): rejected for the latency and error-semantics reasons above, and because the two rows per event it would amortise are an order of magnitude less than the fan-out rows the batch path already reaches. Descoping FR-818 with the AC-30 consequence recorded: rejected because AC-30's first two clauses have no other mechanism, and §12 forbids a tolerance in their place. Raising `PIGEON_DB_MAX_CONNS` alone: rejected because a bigger pool moves the parking further out rather than shedding, and leaves the fan-out and completion writes single-row.
+
+**AC-30's third clause.** "The ceiling matches the §8.1 table within 20%" is implemented nowhere: `cmd/loadgen compare` is AC-43's replica-scaling comparison, there is no `-class` flag and no §8.1 table in the harness, and `docs/load-test.md` records the gap rather than implying otherwise. A-11 records it as owned by card `t_0bf3effa` - the class comparison in the harness plus the graded run on a host that carries a rating - gated on S12 (`t_c6afa452`) and `t_b9850e1b`, because a relay that drains at ~1.4 events/s and a write path with no ceiling leave nothing to compare.
+
+**Encoded by.** FR-818 (rewritten), §19's decision row; `internal/config` (`PIGEON_DB_MAX_CONNS`, `PIGEON_WRITE_QUEUE_DEPTH`, `PIGEON_WRITE_QUEUE_WORKERS`, `PIGEON_INGEST_ADMIT_TIMEOUT`), `internal/httpapi`'s publish admission, `internal/metrics`'s shed counter, `.env.example`, `docs/topology.md`; slice S12, cards `t_c6afa452` (mechanism) and `t_0bf3effa` (graded run).
+
+## Gap list — twelve decided, one open
 
 Six gaps, each now a decision with a mechanism and a named trade-off. Row 4b is a
 seventh contradiction found while resolving the fourth, recorded here instead of being
@@ -1217,6 +1238,9 @@ slice and no implementation, and the one that names a budget could not be read w
 contradicting FR-1308. Row 10 was held for A-9 (card `t_af54d465`), the attempt-buffer
 acknowledgement, while that branch was unlanded, so each row keeps the number it was written with;
 A-9 has since landed into row 10, and the heading's count is now eleven.
+Row 12 is A-11, found by S10's load test: FR-818 was a P0 with no slice, no
+implementation and no shed path - the instance queued on the pgx pool - and AC-30's third clause
+had no harness behind it at all, so the heading's count is now twelve.
 
 | # | Gap | Decision | Contract changed | Unblocks |
 |---|---|---|---|---|
@@ -1231,6 +1255,7 @@ A-9 has since landed into row 10, and the heading's count is now eleven.
 | 9 | LOG-2's "above 100/s" fixed neither a burst allowance nor a replica count | A-8 | LOG-2, §13.1 and AC-33 state `PIGEON_SUCCESS_LOG_RPS` sustained per process and at most 2 × that in any one-second window | S6 (landed), S10's AC-33 load test |
 | 10 | The acknowledgement could be revoked midway (a batch the flusher cannot hand back), and nothing retired an entry that lost its removal | A-9 | D-9 added; §6's attempt-evidence row states an acknowledgement after the commit that is one transaction and is not revocable by the cancellation ending a pass | S6's flusher (implementation routed separately) |
 | 11 | §7.13's FR-1301, FR-1303 and FR-1304 had no slice, no AC and no implementation, and FR-1303's "separate budget" contradicted FR-1308 read as an endpoint limit | A-10 | FR-1303 and FR-1304 rewritten with the lane and hold mechanisms; FR-1301's halves named (publish = FR-207, delivery deferred to v1.1); AC-52, AC-53 and OBS-13 added; §17's M3 exit and §17.1 amended | S11 (card `t_558a9f59`), and AC-16's NFR-2 leg in S10 |
+| 12 | FR-818 (P0) had no owning slice, no implementation and no mechanism that could shed - the instance queues on the pgx pool - and its literal text (every database write batched through one queue) cannot hold for the publish transaction, which is `202`-on-commit (FR-604) inside NFR-1's 100 ms budget. AC-30's third clause is implemented nowhere in the harness | A-11 | FR-818 rewritten as a bounded write budget with an ingest admission deadline and an `over_capacity` shed; FR-815's floor read as §8.1's binding rows; `PIGEON_DB_MAX_CONNS` 10 → 40; `PLAN.md` slice S12 added | S12 (card `t_c6afa452`) and the graded AC-30 run (card `t_0bf3effa`) |
 
 **They do not contradict each other**, checked pairwise where they touch: A-1's pause
 flags and A-4's archive both ride the control/evidence split in §6 (D-8, FR-812); A-2's
@@ -1256,7 +1281,13 @@ delivery view A-7 left alone. The check that mattered most is against the rows A
 FR-1308, FR-1302 and FR-1306 are untouched, because no decision in this list adds a second endpoint
 limit, and A-10's lanes are per process exactly as A-8's log gate and FR-207's rate limits are -
 which is also why neither A-10 nor A-8 raises a deployment's ceiling with its replica count without
-saying so.
+saying so. A-11 reaches the ingest transaction and the worker write paths, and it narrows FR-818's
+literal text without moving what the surrounding decisions fix: FR-604 still makes the `202` the
+commit, FR-812's class split and D-1's buffer are untouched, FR-815's floor is read as §8.1 reads it
+(the rows that bind) rather than as a floor on every path, and FR-816's cap is respected because the
+write budget's worker pool is fixed at boot. Its one configuration change, `PIGEON_DB_MAX_CONNS` 10 →
+40, is a value OPS-8's arithmetic already constrains (`1 × 40 + 5 ≤ 100` at one replica, 85 at two),
+so it moves no topology decision and no requirement's number.
 
 One thing this list no longer leaves open: whether the endpoint pause threshold scales
 with subscription count. It does - `N = min(active, max(3, ceil(active/4)))` in FR-1203
