@@ -300,3 +300,39 @@ func TestUsageEndpointIs503WhenStatusFails(t *testing.T) {
 		t.Fatalf("error code = %q, want disk_usage_unavailable; body: %s", got, raw)
 	}
 }
+
+// TestUsageEndpointIs503WithoutDiskSignal is SB-6's degraded mode at the
+// observable the card names: with neither PIGEON_DISK_DIR nor PIGEON_DISK_BYTES
+// set and a healthy database, GET /v1/meta/usage answers 503. The gauge is
+// main.go's exact construction (cmd/pigeon/main.go) over this harness's real,
+// migrated database - not a fakeRetention - so the case cannot drift from the
+// shipped wiring. The reading is source "none" with no volume to divide by, and
+// the ingest gate must stay open: no signal is not the same as an empty disk.
+func TestUsageEndpointIs503WithoutDiskSignal(t *testing.T) {
+	e := setup(t)
+	gauge := &retention.FilesystemGauge{
+		Dir:      "", // PIGEON_DISK_DIR unset
+		Bytes:    0,  // PIGEON_DISK_BYTES unset
+		Database: e.st.DatabaseSize,
+	}
+	rm := retention.NewManager(e.st, gauge, retention.Options{
+		MaxDiskPct: 80,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	re := e.withRetention(t, rm, nil)
+
+	code, raw := re.do(http.MethodGet, "/v1/meta/usage", re.adminToken, nil)
+	mustStatus(t, code, raw, http.StatusServiceUnavailable)
+	if got := errorCode(t, raw); got != "disk_usage_unavailable" {
+		t.Fatalf("error code = %q, want disk_usage_unavailable; body: %s", got, raw)
+	}
+	// The message is the operator's only clue about what to fix, so it names the
+	// knob rather than the internal sentinel that noticed it was unset.
+	if msg := decode[errorBody](t, raw).Error.Message; !strings.Contains(msg, "PIGEON_DISK_DIR") {
+		t.Fatalf("error message = %q, want it to name PIGEON_DISK_DIR; body: %s", msg, raw)
+	}
+	// The other half of SB-6's clause: no volume signal never sheds ingest.
+	if rm.IngestGate(ctx()) {
+		t.Fatal("IngestGate = true with no volume reading, want false: neither knob set must not shed")
+	}
+}

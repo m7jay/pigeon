@@ -237,6 +237,7 @@ jobs:
             TestRelayFlushWhilePendingRepublishesAll \
             TestRunOnceOverBudgetDropsOldestPartitionFirst \
             TestPublishShedsWith429OverDiskBudget \
+            TestUsageEndpointIs503WithoutDiskSignal \
             TestDropPartitionSerialisesWithAConcurrentDrop \
             TestSweeperStandbyTakesOverWhenTheHolderIsKilled \
             TestTwoSweepersDropExactlyOnePartition \
