@@ -298,6 +298,24 @@ Reported here so the gap is a sentence rather than a discovery:
   goroutine-per-offered-delivery model this criterion exists to refute, and the
   soft limit here is not 4096. The figures above are the correction, and the
   literal leg is now in the suite so the claim cannot drift back.
+
+  **Those peaks are one run's sample, not a fingerprint, and the leg is
+  load-sensitive in a way worth naming.** A repeat of the same three legs on the
+  same box reported 8 and 10 attempts in flight where this run reported 9 and 10,
+  44 and 78 goroutines where it reported 55 and 85, and 34 and 56 descriptors
+  where it reported 42 and 62 - the legs measure concurrency under a scheduler,
+  and the criterion's assertion is the bound (never above the endpoint's cap of
+  10; the footprint does not grow with the offered backlog), not the sample. A
+  third repeat failed the literal leg on its *wall-clock* deadline instead: with
+  this box also running another slice's `-race` suite (load average 18 on 2 vCPU)
+  251 of the 2,500 deliveries were still pending at the five-minute mark, and
+  that leg's footprint is never logged because the drain check comes first. That
+  is contention, not a broken bound - both legs that did report stayed inside the
+  cap, and neither the goroutine nor the descriptor ceiling was threatened - but
+  it makes this test a red on a box that is already saturated by someone else's
+  suite. The green it needs is a dedicated one, and it has it: the `ci` run on
+  this head exercises the whole package under `-race` on its own 2 vCPU runner and
+  passes.
 - **AC-43 (1 → 2 → 4 replicas scaling ≥ 80% per doubling, and no improvement above
   the Postgres ceiling)** needs more than one host, and `compare` needs at least
   two reports to say anything. This run is a single replica and cannot speak to it.
