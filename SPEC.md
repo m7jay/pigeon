@@ -1093,8 +1093,8 @@ Neither is the mechanism. The budget that separates is the worker's.
   its own class. Today it cannot: it selects `order by d.id limit 1` over every pending delivery
   (`0013_s5_retry_pause_limits.sql:308`), so the oldest row wins and a retry backlog is claimed
   ahead of every newer first attempt.
-- **Lane side.** The worker runs one claim loop per lane, and the two allowances are a **partition**
-  of the process's existing attempt budget, not an addition to it: the process cap `C` is
+- **Lane side.** The two allowances are a **partition** of the process's existing attempt budget, not
+  an addition to it: the process cap `C` is
   `PIGEON_DELIVERY_CONCURRENCY` (FR-816's per-process cap, default 64), the retry lane's
   configurable allowance `R` is `PIGEON_DELIVERY_RETRY_CONCURRENCY` (default 16), and the lanes hold
   `R` and `C - R` slots respectively (48 first-attempt slots at those defaults). Attempts in flight
@@ -1132,6 +1132,17 @@ Neither is the mechanism. The budget that separates is the worker's.
   on the delivery row, returned by the delivery view (FR-1102, FR-1103), plus
   `endpoint_held_back_total` and `endpoint_held_back_seconds` (OBS-13). The producer portal renders
   the field because it is a thin API client (M2a, `t_c0144baa`).
+
+**The lanes are served by a rotation, and the number of loops is not what A-10 fixes.** A-10 first
+read "the worker runs one claim loop per lane"; the shipped shape is one claim loop per worker -
+`PIGEON_DELIVERY_WORKERS` (default 1), the count FR-816 already shipped - rotating over the lanes, and
+the difference is not observable. The rotation advances its cursor on every dispatch and a lane at its
+allowance or with nothing due hands the pass to the next one, so neither lane starves the other; each
+claim carries the lane's own class, so a retry backlog cannot enter the first-attempt allowance; the
+allowances are semaphores on the process rather than on a loop, so the number of claim loops does not
+multiply them (`R` and `C - R` whatever the loop count); and one delivery is claimed per pass, the
+claim throughput the base's single loop already had. A goroutine per lane would add no property those
+sentences do not already hold, and would widen `PIGEON_DELIVERY_WORKERS` from claim loops to lanes.
 
 **Composition with FR-1308, stated once.** An attempt passes two independent admissions: its lane's
 allowance (FR-1303, platform capacity, per process) and the endpoint's shared limits (FR-1302,
