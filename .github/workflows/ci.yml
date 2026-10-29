@@ -143,6 +143,20 @@ jobs:
           # (TestDedupeAnswerSurvivesTheSweep) and the archive's measured
           # per-pair size agreeing with its exported gauge
           # (TestDedupeArchiveSizingAndGaugeAgree).
+          # FR-405 and FR-1006 carry no AC number (no row in REQUIREMENTS.md §16
+          # mentions headers), so their pins are requirement-level, the same shape
+          # as TestFR1207ResumeExtendsThePromisedWindow and the D-6/D-7 entries.
+          # Both sentences state two halves and both are registered, per leg:
+          # FR-405's "up to 5" and "rejected at registration" are
+          # TestCustomHeaderValidationIsFR405 (the cap and the four names, at the
+          # store) and TestEndpointCustomHeadersRefusals (the same refusals as a
+          # 4xx with a message, at the API); "not silently dropped" is
+          # TestCreateEndpointRejectsReservedHeadersBeforeAnyRow, which asserts no
+          # row was written either. FR-1006's "encrypted at rest" is
+          # TestCreateEndpointStoresHeaderValuesEncrypted (the column, read raw);
+          # "redactable" is TestEndpointCustomHeadersRoundTripIsRedacted (API
+          # reads), TestEndpointDetailShowsHeaderNamesAndMasks (the portal's UI)
+          # and TestCustomHeaderValuesNeverReachTheLogs (logs).
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -230,7 +244,14 @@ jobs:
             TestRunOnceLogsTheDroppedPartition \
             TestDedupeAnswerSurvivesTheSweep \
             TestDedupeArchiveSizingAndGaugeAgree \
-            TestDropPartitionOutcomeSurvivesCallerCancellation
+            TestDropPartitionOutcomeSurvivesCallerCancellation \
+            TestCustomHeaderValidationIsFR405 \
+            TestEndpointCustomHeadersRefusals \
+            TestCreateEndpointRejectsReservedHeadersBeforeAnyRow \
+            TestCreateEndpointStoresHeaderValuesEncrypted \
+            TestEndpointCustomHeadersRoundTripIsRedacted \
+            TestEndpointDetailShowsHeaderNamesAndMasks \
+            TestCustomHeaderValuesNeverReachTheLogs
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
