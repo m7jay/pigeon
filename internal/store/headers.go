@@ -163,17 +163,20 @@ type sealedHeader struct {
 	ValueCT string `json:"value_ct"`
 }
 
-// headerAAD names the row a sealed value belongs to. It is the AAD for every
-// value under one endpoint, so a ciphertext copied into another endpoint's row
-// (or another column) fails to authenticate instead of being delivered from the
-// wrong endpoint.
-func headerAAD(endpointID string) string {
-	return "pigeon:endpoint-custom-headers:" + endpointID
+// headerAAD names the row AND the field a sealed value belongs to. One endpoints
+// row holds up to five encrypted values (FR-405's bound), so without the name a
+// ciphertext could be copied from one header onto another inside the same row and
+// would still authenticate - the value would then be delivered under a name it
+// was never sealed for. It is built here, next to the SQL that names the row, so
+// the write and the read cannot drift.
+func headerAAD(endpointID, name string) string {
+	return "pigeon:endpoint-custom-headers:" + endpointID + ":" + name
 }
 
 // sealHeaders renders the column for a write. Names are kept as given (trimmed),
-// so a read shows back what the caller wrote; values are sealed under the
-// endpoint's AAD. An empty list is the column default and needs no key: an
+// so a read shows back what the caller wrote; values are sealed under the AAD of
+// the endpoint AND the header name, so a value cannot be moved between names in
+// the row it lives in. An empty list is the column default and needs no key: an
 // endpoint with no custom headers must be registrable on a deployment that has
 // not configured one (there is nothing to encrypt).
 func (s *Store) sealHeaders(endpointID string, in []CustomHeader) ([]byte, error) {
@@ -188,23 +191,27 @@ func (s *Store) sealHeaders(endpointID string, in []CustomHeader) ([]byte, error
 	}
 	out := make([]sealedHeader, 0, len(in))
 	for _, h := range in {
-		ct, err := s.headersKey.Seal([]byte(h.Value), headerAAD(endpointID))
+		// The name that is stored is the name that goes into the AAD: the read
+		// authenticates against what the row holds, so the two cannot drift by a
+		// trim or a re-render.
+		name := strings.TrimSpace(h.Name)
+		ct, err := s.headersKey.Seal([]byte(h.Value), headerAAD(endpointID, name))
 		if err != nil {
 			// err never carries the plaintext (internal/atrest guarantees it);
 			// the name is not secret.
-			return nil, fmt.Errorf("store: seal custom header %q: %w", strings.TrimSpace(h.Name), err)
+			return nil, fmt.Errorf("store: seal custom header %q: %w", name, err)
 		}
-		out = append(out, sealedHeader{Name: strings.TrimSpace(h.Name), ValueCT: ct})
+		out = append(out, sealedHeader{Name: name, ValueCT: ct})
 	}
 	return json.Marshal(out)
 }
 
 // openSealedHeaders decrypts the column for the DELIVERY path alone (FR-405).
 // It returns the headers that authenticated plus the names of those that did
-// not: a value sealed for another endpoint, or under a key this process does not
-// have, is dropped rather than sent, and the delivery still goes out - a header
-// nobody can authenticate must never reach a receiver, and one bad value must
-// not wedge a delivery.
+// not: a value sealed for another endpoint, or for another header name in this
+// one, or under a key this process does not have, is dropped rather than sent,
+// and the delivery still goes out - a header nobody can authenticate must never
+// reach a receiver, and one bad value must not wedge a delivery.
 func (s *Store) openSealedHeaders(endpointID string, raw []byte) ([]CustomHeader, []string, error) {
 	entries, err := sealedHeaderEntries(raw)
 	if err != nil {
@@ -213,7 +220,7 @@ func (s *Store) openSealedHeaders(endpointID string, raw []byte) ([]CustomHeader
 	var out []CustomHeader
 	var dropped []string
 	for _, e := range entries {
-		plaintext, err := s.headersKey.Open(e.ValueCT, headerAAD(endpointID))
+		plaintext, err := s.headersKey.Open(e.ValueCT, headerAAD(endpointID, e.Name))
 		if err != nil {
 			dropped = append(dropped, e.Name)
 			continue
