@@ -1,0 +1,44 @@
+{{define "content"}}
+<h1>Send a test event</h1>
+
+{{/* UI-4: the marker is a field of the publish, so the event is ordinary -
+     validated, fanned out, delivered, retried - and the fact that it was a test
+     lives on the row. The page says so before the button, not after it. */}}
+<div class="notice">
+  <strong>This sends a synthetic test event.</strong>
+  <p>It is not a dry run and it is not a simulation. It is a real event that travels the production path: validated against the event type's own schema, fanned out to the endpoints that match, retried and logged exactly like any other delivery. It is marked as a test everywhere it appears - in this portal's delivery log and event page, and in the consumer's own view - so nobody mistakes it for customer traffic. The only thing the marker changes is how it is labelled.</p>
+</div>
+
+{{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+
+<div class="card">
+  {{if .Data.EventTypes}}
+  <form method="post" action="/test-event">
+    {{template "csrf_field" .}}
+    <div class="form-row">
+      <label for="event_type">Event type</label>
+      <select id="event_type" name="event_type" required>
+        {{range .Data.EventTypes}}<option value="{{.Name}}"{{if eqs .Name $.Data.EventType}} selected{{end}}>{{.Name}}</option>{{end}}
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="consumer_ref">Consumer reference</label>
+      <select id="consumer_ref" name="consumer_ref">
+        <option value="">Not addressed to one consumer</option>
+        {{range .Data.Consumers}}<option value="{{.Ref}}"{{if eqs .Ref $.Data.ConsumerRef}} selected{{end}}>{{.Ref}} - {{.Name}}</option>{{end}}
+      </select>
+      <span class="muted">Optional. A consumer-routed event type needs exactly one consumer reference (FR-505); leave this on the empty choice only for a broadcast type.</span>
+    </div>
+    <div class="form-row">
+      <label for="payload">Payload (JSON)</label>
+      <textarea id="payload" name="payload" rows="12" class="mono">{{.Data.Body}}</textarea>
+      <span class="muted">It starts from the event type's own schema so you do not have to guess your own contract. It must be a JSON document.</span>
+    </div>
+    <button class="btn" type="submit">Send the test event</button>
+  </form>
+  {{else}}
+  <p class="empty">You have no event types yet, and a test event must be published against one. Register a type on the <a href="/onboarding">Get started</a> page first.</p>
+  {{end}}
+  <p class="page-sub">Environment: <strong>{{.Data.Env}}</strong></p>
+</div>
+{{end}}

@@ -1,0 +1,43 @@
+{{define "content"}}
+<h1>Event {{.Data.Event.ID}}</h1>
+<p class="page-sub">Environment <strong>{{.Data.Env}}</strong> - the event, how it was routed, and every delivery it produced.</p>
+
+{{if .Data.Event.IsTest}}<p class="flash flash-info">This is a synthetic test event (UI-4): it was published with the test marker, travelled the production path, and is labelled as a test everywhere it appears.</p>{{end}}
+{{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+
+<div class="card">
+  <dl class="kv">
+    <dt>ID</dt><dd class="mono">{{.Data.Event.ID}}</dd>
+    <dt>Event type</dt><dd class="mono">{{.Data.Event.EventType}}</dd>
+    <dt>Routing mode</dt><dd>{{if .Data.Event.RoutingMode}}{{.Data.Event.RoutingMode}}{{else}}<span class="muted">not reported</span>{{end}}</dd>
+    <dt>Consumer reference</dt><dd>{{if .Data.Event.ConsumerRef}}<span class="mono">{{.Data.Event.ConsumerRef}}</span>{{else}}<span class="muted">none - a broadcast event names no consumer</span>{{end}}</dd>
+    <dt>Routing state</dt><dd>{{if .Data.Event.RoutingState}}{{template "badge" .Data.Event.RoutingState}}{{else}}<span class="muted">not reported</span>{{end}}</dd>
+    {{if .Data.Event.NonDeliveryReason}}<dt>Non-delivery reason</dt><dd>{{.Data.Event.NonDeliveryReason}}</dd>{{end}}
+    <dt>Occurred</dt><dd class="muted">{{.Data.Event.OccurredAt}}</dd>
+    <dt>Created</dt><dd class="muted">{{.Data.Event.CreatedAt}}</dd>
+    <dt>Rollup</dt><dd>{{if .Data.Event.Rollup}}{{.Data.Event.Rollup}}{{else}}<span class="muted">no rollup reported</span>{{end}}</dd>
+  </dl>
+</div>
+
+<div class="card">
+  <h2>Deliveries</h2>
+  {{if .Data.Event.Deliveries}}
+  <table class="data-table">
+    <thead><tr><th>ID</th><th>Endpoint</th><th>Status</th><th>Attempts</th><th></th></tr></thead>
+    <tbody>
+    {{range .Data.Event.Deliveries}}
+    <tr>
+      <td class="mono"><a href="/deliveries/{{.ID}}">{{.ID}}</a>{{if .IsTest}} <span class="muted">test</span>{{end}}</td>
+      <td class="mono"><a href="/endpoints/{{.EndpointID}}">{{.EndpointID}}</a></td>
+      <td>{{template "badge" .Status}}</td>
+      <td>{{.Attempts}}</td>
+      <td class="row-actions"><a class="btn btn-sm btn-secondary" href="/deliveries/{{.ID}}">Attempts and bodies</a></td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">This event produced no delivery: nothing matched it, or it was refused before fan-out. The routing state and any non-delivery reason above are the API's own answer.</p>
+  {{end}}
+</div>
+{{end}}

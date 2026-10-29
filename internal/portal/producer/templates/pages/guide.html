@@ -1,0 +1,34 @@
+{{define "content"}}
+<h1>Integration guide</h1>
+<p class="page-sub">Rendered from your live event types in the <strong>{{.Data.Env}}</strong> environment (UI-9). This page and the consumer portal render the same source - the event-type table - rather than a copy of a guide, so a schema you bump here is what a consumer's portal shows too.</p>
+
+{{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+{{if .Data.BaseURL}}<p class="page-sub">Publish against <span class="mono">{{.Data.BaseURL}}</span>, authenticated with a producer session token (FR-112).</p>{{end}}
+
+{{if .Data.EventTypes}}
+{{range .Data.EventTypes}}
+<div class="card">
+  <h2 class="mono">{{.Name}}</h2>
+  <dl class="kv">
+    <dt>Routing mode</dt><dd>{{.RoutingMode}}</dd>
+    <dt>Event class</dt><dd>{{if .EventClass}}{{.EventClass}}{{else}}<span class="muted">not set</span>{{end}}</dd>
+    <dt>Payload version</dt><dd>{{.PayloadVersion}}</dd>
+    <dt>Accepting publishes</dt><dd>{{if .Enabled}}{{template "badge" "active"}} yes{{else}}{{template "badge" "paused"}} no{{end}}</dd>
+  </dl>
+
+  <h3>Payload schema</h3>
+  {{if .Schema}}<pre class="snippet">{{.Schema}}</pre>{{else}}<p class="empty">This event type carries no payload schema, so any JSON object is accepted.</p>{{end}}
+
+  <h3>Publishing and fan-out</h3>
+  <p class="page-sub">Publish one event with a single POST naming this type and carrying a payload; the API validates that payload against the schema above before anything else happens, and the payload version is the one this page shows.{{if eq .RoutingMode "consumer"}} A consumer-routed event must name exactly one consumer - <span class="mono">consumer_ref</span> - and fan-out is the active endpoints of that consumer intersected with the active subscriptions for this type (FR-505, FR-507). An event naming both or neither is refused with a 422.{{else if eq .RoutingMode "broadcast"}} A broadcast event names no consumer: it takes no <span class="mono">consumer_ref</span>, and supplying one is a 422 (FR-505).{{end}} Each delivery that fan-out produces is signed with its endpoint's own secret, retried independently, and kept with its full attempt trail - so what you see in the delivery log is what the consumer sees, minus the other consumers.</p>
+
+  <h3>Verifying what you receive</h3>
+  <p class="page-sub">Signatures are Standard Webhooks. Take the endpoint's <span class="mono">whsec_</span> secret to the <a href="/snippet">snippets page</a> for a verifier in curl, Go, Node or Python - during a rotation, accept the old and the new signature until the overlap window closes (UI-6).</p>
+</div>
+{{end}}
+{{else}}
+<div class="card">
+  <p class="empty">No event types yet, so there is no contract to integrate against. Register one on the <a href="/onboarding">Get started</a> page and it appears here with its live schema.</p>
+</div>
+{{end}}
+{{end}}
