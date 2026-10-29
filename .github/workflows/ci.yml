@@ -143,6 +143,23 @@ jobs:
           # (TestDedupeAnswerSurvivesTheSweep) and the archive's measured
           # per-pair size agreeing with its exported gauge
           # (TestDedupeArchiveSizingAndGaugeAgree).
+          #
+          # AC-34's census (TestAttemptFanOutIsBounded) is registered here too, so
+          # the criterion's evidence cannot be renamed away. Its assertions are the
+          # bound - the peak in-flight count stays at or under the endpoint's cap of
+          # 10 with 2,500 due deliveries offered, the goroutine and descriptor
+          # footprint does not track the offered backlog across three backlogs six
+          # and twenty times apart, and the process's CPU rate does not either. The
+          # literal leg's absolute CPU figure is reported rather than asserted: it
+          # is the whole test binary's CPU under -race, so it lands either side of
+          # half a core on a shared 2 vCPU runner whether or not the bound holds
+          # (three CI runs of this file on the previous head measured 0.44, 0.49 and
+          # 0.51 cores on that leg, and the last failed a 0.5 threshold while the
+          # bound held in all three). The test's own header states the choice and the
+          # alternative it rejected; the CPU clause it enforces instead compares the
+          # two legs that attempt at the same rate (0.12/0.12, 0.09/0.11 and
+          # 0.12/0.14 cores/s in those three runs, against an allowance of twice the
+          # small leg's rate plus 0.2).
           # FR-405 and FR-1006 carry no AC number (no row in REQUIREMENTS.md §16
           # mentions headers), so their pins are requirement-level, the same shape
           # as TestFR1207ResumeExtendsThePromisedWindow and the D-6/D-7 entries.
@@ -233,6 +250,7 @@ jobs:
             TestAC37ClaimUsesTheEndpointWindow \
             TestAC37PerEndpointWindowGoverns \
             TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas \
+            TestAttemptFanOutIsBounded \
             TestAC52DeliveryLanesPartitionTheProcessBudget \
             TestAC52SharedLaneAtOneProcessSlotRunsBothClasses \
             TestAC52RegressionHealthyEndpointNotParkedBehindCappedBacklog \
