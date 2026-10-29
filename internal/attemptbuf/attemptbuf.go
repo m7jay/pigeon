@@ -42,6 +42,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/m7jay/pigeon/internal/metrics"
+	"github.com/m7jay/pigeon/internal/redisconn"
 	"github.com/m7jay/pigeon/internal/store"
 )
 
@@ -195,23 +196,22 @@ func NewFromClient(rdb *redis.Client, opts Options) (*Buffer, error) {
 	return New(rdb, opts)
 }
 
-// clientFromURL accepts both the documented URL form and a bare host:port.
+// clientFromURL accepts both the documented URL form and a bare host:port. The
+// parsing is redisconn's, which is the one place in this tree that decides what
+// PIGEON_REDIS_URL means; this wrapper adds the buffer's own deadline policy.
 //
-// Both branches set ContextTimeoutEnabled, because without it go-redis ignores
+// ContextTimeoutEnabled is turned on here, because without it go-redis ignores
 // the caller's context deadline and rides the client's own ReadTimeout instead:
 // measured, a 200 ms deadline against a socket that accepts and never answers
 // returned after 3.001 s, the read timeout. A Push, or the flusher's bounded
 // retirement (AckTimeout), would then be waiting on a bound nobody set (D-9).
 func clientFromURL(raw string) (*redis.Client, error) {
-	if strings.Contains(raw, "://") {
-		o, err := redis.ParseURL(raw)
-		if err != nil {
-			return nil, fmt.Errorf("parse PIGEON_REDIS_URL: %w", err)
-		}
-		o.ContextTimeoutEnabled = true
-		return redis.NewClient(o), nil
+	o, err := redisconn.Options(raw)
+	if err != nil {
+		return nil, err
 	}
-	return redis.NewClient(&redis.Options{Addr: raw, ContextTimeoutEnabled: true}), nil
+	o.ContextTimeoutEnabled = true
+	return redis.NewClient(o), nil
 }
 
 // Close releases the buffer's connection.
