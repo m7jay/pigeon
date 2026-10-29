@@ -3,11 +3,9 @@ package store
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -35,23 +33,56 @@ type LeasedOutbox struct {
 	Payload        json.RawMessage
 }
 
-// LeaseOutbox runs the definer function. lease is how long the row is held; a
-// crashed relay lets it lapse and the row becomes claimable again (D-6, FR-809).
+// LeaseOutbox is the relay's unit of work in its one-row form. It claims the next
+// pending row with SKIP LOCKED (FR-702) and returns the full event so the §10
+// envelope can be built from one round trip. The boolean is false when nothing was
+// claimable (the outbox is empty, or every pending row is still under lease), which
+// tells the relay to wait rather than spin.
+//
+// It is LeaseOutboxBatch with a limit of one, and nothing else: the S2 primitive is
+// stated once, so a caller that wants a single row cannot drift from the batch the
+// relay drains through.
 func (s *Store) LeaseOutbox(ctx context.Context, lease time.Duration) (LeasedOutbox, bool, error) {
-	var row LeasedOutbox
-	err := s.pool.QueryRow(ctx, `select outbox_id, event_id, producer_id, env, event_type,
+	rows, err := s.LeaseOutboxBatch(ctx, lease, 1)
+	if err != nil || len(rows) == 0 {
+		return LeasedOutbox{}, false, err
+	}
+	return rows[0], true, nil
+}
+
+// LeaseOutboxBatch claims up to limit pending rows in ONE round trip and returns
+// them in id order with their events, which is what makes the relay's drain loop a
+// batch loop instead of one round trip per event: the lease, the §10 envelope, the
+// fan-out and the mark all become per-BATCH costs (FR-818, §8.1's L1), and the
+// fan-out insert reaches FR-815's rows per transaction.
+//
+// limit is clamped by the function itself (a NULL or non-positive limit reads as
+// one, and there is a ceiling), so a caller cannot accidentally claim the whole
+// outbox into memory. An empty slice means nothing was claimable: the outbox is
+// empty, or every pending row is still under lease, which is the caller's cue to
+// wait rather than spin.
+func (s *Store) LeaseOutboxBatch(ctx context.Context, lease time.Duration, limit int) ([]LeasedOutbox, error) {
+	rows, err := s.pool.Query(ctx, `select outbox_id, event_id, producer_id, env, event_type,
 		payload_version, routing_mode, event_class, coalesce(consumer_ref, ''), occurred_at, payload
-		from pigeon_lease_outbox($1)`, lease,
-	).Scan(&row.OutboxID, &row.EventID, &row.ProducerID, &row.Env, &row.EventType,
-		&row.PayloadVersion, &row.RoutingMode, &row.EventClass, &row.ConsumerRef,
-		&row.OccurredAt, &row.Payload)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return row, false, nil
-	}
+		from pigeon_lease_outbox_batch($1, $2)`, lease, limit)
 	if err != nil {
-		return row, false, fmt.Errorf("lease outbox: %w", err)
+		return nil, fmt.Errorf("lease outbox batch: %w", err)
 	}
-	return row, true, nil
+	defer rows.Close()
+	var out []LeasedOutbox
+	for rows.Next() {
+		var row LeasedOutbox
+		if err := rows.Scan(&row.OutboxID, &row.EventID, &row.ProducerID, &row.Env, &row.EventType,
+			&row.PayloadVersion, &row.RoutingMode, &row.EventClass, &row.ConsumerRef,
+			&row.OccurredAt, &row.Payload); err != nil {
+			return nil, fmt.Errorf("lease outbox batch: %w", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("lease outbox batch: %w", err)
+	}
+	return out, nil
 }
 
 // MarkOutboxPublished records FR-701's success: the row is marked published only
