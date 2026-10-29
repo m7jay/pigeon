@@ -97,20 +97,104 @@ func TestCapHoldsAcrossReplicas(t *testing.T) {
 // FR-1302: "a crashed worker's slots expire". A worker that dies holding a slot
 // leaks nothing - the member is scored by its expiry and purged by the next
 // acquisition.
+//
+// No leg of this test is timed against a wall clock the box can stretch. The
+// shape it replaces held a 60 ms lease for the "still live" refusal and then
+// slept 90 ms for the expiry, so on a loaded box (and under -race, which slows
+// every Redis round trip) the "live" holder had already lapsed by the second
+// Acquire: the missing refusal was reported as a broken cap rather than as a
+// scheduling delay (measured 2 FAIL / 100 on a busy box, every failure on the
+// refusal line).
 func TestCrashedHolderSlotsExpire(t *testing.T) {
 	ctx := context.Background()
 	r, rdb := newRedisRegistry(t)
-	const endpoint = "ep_crash"
 
-	// Held with a 60 ms lease and never released, the way a SIGKILL leaks one.
-	mustAcquire(t, ctx, r, endpoint, 1, 60*time.Millisecond, "dead")
-	if _, ok, _, err := r.Acquire(ctx, endpoint, 1, 60*time.Millisecond, "next"); err != nil || ok {
+	// A live holder blocks the next acquire. 30 s is not a sleep that is "long
+	// enough": for this assertion to be wrong, thirty seconds of wall clock must
+	// pass between two statements of this test, whatever the box is doing.
+	const liveLease = 30 * time.Second
+	const endpoint = "ep_crash"
+	mustAcquire(t, ctx, r, endpoint, 1, liveLease, "dead")
+	_, ok, wait, err := r.Acquire(ctx, endpoint, 1, liveLease, "next")
+	if err != nil || ok {
 		t.Fatalf("cap 1 with one live holder = (ok=%v, err=%v), want refused", ok, err)
 	}
-	time.Sleep(90 * time.Millisecond)
-	mustAcquire(t, ctx, r, endpoint, 1, 60*time.Millisecond, "next")
-	if n, err := rdb.ZCard(ctx, ConcurrencyKey(endpoint)).Result(); err != nil || n != 1 {
-		t.Fatalf("after the dead holder expired the set holds %d (err %v), want 1", n, err)
+	if wait <= 0 || wait > liveLease {
+		t.Errorf("the refusal reported wait=%s; a held slot's remaining lease (0, %s] is what the caller waits for (FR-1302)", wait, liveLease)
+	}
+
+	// A lease that really lapses frees the slot, at the scale it was taken at: a
+	// separate short lease, waited for by a bounded poll rather than a fixed
+	// sleep. Load can only make the purge later, never false the assertion, and
+	// a ttl read as seconds instead of milliseconds (50 s for this holder) still
+	// misses the bound.
+	const shortLease, lapsed = 50 * time.Millisecond, "ep_lapsed"
+	mustAcquire(t, ctx, r, lapsed, 1, shortLease, "dead")
+	waitForFreeSlot(t, ctx, r, lapsed, liveLease, 5*time.Second)
+	if n, err := rdb.ZCard(ctx, ConcurrencyKey(lapsed)).Result(); err != nil || n != 1 {
+		t.Fatalf("after the lapsed holder freed its slot the set holds %d (err %v), want 1", n, err)
+	}
+
+	// And the dead member is PURGED, not merely outscored: a crash leaves the
+	// member behind with a lapsed score, which is what the next acquisition
+	// purges. Move the held slot's score into the past by hand - no wall clock -
+	// and require the next acquisition to take the slot AND drop the dead member
+	// by name, so a leak cannot hide behind the cap check.
+	const purged = "ep_purged"
+	key := ConcurrencyKey(purged)
+	mustAcquire(t, ctx, r, purged, 1, liveLease, "dead")
+	dead := zMembers(t, rdb, key)
+	if len(dead) != 1 {
+		t.Fatalf("%s holds %v after one acquire, want exactly 1 member", key, dead)
+	}
+	markLeaseLapsed(t, rdb, key, dead[0])
+	mustAcquire(t, ctx, r, purged, 1, liveLease, "next")
+	got := zMembers(t, rdb, key)
+	if len(got) != 1 || got[0] == dead[0] {
+		t.Fatalf("%s holds %v after the dead holder's lease lapsed, want exactly the new holder (%q purged)", key, got, dead[0])
+	}
+}
+
+// waitForFreeSlot acquires until the endpoint admits the caller, failing after
+// within. A bounded wait is what makes the leg latency-independent: load can only
+// make the purge later, never false the assertion.
+func waitForFreeSlot(t *testing.T, ctx context.Context, r Registry, endpoint string, ttl, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		if _, ok, _, err := r.Acquire(ctx, endpoint, 1, ttl, "next"); err != nil {
+			t.Fatalf("Acquire(%s): %v", endpoint, err)
+		} else if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a lapsed holder still blocked %s %s later; a crashed worker's slot must expire (FR-1302)", endpoint, within)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// zMembers returns the endpoint's held slots as recorded, so a test can name the
+// member a crashed holder leaked instead of only counting it.
+func zMembers(t *testing.T, rdb *redis.Client, key string) []string {
+	t.Helper()
+	members, err := rdb.ZRange(context.Background(), key, 0, -1).Result()
+	if err != nil {
+		t.Fatalf("ZRANGE %s: %v", key, err)
+	}
+	return members
+}
+
+// markLeaseLapsed moves a held slot's score into the past: the model of a
+// SIGKILLed holder whose lease has since run out, at no cost in wall clock.
+func markLeaseLapsed(t *testing.T, rdb *redis.Client, key, member string) {
+	t.Helper()
+	err := rdb.ZAdd(context.Background(), key, redis.Z{
+		Score:  float64(time.Now().Add(-time.Second).UnixMilli()),
+		Member: member,
+	}).Err()
+	if err != nil {
+		t.Fatalf("ZADD lapsed score for %s: %v", member, err)
 	}
 }
 
