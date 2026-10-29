@@ -34,7 +34,7 @@ type publishRequest struct {
 	// Test marks the event as synthetic (UI-4). The field is accepted on both the
 	// key route and the producer portal's member route, so a producer's own script
 	// and the portal's "Send test event" button mean the same thing by the same
-	// name; the marker travels on the row (migration 0020), not on the page that
+	// name; the marker travels on the row (migration 0021), not on the page that
 	// sent it.
 	Test bool `json:"test"`
 }

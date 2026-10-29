@@ -53,7 +53,7 @@ type deliveryJSON struct {
 	// not held, which is every delivery whose attempt has started.
 	HeldBackSince  *string `json:"held_back_since"`
 	HeldBackReason *string `json:"held_back_reason"`
-	// IsTest is UI-4's synthetic marker (S9a, migration 0020): the delivery's event
+	// IsTest is UI-4's synthetic marker (S9a, migration 0021): the delivery's event
 	// was sent as a test, so the log labels it wherever it appears. The delivery
 	// itself is ordinary - same worker, same retries, same signature.
 	IsTest bool `json:"is_test"`

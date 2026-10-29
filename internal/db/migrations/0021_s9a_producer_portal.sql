@@ -1,4 +1,4 @@
--- 0020_s9a_producer_portal.sql — S9a / M2a: the two things the producer portal
+-- 0021_s9a_producer_portal.sql — S9a / M2a: the two things the producer portal
 -- needs from the core that did not exist anywhere in the tree.
 --
 -- 1. A durable marker for a *synthetic* test event (UI-4: "\"Send test event\",
