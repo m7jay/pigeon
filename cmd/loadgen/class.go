@@ -10,8 +10,17 @@ package main
 // clause to the artifact and its exit status is the verdict, as `compare`'s is.
 //
 // The failure mode the clause exists to prevent is a graded number taken on a
-// machine that does not carry the class, so the harness records the observed
-// machine and refuses when the two disagree.
+// machine that does not carry the class, so the harness records the machine under
+// test and refuses when the two disagree.
+//
+// "The machine under test" is not the machine this process runs on. §12 wants the
+// generator outside the machine under test or in its own container, and this process
+// *is* the generator: on every gradeable run the machine block describes the
+// generator's box. So a graded run declares the machine under test with
+// -sut-cpus/-sut-mem-gib, the artifact carries it as machine_under_test, and the
+// class is checked against *that* - in `run` before the 35 minutes are spent, and in
+// `grade` from the artifact. An artifact with no machine under test cannot support
+// the claim and is refused rather than graded.
 
 import (
 	"encoding/json"
@@ -159,9 +168,93 @@ func observedClass(m machine) string {
 	return ""
 }
 
+const (
+	// machineObserved and machineDeclared say how a machine under test was
+	// established, and they are recorded in the artifact beside it. "observed" is
+	// the machine this process ran on, which is the machine under test only when the
+	// generator shared it; "declared" is -sut-cpus/-sut-mem-gib, the operator's
+	// statement about a machine the generator cannot see (§12's arrangement).
+	machineObserved = "observed"
+	machineDeclared = "declared"
+)
+
+// sameMachine returns "" when two machine descriptions are the same machine, and what
+// differs otherwise. It is the class match with the class taken out: cores are exact
+// and memory is the classMemBand, so a declaration cannot be tuned to agree with the
+// observed machine by a hair.
+func sameMachine(a, b machine) string {
+	if a.CPUs != b.CPUs {
+		return fmt.Sprintf("%d vCPU against %d", a.CPUs, b.CPUs)
+	}
+	am, bm := float64(a.MemMiB)/1024, float64(b.MemMiB)/1024
+	if am > 0 && bm > 0 {
+		if dev := (am - bm) / bm; math.Abs(dev) > classMemBand {
+			return fmt.Sprintf("%.1f GiB against %.1f GiB (±%.0f%% allowed)", am, bm, classMemBand*100)
+		}
+	}
+	return ""
+}
+
+// declaredSUT is the machine under test as the operator stated it (-sut-cpus,
+// -sut-mem-gib). Both figures are required together: a machine named by its cores
+// alone or its RAM alone is not a machine, and filling the other half in is how an
+// unrated box gets graded.
+func (c config) declaredSUT() (machine, bool, error) {
+	switch {
+	case c.SUTCPUs == 0 && c.SUTMemGiB == 0:
+		return machine{}, false, nil
+	case c.SUTCPUs <= 0 || c.SUTMemGiB <= 0:
+		return machine{}, false, errors.New("-sut-cpus and -sut-mem-gib describe the machine under test (-class checks the class against it) and must be given together, both positive")
+	}
+	m := machine{
+		CPUs:   c.SUTCPUs,
+		MemMiB: int64(math.Round(c.SUTMemGiB * 1024)),
+		Source: machineDeclared,
+	}
+	m.ObservedClass = observedClass(m)
+	return m, true, nil
+}
+
+// machineUnderTest resolves the machine the declared class is claimed for.
+//
+// When the generator shared the machine under test (§12's lower-bound arrangement)
+// the machine under test is the one this process describes - the only machine the
+// harness can see - and a -sut-cpus/-sut-mem-gib declaration that disagrees with it
+// is refused rather than picked over: otherwise a run could describe a 2 vCPU box in
+// the machine block and claim the 8 vCPU class in a flag.
+//
+// When the generator ran elsewhere - the arrangement §12 asks for, and the only one
+// clause 3 can be graded from - the harness cannot see the machine under test at all,
+// so the declaration is required. Without it the class would be checked against
+// nothing, which is exactly the graded-number-on-an-unrated-box failure the clause
+// exists to prevent.
+func machineUnderTest(c config, observed machine, onSUT bool) (machine, error) {
+	declared, ok, err := c.declaredSUT()
+	if err != nil {
+		return machine{}, err
+	}
+	if onSUT {
+		if ok {
+			if reason := sameMachine(observed, declared); reason != "" {
+				return machine{}, fmt.Errorf("the generator shared the machine under test, so the machine under test is %s, but -sut-cpus %d -sut-mem-gib %g declares %s: %s",
+					observed.describe(), c.SUTCPUs, c.SUTMemGiB, declared.describe(), reason)
+			}
+		}
+		observed.Source = machineObserved
+		return observed, nil
+	}
+	if !ok {
+		return machine{}, errors.New("§12 puts the generator off the machine under test, so this process cannot see the machine the class is claimed for: declare it with -sut-cpus N -sut-mem-gib N (the instance's vCPU and RAM in GiB). Without it the class is checked against nothing, which is the failure mode AC-30's third clause exists to prevent")
+	}
+	return declared, nil
+}
+
 // describe is the machine's one-line form for a report and a refusal message.
 func (m machine) describe() string {
 	d := fmt.Sprintf("%d vCPU / %.1f GiB", m.CPUs, float64(m.MemMiB)/1024)
+	if m.Source != "" {
+		d += " (" + m.Source + ")"
+	}
 	if m.Hostname != "" {
 		d += " on " + m.Hostname
 	}
@@ -290,40 +383,50 @@ func baseIsLocal(baseURL string) (bool, error) {
 // classPreflight validates a run that declares a class, before it spends 35 minutes
 // on a claim that cannot be graded. It refuses a class §8.1 does not rate, a
 // subscription count other than §8.1's own basis, a run with no -db (the graded
-// units are database counts, not the generator's), and - when the generator runs on
-// the machine under test, so that the class is observable - a machine that does not
-// carry the declared class. The same rules are applied to the artifact by
-// compareClass, so a run cannot pass what a verdict refuses.
-func classPreflight(c config) (*classClaim, error) {
+// units are database counts, not the generator's), a machine under test it cannot
+// identify (-sut-cpus/-sut-mem-gib when the generator runs off the machine), and a
+// machine under test that does not carry the declared class. The same rules are
+// applied to the artifact by compareClass, so a run cannot pass what a verdict
+// refuses.
+//
+// It returns the claim and the machine under test the claim is checked against; the
+// run records both.
+func classPreflight(c config) (*classClaim, machine, error) {
 	row, ok := lookupClass(c.Class)
 	if !ok {
-		return nil, fmt.Errorf("-class %q is not a §8.1 row: %s", c.Class, classNames())
+		return nil, machine{}, fmt.Errorf("-class %q is not a §8.1 row: %s", c.Class, classNames())
 	}
 	if c.Subs != classSubs {
-		return nil, fmt.Errorf("§8.1's event column is stated at %d subscriptions per event and -class grades that workload; -subs is %d", classSubs, c.Subs)
+		return nil, machine{}, fmt.Errorf("§8.1's event column is stated at %d subscriptions per event and -class grades that workload; -subs is %d", classSubs, c.Subs)
 	}
 	if c.DB == "" {
-		return nil, errors.New("§12 counts accepted events in events and outbox rather than from the generator's own counter; -class requires -db")
+		return nil, machine{}, errors.New("§12 counts accepted events in events and outbox rather than from the generator's own counter; -class requires -db")
 	}
 	onSUT, source, err := generatorIsOnSUT(c.GeneratorOnSUT, c.BaseURL)
 	if err != nil {
-		return nil, err
+		return nil, machine{}, err
 	}
 	m := describeMachine()
+	sut, err := machineUnderTest(c, m, onSUT)
+	if err != nil {
+		return nil, machine{}, err
+	}
 	claim := row.claim(onSUT, source)
-	switch {
-	case !onSUT:
+	if !onSUT {
 		// §12's arrangement. The machine this process describes is the generator's,
 		// not the class's, so the class is recorded as the operator's statement about
 		// the box under test rather than as something this harness verified.
-		claim.Note = fmt.Sprintf("the class is attested, not observed: the generator ran off the machine under test, so the machine block in this report (%s) describes the generator", m.describe())
-	default:
-		if reason := classMatch(m, row); reason != "" {
-			return nil, fmt.Errorf("this machine does not carry -class %s: %s. §8.1 rates %s. A graded number on a machine that does not carry the class is the failure mode AC-30's third clause exists to prevent, so this run is refused rather than graded",
-				row.Name, reason, classNames())
-		}
+		claim.Note = fmt.Sprintf("the class is attested, not observed: the generator ran off the machine under test, so the machine block in this report (%s) describes the generator and the class is checked against the declared machine under test (%s)",
+			m.describe(), sut.describe())
+	} else {
+		claim.Note = fmt.Sprintf("the class is observed on this machine (%s), and this run cannot be graded: §12 wants the generator outside the machine under test or in its own container, and this generator shared it, so every number here is a lower bound. A graded run puts the generator on another host (or in its own container, stated with -generator-on-sut no) and declares the machine under test with -sut-cpus/-sut-mem-gib",
+			sut.describe())
 	}
-	return claim, nil
+	if reason := classMatch(sut, row); reason != "" {
+		return nil, machine{}, fmt.Errorf("the machine under test does not carry -class %s: %s (§8.1 rates %s). A graded number on a machine that does not carry the class is the failure mode AC-30's third clause exists to prevent, so this run is refused rather than graded",
+			row.Name, reason, classNames())
+	}
+	return claim, sut, nil
 }
 
 func evidenceOf(onSUT bool) string {
@@ -344,7 +447,10 @@ type classComparison struct {
 	Class    classClaim   `json:"class"`
 	Row      machineClass `json:"section_8_1_row"`
 	Evidence string       `json:"class_evidence"`
-	Blockers []string     `json:"not_gradeable,omitempty"`
+	// MachineUnderTest is the machine the class was checked against, as the artifact
+	// recorded it.
+	MachineUnderTest *machine `json:"machine_under_test,omitempty"`
+	Blockers         []string `json:"not_gradeable,omitempty"`
 
 	Subscriptions        int     `json:"subscriptions_per_event"`
 	GradedWindowS        float64 `json:"graded_window_s"`
@@ -386,6 +492,7 @@ func compareClass(r *report) classComparison {
 		return fail("the report declares class %q, which is not a row of §8.1's table (%s)", r.Class.Name, classNames())
 	}
 	out.Class, out.Row, out.Evidence = *r.Class, row, r.Class.Evidence
+	out.MachineUnderTest = r.MachineUnderTest
 
 	out.GradedWindowS = r.Graded.WindowS
 	out.MeasuredEventsPS, out.MeasuredDeliveriesPS = r.Graded.EventsPS, r.Graded.DeliveriesPS
@@ -403,15 +510,29 @@ func compareClass(r *report) classComparison {
 	// graded on a different subscription count, or was never reconciled would be a
 	// measurement of something else wearing the clause's name.
 	var blockers []string
-	// The class gate: the machine the harness describes must carry the class it is
-	// grading. It applies whenever the machine under test *is* that machine - the
-	// evidence is "observed" then, and an artifact that records no evidence at all is
-	// checked rather than trusted - and is skipped only for an explicitly attested
-	// class, where the block below is the generator's and a mismatch would say
-	// nothing about the box being graded.
-	if out.Evidence != "attested" {
-		if reason := classMatch(r.Machine, row); reason != "" {
-			blockers = append(blockers, fmt.Sprintf("the run claims %s but ran on %s: %s", row.Name, r.Machine.describe(), reason))
+	// The class gate: the machine the class is claimed for must carry it.
+	//
+	// It reads machine_under_test, not the machine block. §12 puts the generator off
+	// the machine under test and this harness *is* the generator, so on every
+	// gradeable run the block describes the generator's box: checking the class
+	// against it would check the class against the wrong machine, and would never
+	// fire on the runs the clause is graded from. The machine under test is the
+	// machine-block's figures when the generator shared it and the operator's
+	// -sut-cpus/-sut-mem-gib declaration when it did not. An artifact that records
+	// neither cannot support the claim.
+	if r.MachineUnderTest == nil || r.MachineUnderTest.CPUs <= 0 {
+		blockers = append(blockers, "the report records no machine under test, so the declared class is checked against nothing: a graded run declares it with -sut-cpus N -sut-mem-gib N (the machine the instance ran on, §12 puts the generator off it)")
+	} else {
+		if reason := classMatch(*r.MachineUnderTest, row); reason != "" {
+			blockers = append(blockers, fmt.Sprintf("the run claims %s but the machine under test is %s: %s", row.Name, r.MachineUnderTest.describe(), reason))
+		}
+		if out.Evidence == evidenceOf(true) {
+			// The class is recorded as observed, so the machine under test is by
+			// definition the machine this process described. An artifact whose two
+			// blocks disagree is not describing one machine.
+			if reason := sameMachine(r.Machine, *r.MachineUnderTest); reason != "" {
+				blockers = append(blockers, fmt.Sprintf("the class is recorded as observed, so the machine under test is the machine the generator ran on, but the two blocks disagree: %s", reason))
+			}
 		}
 	}
 	if r.Config.Subs != classSubs {
@@ -434,8 +555,8 @@ func compareClass(r *report) classComparison {
 	}
 
 	within := math.Abs(out.EventsDeviation) <= classTolerance && math.Abs(out.DeliveriesDeviation) <= classTolerance
-	detail := fmt.Sprintf("class %s (%d vCPU / %d GiB, %s), graded window %.0f s at %d subscription(s)/event: events/s %.1f against §8.1's %.0f (%+.1f%%), deliveries/s %.1f against §8.1's %.0f (%+.1f%%), both within ±%.0f%%: %v",
-		row.Name, row.CPUs, row.MemGiB, evidenceText(out.Evidence), out.GradedWindowS, r.Config.Subs,
+	detail := fmt.Sprintf("class %s (%d vCPU / %d GiB, %s), machine under test %s, graded window %.0f s at %d subscription(s)/event: events/s %.1f against §8.1's %.0f (%+.1f%%), deliveries/s %.1f against §8.1's %.0f (%+.1f%%), both within ±%.0f%%: %v",
+		row.Name, row.CPUs, row.MemGiB, evidenceText(out.Evidence), sutText(r.MachineUnderTest), out.GradedWindowS, r.Config.Subs,
 		out.MeasuredEventsPS, row.Events, out.EventsDeviation*100,
 		out.MeasuredDeliveriesPS, row.Deliveries, out.DeliveriesDeviation*100,
 		classTolerance*100, within)
@@ -462,6 +583,15 @@ func evidenceText(evidence string) string {
 	default:
 		return "class evidence unrecorded"
 	}
+}
+
+// sutText names the machine under test in a verdict, and says so plainly when the
+// artifact records none - which is a refusal, not a footnote.
+func sutText(m *machine) string {
+	if m == nil || m.CPUs <= 0 {
+		return "unrecorded"
+	}
+	return m.describe()
 }
 
 // deviationAdvice names which side of §12's rule a miss falls on. "A tolerance is
@@ -594,6 +724,7 @@ func printGrade(res *gradeResult) {
 			row.Name, row.CPUs, row.MemGiB, row.Deliveries, row.Events, classSubs)
 		fmt.Printf("  graded window %.0f s, offered %.0f events/s, class evidence: %s\n",
 			res.Comparison.GradedWindowS, res.Comparison.OfferedEventsPS, evidenceText(res.Comparison.Evidence))
+		fmt.Printf("  machine under test: %s\n", sutText(res.Comparison.MachineUnderTest))
 		fmt.Printf("  %-14s %12s %12s %11s %10s\n", "unit", "§8.1 row", "measured", "deviation", "tolerance")
 		fmt.Printf("  %-14s %12.1f %12.1f %10.1f%% %9.0f%%\n", "events/s",
 			res.Comparison.ExpectedEventsPS, res.Comparison.MeasuredEventsPS, res.Comparison.EventsDeviation*100, res.Comparison.Tolerance*100)
@@ -608,6 +739,6 @@ func printGrade(res *gradeResult) {
 		fmt.Printf("%s %-22s %s\n", verdictStatus(v.OK), v.AC, v.Detail)
 	}
 	if res.Machine.CPUs > 0 {
-		fmt.Printf("\nmeasured on %s\n", res.Machine.describe())
+		fmt.Printf("\nmeasured on %s (the generator's machine; the class is claimed for the machine under test above)\n", res.Machine.describe())
 	}
 }

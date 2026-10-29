@@ -77,11 +77,24 @@ type config struct {
 	// (-class). Empty means the run claims none, which leaves AC-30's third clause
 	// ungradeable: see class.go.
 	Class string
+	// SUTCPUs and SUTMemGiB declare the machine under test (-sut-cpus,
+	// -sut-mem-gib): the machine the class is claimed for. §12 puts the generator
+	// off the machine under test, so on a gradeable run the machine block describes
+	// the *generator's* box and the machine being graded has to be stated. Zero
+	// means undeclared, which is only coherent when the generator shares the machine
+	// under test - then the harness can see it.
+	SUTCPUs   int
+	SUTMemGiB float64
 	// GeneratorOnSUT is the §12 protocol fact - whether the generator shared the
 	// machine under test - as auto, yes or no. auto resolves it from -base.
 	GeneratorOnSUT string
 	// Claim is the class claim classPreflight built, carried into the report.
 	Claim *classClaim
+	// SUT is the machine under test classPreflight resolved, carried into the
+	// report as machine_under_test. It is what `grade` checks the class against, and
+	// it is the only source for the machine block of the machine actually under
+	// test when the generator ran elsewhere.
+	SUT *machine
 }
 
 func main() {
@@ -139,6 +152,10 @@ run flags:
   -class           declare the §8.1 machine class this run claims for the machine under test
                    (2vCPU-2GB, 2vCPU-4GB, 4vCPU-8GB, 8vCPU-16GB); required for AC-30's third
                    clause, which "grade" decides
+  -sut-cpus        the machine under test's vCPU count, when the generator runs off it (§12)
+  -sut-mem-gib     the machine under test's RAM in GiB; -sut-cpus and -sut-mem-gib are given
+                   together and are recorded as machine_under_test, which is the machine the
+                   declared class is checked against
   -generator-on-sut  auto|yes|no - did the generator share the machine under test? (§12; auto
                    resolves it from -base)
 
@@ -171,6 +188,8 @@ func cmdRun(args []string) error {
 	fs.DurationVar(&c.RequestTimeout, "timeout", 10*time.Second, "per-request timeout")
 	fs.DurationVar(&c.Settle, "settle", 60*time.Second, "wait after the last publish before reconciling (relay fan-out is asynchronous)")
 	fs.StringVar(&c.Class, "class", "", "§8.1 machine class this run claims (AC-30 clause 3)")
+	fs.IntVar(&c.SUTCPUs, "sut-cpus", 0, "vCPU count of the machine under test (with -sut-mem-gib)")
+	fs.Float64Var(&c.SUTMemGiB, "sut-mem-gib", 0, "RAM in GiB of the machine under test (with -sut-cpus)")
 	fs.StringVar(&c.GeneratorOnSUT, "generator-on-sut", "auto", "auto|yes|no: did the generator share the machine under test? (§12)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -190,14 +209,21 @@ func cmdRun(args []string) error {
 	if c.Class != "" {
 		// A class declaration is a claim that this run grades AC-30's third clause,
 		// so the harness checks what makes that possible before spending the 35
-		// minutes: §8.1's basis, the database the graded units are counted in, and
-		// - when the generator is on the machine under test, so the class is
-		// observable - that the machine carries the class it claims.
-		claim, err := classPreflight(c)
+		// minutes: §8.1's basis, the database the graded units are counted in, an
+		// identifiable machine under test, and that machine carrying the class it
+		// claims.
+		claim, sut, err := classPreflight(c)
 		if err != nil {
 			return err
 		}
-		c.Claim = claim
+		c.Claim, c.SUT = claim, &sut
+	} else if sut, ok, err := c.declaredSUT(); err != nil {
+		// A declared machine under test is recorded even without a class, so the §16
+		// machine block names the box the instance ran on rather than only the
+		// generator's.
+		return err
+	} else if ok {
+		c.SUT = &sut
 	}
 	rep, err := runLoad(c)
 	if err != nil {
@@ -300,7 +326,13 @@ type machine struct {
 	// ObservedClass is the §8.1 row this machine itself matches, when it matches
 	// one. Empty means it carries none of them.
 	ObservedClass string `json:"observed_class,omitempty"`
-	DB            string `json:"database,omitempty"`
+	// Source says how a machine under test was established: "observed" when the
+	// machine this process ran on *is* the machine under test (the generator shared
+	// it), "declared" when the generator ran elsewhere (§12) and the operator stated
+	// the machine under test with -sut-cpus/-sut-mem-gib. Empty for the machine
+	// block proper, which is always the generator's box.
+	Source string `json:"source,omitempty"`
+	DB     string `json:"database,omitempty"`
 }
 
 // runConfig is the generator-side configuration a report carries. It is a named
@@ -322,6 +354,14 @@ type report struct {
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at"`
 	Machine   machine   `json:"machine"`
+	// MachineUnderTest is the machine the declared class is claimed for, recorded
+	// from the generator's own machine when it shared it and from
+	// -sut-cpus/-sut-mem-gib when §12 put the generator elsewhere. `grade` checks the
+	// class against *this* and not against Machine, because on every gradeable run
+	// Machine is the generator's box: a class graded against the generator's machine
+	// would be a graded number on an unrated box, which is the failure mode AC-30's
+	// third clause exists to prevent.
+	MachineUnderTest *machine `json:"machine_under_test,omitempty"`
 	// Class is the §8.1 machine class this run declared with -class, absent when it
 	// declared none. AC-30's third clause is not gradeable without it: `grade` says
 	// so rather than comparing a number against a row nobody claimed.
@@ -385,6 +425,7 @@ func runLoad(c config) (*report, error) {
 	rep.Config.EvaluateS = c.Evaluate.Seconds()
 	rep.Config.Concurrency = c.Concurrency
 	rep.Machine = describeMachine()
+	rep.MachineUnderTest = c.SUT
 	rep.Class = c.Claim
 
 	client := &http.Client{
@@ -418,6 +459,9 @@ func runLoad(c config) (*report, error) {
 	if c.Claim != nil {
 		fmt.Printf("  class: %s (%d vCPU / %d GiB) declared for the machine under test, class evidence %s\n",
 			c.Claim.Name, c.Claim.CPUs, c.Claim.MemGiB, c.Claim.Evidence)
+		if c.SUT != nil {
+			fmt.Printf("  machine under test (%s): %s\n", c.SUT.Source, c.SUT.describe())
+		}
 		if c.Claim.Note != "" {
 			fmt.Printf("  note: %s\n", c.Claim.Note)
 		}
