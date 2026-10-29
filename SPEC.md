@@ -366,12 +366,16 @@ and is retried on the next tick.
 the configured `PIGEON_RETENTION_EVENTS` window appears in the usage payload
 but no partitions are dropped for it. This is a known gap, not a silent promise.
 
-**SB-6's dashboard half has no dashboard to put it in.** SB-6 asks for the disk
+**SB-6's dashboard half has no operator dashboard to put it in.** SB-6 asks for the disk
 figure on "the dashboard and `GET /v1/meta/usage`". There is no operator dashboard in
-the tree (the consumer portal is tenant-facing), so the pressure signal ships as the
-admin-only JSON endpoint plus `pigeon_partition_drops_total` and
-`pigeon_publishes_shed_total` on `/metrics`, which an external dashboard or alert
-scrapes. If an operator UI lands later, it reads the same payload.
+the tree, so the pressure signal ships as the admin-only JSON endpoint plus
+`pigeon_partition_drops_total` and `pigeon_publishes_shed_total` on `/metrics`, which an
+external dashboard or alert scrapes. The producer portal's UI-8 panel is the one in-tree
+place a human sees it: it reads `GET /v1/producer/usage` (S9a), the member-visible half
+of the same reading - the pressure and the windows, never the partition catalogue, which
+stays on the admin route - so a producer sees the platform's disk pressure without being
+handed the operator's table listing. If an operator UI lands later, it reads the same
+admin payload.
 
 ## Local toolchain
 
@@ -738,7 +742,10 @@ client-held claim, no signed cookie.
   sentences in §14 that called the portal credential a "scoped token" now name the
   session bearer. Signed means stateless, stateless means a revocation list, and the
   revocation list is this table - so a signed cookie here would have been a second
-  mechanism for the row that already exists.
+  mechanism for the row that already exists. The producer portal's data paths - which
+  `/v1/producer/*` and `/v1/session/*` route each panel calls, and with which
+  credential (a member session bearer, an owner one, or none) - are listed in
+  `REQUIREMENTS.md` §14.3.
 
 **Trade-off.** One indexed read per authenticated request where a JWT needs none,
 mitigated by the 5 s cache; a session table on the auth path where a JWT needs

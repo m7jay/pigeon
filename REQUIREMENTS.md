@@ -960,6 +960,60 @@ second token on the portal-to-core hop: the portal presents its bearer to the co
 no CSRF token, because a CSRF attack does not traverse that hop - S10 MUST NOT implement
 a second token beside this one.
 
+### 14.3 The producer portal's data paths
+
+The producer portal (M2a, `cmd/producer-portal`) is a thin client: every panel it
+renders is one of the calls below, made server-side with the signed-in member's
+opaque session bearer (FR-112), and nothing it does is impossible from the API. The
+credential column is the `routeKind` the route declares in
+`internal/httpapi/routes.go`; the `anonymous` rows are the ways in, which by
+definition have no session yet.
+
+| Route | Credential | Rendered by |
+|---|---|---|
+| `POST /v1/session` | anonymous | the login form |
+| `GET /v1/session` | session | read on every page - the core, not a cookie copy, is the authority on the role |
+| `DELETE /v1/session` | session | logout |
+| `POST /v1/session/password` | a session with FR-101's forced change pending | the account page |
+| `POST /v1/session/oidc` | anonymous | the OIDC callback hands the id_token to the core (FR-106) |
+| `POST /v1/password-resets` | anonymous | the forgot-password form (FR-111) |
+| `POST /v1/password-resets/accept` | anonymous | the reset form (FR-111) |
+| `GET /v1/producer/event-types` | member | UI-1 step 2, UI-9 |
+| `POST /v1/producer/event-types` | member | UI-1 step 2 |
+| `POST /v1/producer/events` | member | UI-1 steps 5-6, UI-4's test event |
+| `GET /v1/producer/events/{eventID}` | member | UI-1 step 6, the event page |
+| `GET /v1/producer/consumers` | member | UI-2, UI-10, UI-11 |
+| `POST /v1/producer/consumers` | member | UI-1 step 3, UI-10 create |
+| `GET /v1/producer/consumers/{consumerID}/endpoints` | member | UI-2's health, UI-11 |
+| `POST /v1/producer/consumers/{consumerID}/endpoints` | member | UI-1 step 3 |
+| `PATCH /v1/producer/consumers/{consumerID}/endpoints/{endpointID}` | member | UI-2 pause/resume |
+| `POST /v1/producer/consumers/{consumerID}/endpoints/{endpointID}/verify` | member | UI-1 step 4 |
+| `POST /v1/producer/consumers/{consumerID}/endpoints/{endpointID}/rotate` | member | UI-6 |
+| `GET /v1/producer/consumers/{consumerID}/events` | member | UI-11's unroutable rows |
+| `GET /v1/producer/consumers/{consumerID}/users` | member | UI-10 |
+| `POST /v1/producer/consumers/{consumerID}/invites` | owner | UI-10 invite |
+| `DELETE /v1/producer/consumers/{consumerID}/users/{userID}` | owner | UI-10 revoke |
+| `GET /v1/producer/deliveries` | member | UI-3 |
+| `GET /v1/producer/deliveries/{deliveryID}` | member | UI-3 detail |
+| `POST /v1/producer/deliveries/replay` | member | UI-5 |
+| `GET /v1/producer/usage` | member | UI-8 (SB-6's pressure panel) |
+
+`member` is FR-104's producer member session (an owner or a developer) and `owner`
+is the same session with the owner role; both are FR-112's opaque bearer, not a
+producer API key (FR-201). Every `member` route also names the plane explicitly as
+`?env=test|live` (FR-103): the producer comes from the session claim and the
+environment from the query, and nothing in a body can move either. `POST /v1/events`
+stays key-only - it is the ingest path a producer's own infrastructure uses - while
+the portal publishes through `POST /v1/producer/events`, which is the same work
+through the same `servePublish` under a member credential, so the two cannot drift.
+
+The rest of the member surface in `internal/httpapi/routes.go` -
+`GET /v1/producer/members`, the invite list and revoke, the key routes, the
+subscription routes, `GET /v1/producer/deliveries/dedupe` and the single-consumer
+`GET /v1/producer/consumers/{consumerID}` - exists for non-portal callers; the
+portal above reads the list routes instead of caching an id, so what it renders can
+never disagree with the API's own answer.
+
 ---
 
 ## 15. Isolation, deployment, operations
@@ -1086,7 +1140,7 @@ The durability claims in §6 are only credible if each failure mode is exercised
 | M1 | Event types, endpoints, subscriptions, ingest + outbox + relay | AC-02, AC-03, AC-08, AC-09 |
 | M2 | Fan-out, delivery, leases, sweeper, attempt buffer | AC-04…AC-07, AC-21 |
 | M3 | Retry classification, DLQ, pause thresholds, throttles | AC-05, AC-14, AC-16, AC-17, AC-52, AC-53 |
-| M2a | Producer portal: onboarding, endpoints, deliveries, consumers (parallel) | AC-01 |
+| M2a | Producer portal: onboarding, endpoints, deliveries, consumers (parallel) - landed as S9a `t_c0144baa` | AC-01 |
 | M2b | Consumer portal: invitation, self-service endpoints and subscriptions, scoped log, replay (parallel) | AC-38, AC-39 |
 | M4 | Replay with bounds, inspect API, dedupe visibility | AC-12, AC-13 |
 | M5 | Partitioning, retention-by-disk, metrics, absence alarm | AC-10, AC-11, AC-18 |
