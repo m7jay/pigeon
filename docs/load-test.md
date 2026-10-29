@@ -104,24 +104,26 @@ go build -o /tmp/loadgen ./cmd/loadgen
 #    of that artifact. -db is what turns the reconciliation into a database count
 #    instead of the generator's own tally - omit it and the report says the
 #    reconciliation did not run rather than quietly grading the generator.
-#    -class NAME is added when the run is claiming a §8.1 machine class: it records
-#    the claim beside the machine block and refuses to start when the machine does
-#    not carry the class, when the run is not at 10 subscriptions per event, or when
-#    -db is absent (see "AC-30's third clause" below).
+#    This is the reference-box runbook: it claims no §8.1 class, because this box
+#    matches no row of §8.1's table. -class belongs to the graded run, which is in
+#    "AC-30's third clause" below.
 /tmp/loadgen run -base http://127.0.0.1:8080 -db "$PIGEON_DATABASE_URL" \
   -key "$PIGEON_LOADGEN_KEY" \
   -event-type load.created -consumer-ref load-consumer \
   -rate 250 -subs 10 -warmup 5m -measure 30m -evaluate 10m -settle 60s \
-  -concurrency 512 -class 2vCPU-4GB -label "2vCPU-4GB-1replica-defaults" -out run.json
+  -concurrency 512 -label "2vCPU-4GB-1replica-defaults" -out run.json
 
-# 4. AC-30: grade that artifact against the §8.1 row the run declared. The exit
-#    status is the verdict. This is one run of one instance against one row, in both
-#    units - not step 5.
-/tmp/loadgen grade -label run.json -out run-verdict.json
+# 4. The artifact's own verdicts. This run declares no class, so `grade` refuses
+#    AC-30's third clause by name (exit 1) rather than comparing a number against a
+#    row nobody claimed - which is the honest outcome for a reference-box run and
+#    not a failure of the harness. Its clauses 1-2 verdict is still decided, from
+#    the artifact's own phase numbers.
+/tmp/loadgen grade -label run.json
 
 # 5. AC-43: compare a run set across replica counts. Two reports minimum, in
 #    ascending replica order; the exit status is the verdict. This is the SCALING
-#    comparison and only that: AC-30's ceiling clause is step 4's.
+#    comparison and only that: AC-30's ceiling clause is the graded run in "AC-30's
+#    third clause", not this one.
 /tmp/loadgen compare -label run-1replica.json -label run-2replica.json -label run-4replica.json
 ```
 
@@ -143,6 +145,49 @@ from the artifact:
 /tmp/loadgen grade -label run.json -class 2vCPU-4GB   # assert the class intended
 ```
 
+#### The graded invocation
+
+The graded run is §12's protocol, on **a host that carries the class**, with the
+generator **off the machine under test**. It declares two things, and they are not the
+same machine: `-class` is the §8.1 row claimed, and `-sut-cpus`/`-sut-mem-gib` are the
+machine under test the row is claimed for. `-rate` must be **above** the row's events/s
+(1,200 against the 8 vCPU row's 1,000), or the run never went past the ceiling and
+`grade` refuses it as a run that cannot support the claim.
+
+```sh
+# (a) Two hosts: the generator on its own box, the instance on the rated one (§12's
+#     first arrangement). -base is the instance's non-loopback address, so the run is
+#     not on the machine under test and the class is recorded as *attested*: the
+#     operator states the machine under test, because the generator cannot see it.
+/tmp/loadgen run -base http://<sut-address>:8080 -db "$PIGEON_DATABASE_URL" \
+  -key "$PIGEON_LOADGEN_KEY" -event-type load.created -consumer-ref load-consumer \
+  -rate 1200 -subs 10 -warmup 5m -measure 30m -evaluate 10m -settle 60s \
+  -concurrency 512 -class 8vCPU-16GB -sut-cpus 8 -sut-mem-gib 16 \
+  -label "8vCPU-16GB-1replica" -out run.json
+
+# (b) One machine, the generator in its own container so it does not compete for the
+#     instance's cores (§12's second arrangement). -generator-on-sut no states that -
+#     auto would resolve the loopback -base to "shared" - and -sut-cpus/-sut-mem-gib
+#     are the instance's own allowance, which is also what -class is checked against.
+/tmp/loadgen run -base http://127.0.0.1:8080 -generator-on-sut no \
+  -db "$PIGEON_DATABASE_URL" -key "$PIGEON_LOADGEN_KEY" \
+  -event-type load.created -consumer-ref load-consumer \
+  -rate 600 -subs 10 -warmup 5m -measure 30m -evaluate 10m -settle 60s \
+  -concurrency 512 -class 4vCPU-8GB -sut-cpus 4 -sut-mem-gib 8 \
+  -label "4vCPU-8GB-1replica-container" -out run.json
+
+# Then, and only then, the verdict. Both shapes above are *attested*; see below for
+# what makes a class observed, and why an observed one is never graded.
+/tmp/loadgen grade -label run.json -out run-verdict.json
+```
+
+A generator that **shares** the machine under test - the default resolution when
+`-base` is loopback or this host and nothing overrides it - is *observed* evidence:
+`run` checks the class against the machine it can see **before** spending the 35
+minutes, but `grade` refuses the clause from that artifact, because §12 puts the
+generator off the machine under test and a run whose generator competed is a lower
+bound. That is the one arrangement this document's own published run was made in.
+
 The table is in `cmd/loadgen/class.go`, cited to `REQUIREMENTS.md` §8.1, and pinned
 against the requirement's own text row by row by `TestClassTableIsSection81`:
 
@@ -159,9 +204,20 @@ passes when **both** measured rates are within 20% of the declared row (inclusiv
 and the verdict prints the measured numbers, the row's, and the deviation of each.
 
 **A run must declare its class, and a mismatch is refused rather than explained.**
-`run -class NAME` records the claim beside the machine block, and `grade` grades it
-only when the machine carries it:
+`run -class NAME` records the claim, and `grade` grades it only when the machine the
+class is claimed for carries it:
 
+- The claim is checked against the **machine under test**, which is recorded in the
+  artifact as `machine_under_test` and is not the machine block. §12 puts the
+  generator off the machine under test and `cmd/loadgen` *is* the generator, so on
+  every gradeable run the machine block describes the **generator's** box: a class
+  checked against that would be checked against the wrong machine on exactly the runs
+  the clause is graded from. `machine_under_test` is the machine block when the
+  generator shared it, and `-sut-cpus`/`-sut-mem-gib` (the operator's statement about
+  a box the generator cannot see) when it did not. An artifact that records neither
+  **cannot support the claim** and is refused: a graded number on an unrated box is
+  the failure mode this clause exists to prevent, applied where the graded number is
+  actually produced.
 - The machine block's CPU and memory are **effective**, not the host's: the CPU count
   is the process's affinity intersected with its cgroup quota, and memory is
   `/proc/meminfo` capped by the cgroup limit, with the host's own figures recorded
@@ -171,22 +227,26 @@ only when the machine carries it:
 - Cores are exact and memory is a band (25%), because §8.1's rows differ by vCPU and
   by RAM and no machine reports its class's RAM exactly: a "16 GB" host that reports
   15 GiB is that row, and this repository's 2 vCPU / 7.8 GiB box is no row at all.
-- A class is **observed** (the generator ran on the machine under test, so the machine
-  block describes the machine being graded) or **attested** (the generator ran off it,
-  §12, so the block describes the generator and the machine check does not apply). The
-  evidence is derived from how the run was launched, never passed in: an artifact
-  cannot claim observation while recording that the generator ran elsewhere.
+  The same comparison decides whether a `-sut-cpus`/`-sut-mem-gib` declaration agrees
+  with the machine the harness can see, when the generator shared it.
+- A class is **observed** (the generator ran on the machine under test, so the class
+  was checked against the machine being graded, before the run) or **attested** (the
+  generator ran off it, §12, so the class rests on the declared machine under test).
+  The evidence is derived from how the run was launched, never passed in: an artifact
+  cannot claim observation while recording that the generator ran elsewhere. An
+  observed run is a lower bound and is not graded; the graded run is the attested one.
 - `grade` refuses to decide the clause at all when the run cannot support it, naming
-  which of these it is: no class declared; the machine does not carry the declared
-  class; a class §8.1 does not rate; not 10 subscriptions per event; §12's windows
-  (5 m warm-up excluded, 30 m measured, the last 10 m graded); an offered rate at or
-  below the row (the run never went past the ceiling, so the ceiling is not what it
-  measured); a graded window that was never reconciled against the database; or a
-  generator that shared the machine under test.
+  which of these it is: no class declared; no machine under test recorded; the machine
+  under test does not carry the declared class; a class §8.1 does not rate; not 10
+  subscriptions per event; §12's windows (5 m warm-up excluded, 30 m measured, the last
+  10 m graded); an offered rate at or below the row (the run never went past the
+  ceiling, so the ceiling is not what it measured); a graded window that was never
+  reconciled against the database; or a generator that shared the machine under test.
 - The clause reads `events`/`deliveries` **as the database counted them** over the
   graded window (§16); the generator's own tally over the same window is printed as a
   cross-check and is not graded, because the window's edges are the in-flight set at
-  both ends.
+  both ends. `graded_reconcile` carries the same note, so its `events_match` /
+  `outbox_match` false is legible as a deliberate choice rather than a mismatch.
 
 The verdict rule is §12's: pass, or a defect to fix (named, with its owning card), or
 an **amendment to §8.1** recorded as one in the gap list with the measurement attached.
@@ -196,22 +256,31 @@ when the measured ceiling is *above* the row by more than 20% the verdict says
 class's table is a finding about the table.
 
 **The graded run is the operator's, on a host that carries the class.** This box is
-2 vCPU / 7.8 GiB and matches no §8.1 row, and §12 wants the generator off the machine
-under test as well (Jay's standing rule: rated-class measurement happens on his
-machine, not on this instance). `t_94f397ba` was archived after it correctly blocked
-`capability`, and its comments carry the reproduction recipe. What lands here is the
-mechanism: the comparison, its refusals, and the deterministic tests behind them
-(`class_test.go`, 18 tests, names registered in `ci.yml`'s required-name guard). The
-harness was exercised end to end on this box against a real instance, database and
-Redis - a 100 s run at 40 offered events/s with 10 subscriptions per event, no class
-claimed - and the parts the clause reads all worked: the graded window counted 563
-events and 5,630 deliveries in 20 s (10.0 deliveries per event, the fan-out intact),
-the machine block reported "§8.1 row the machine itself matches: none", `grade` refused
-the artifact for declaring no class, and an artifact doctored to claim `2vCPU-4GB`
-was refused for the six named reasons (the machine's 7.8 GiB against the row's 4 GiB,
-a 20 s warm-up, a 60 s measurement, a 20 s graded window, 40 offered against 250,
-and the generator on the machine under test). **That is a statement about the harness,
-not about any machine class**, and no clause number is claimed from it.
+2 vCPU / 7.8 GiB and matches no §8.1 row, so a class cannot even be *observed* here -
+`run` refuses it before the run, which is the preflight working - and §12 wants the
+generator off the machine under test as well (Jay's standing rule: rated-class
+measurement happens on his machine, not on this instance). `t_94f397ba` was archived
+after it correctly blocked `capability`, and its comments carry the reproduction
+recipe. What lands here is the mechanism: the comparison, its refusals, the machine
+under test it checks the class against, and the deterministic tests behind them
+(`class_test.go`, 23 tests, all registered in `ci.yml`'s required-name guard).
+
+The harness was exercised end to end on this box against a real instance, database and
+Redis - a 60 s measurement at 40 offered events/s with 10 subscriptions per event, no
+class claimed, `-sut-cpus 2 -sut-mem-gib 4` recorded as the machine under test - and
+the parts the clause reads all worked: the graded window counted 436 events and 4,360
+deliveries in 20 s (10.0 deliveries per event, the fan-out intact), the machine block
+reported "§8.1 row the machine itself matches: none" beside `machine_under_test` 2 vCPU
+/ 4.0 GiB (`source: declared`), and `grade` refused the artifact for declaring no class
+rather than comparing it against a row nobody claimed. The same artifact doctored to
+claim `2vCPU-4GB` was refused for the six named reasons (an observed class whose two
+machine blocks disagree, 7.8 GiB against 4.0 GiB; a 20 s warm-up; a 60 s measurement; a
+20 s graded window; 40 offered against 250; and the generator on the machine under
+test), and all four preflight refusals were reproduced live with the built binary: a
+declared machine under test that does not carry the class, an attested class with no
+machine under test at all, a declaration that disagrees with the observed machine on a
+shared-generator run, and a class this box does not carry. **That is a statement about
+the harness, not about any machine class**, and no clause number is claimed from it.
 
 ### The rate limiter is a safety limit, not the ceiling
 
@@ -520,7 +589,9 @@ Reported here so the gap is a sentence rather than a discovery:
       its reciprocal rather than a batching figure. The bracket is fixed on card
       `t_0bf3effa` (the baseline is taken before the first publish), and on this box
       the same shape of run then reads **98.9 xact/s at 2.42 rows/transaction** - a
-      figure about that 100 s run at ~28 accepted events/s, not about the rated load,
+      figure about that 100 s run at 28.15 accepted events/s *in its graded 20 s
+      window* (21.8 events/s over the run's whole 100.42 s, 2,188 accepted), not about
+      the rated load,
       and one that sits on the wrong side of a coin toss against this leg's 100/s.
       **Owner: the operator on a rated host**, with the rest of AC-16. No leg of
       AC-16 is claimed by this run.
