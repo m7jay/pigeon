@@ -203,25 +203,46 @@ jobs:
           # and the single-event escape hatch for a fan-out wider than the bound
           # (TestRelayOversizedEventTakesItsOwnTransaction).
           # AC-30's third clause (card `t_0bf3effa`) registered its names with the
-          # change that implemented it, in `cmd/loadgen`. The clause is "the ceiling
-          # matches the §8.1 table within 20%", so its legs are: the table in the
-          # harness is §8.1's (TestClassTableIsSection81 - row by row, both columns),
-          # a machine is one class and not another (TestClassMatchIsCoresExactAndMemoryABand),
-          # the harness refuses a class the machine does not carry, before the run
+          # change that implemented it, in `cmd/loadgen`, and registers all of them:
+          # the clause is "the ceiling matches the §8.1 table within 20%", so its legs
+          # are: the table in the harness is §8.1's (TestClassTableIsSection81 - row by
+          # row, both columns, and §8.1's spellings are accepted,
+          # TestClassNamesAcceptSection81Spellings), a machine is one class and not
+          # another (TestClassMatchIsCoresExactAndMemoryABand) and the row a machine
+          # itself carries is recorded (TestObservedClassNamesTheRowTheMachineCarries),
+          # the class is checked against the *machine under test* - not the generator's
+          # machine block, which is what the block holds on every gradeable run: the
+          # machine under test is declared with -sut-cpus/-sut-mem-gib when the
+          # generator runs off it (§12) and resolved from the observed machine when it
+          # shares it (TestDeclaredSUTNeedsBothFiguresAndIsRecorded,
+          # TestSUTDeclarationMustAgreeWithTheObservedMachine,
+          # TestClassPreflightRequiresTheMachineUnderTestWhenTheGeneratorIsOffIt), the
+          # harness refuses a class that machine does not carry before the run
           # (TestClassPreflightRefusesAMachineThatDoesNotCarryTheClass) and at the
-          # verdict (TestGradeFailsWhenTheMachineDoesNotCarryTheClass), it compares
-          # both units of the graded window against the declared row and against the
+          # verdict (TestGradeFailsWhenTheMachineDoesNotCarryTheClass), with the rest
+          # of the preconditions refused by name as well
+          # (TestClassPreflightRequiresSection81BasisAndTheDatabase), it compares both
+          # units of the graded window against the declared row and against the
           # requirement's numbers rather than the artifact's own copy
           # (TestGradeComparesBothUnitsOfTheGradedWindow,
           # TestGradeReadsTheTargetFromTheTableNotTheArtifact), it refuses a run that
-          # cannot support the claim in five named ways
-          # (TestGradeRefusesRunsThatCannotSupportTheClaim) including a generator that
-          # shared the machine under test (TestGradeRefusesASharedGeneratorMachine),
-          # it re-decides clauses 1-2 from the artifact instead of believing the
-          # verdicts the artifact carries
-          # (TestGradeRecomputesClausesOneAndTwoFromTheArtifact), its exit status is
-          # the verdict (TestGradeExitStatusIsTheVerdict), and §12's windows are the
-          # protocol's (TestPhaseWindowsFollowSection12).
+          # cannot support the claim in nine named ways
+          # (TestGradeRefusesRunsThatCannotSupportTheClaim) - including an attested
+          # class with no machine under test recorded
+          # (TestGradeRefusesAnAttestedClassWithNoMachineUnderTest), a doctored or
+          # missing class evidence (TestGradeChecksTheMachineWhenTheArtifactRecordsNoClassEvidence,
+          # TestGradeRefusesAnObservedClassOnAnUnratedMachine) and a generator that
+          # shared the machine under test (TestGradeRefusesASharedGeneratorMachine) -
+          # how the generator's host resolves, auto or by flag, is derived
+          # (TestGeneratorOnSUTResolvesFromBaseAndFlag), the generator's own tally is
+          # reported as a cross-check and not graded
+          # (TestGradeReportsTheGeneratorTallyWithoutGradingIt), it re-decides clauses
+          # 1-2 from the artifact instead of believing the verdicts the artifact
+          # carries (TestGradeRecomputesClausesOneAndTwoFromTheArtifact), its exit
+          # status is the verdict (TestGradeExitStatusIsTheVerdict), §12's windows are
+          # the protocol's (TestPhaseWindowsFollowSection12), and `run` records the
+          # claim and the machine under test in the artifact
+          # (TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase).
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -365,16 +386,28 @@ jobs:
             TestMetaEgressIPsReportsTheInstancesAddresses \
             TestEgressIPsAreListedAndValidated \
             TestClassTableIsSection81 \
+            TestClassNamesAcceptSection81Spellings \
             TestClassMatchIsCoresExactAndMemoryABand \
+            TestObservedClassNamesTheRowTheMachineCarries \
             TestClassPreflightRefusesAMachineThatDoesNotCarryTheClass \
+            TestClassPreflightRequiresSection81BasisAndTheDatabase \
+            TestClassPreflightRequiresTheMachineUnderTestWhenTheGeneratorIsOffIt \
+            TestSUTDeclarationMustAgreeWithTheObservedMachine \
+            TestDeclaredSUTNeedsBothFiguresAndIsRecorded \
+            TestGeneratorOnSUTResolvesFromBaseAndFlag \
             TestPhaseWindowsFollowSection12 \
             TestGradeComparesBothUnitsOfTheGradedWindow \
             TestGradeReadsTheTargetFromTheTableNotTheArtifact \
             TestGradeFailsWhenTheMachineDoesNotCarryTheClass \
+            TestGradeChecksTheMachineWhenTheArtifactRecordsNoClassEvidence \
+            TestGradeRefusesAnAttestedClassWithNoMachineUnderTest \
+            TestGradeRefusesAnObservedClassOnAnUnratedMachine \
             TestGradeRefusesASharedGeneratorMachine \
             TestGradeRefusesRunsThatCannotSupportTheClaim \
+            TestGradeReportsTheGeneratorTallyWithoutGradingIt \
             TestGradeRecomputesClausesOneAndTwoFromTheArtifact \
-            TestGradeExitStatusIsTheVerdict
+            TestGradeExitStatusIsTheVerdict \
+            TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
