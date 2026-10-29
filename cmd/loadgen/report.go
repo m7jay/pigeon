@@ -7,11 +7,35 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// xactCommits reads pg_stat_database.xact_commit for the database this process is
+// connected to - the counter whose delta over a run is §12's independent evidence of
+// FR-815's batching. The harness needs its value before the run starts, which is
+// before the reconciliation pool exists, so it opens (and closes) its own.
+func xactCommits(ctx context.Context, dsn string) (int64, error) {
+	if dsn == "" {
+		return 0, fmt.Errorf("no -db given")
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return 0, err
+	}
+	defer pool.Close()
+	var n int64
+	if err := pool.QueryRow(ctx,
+		`select coalesce(sum(xact_commit),0) from pg_stat_database where datname = current_database()`).
+		Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
 
 // reconcileDB answers §16's requirement that the accepted count is checked against
 // the database rather than believed from the generator's own counter.
@@ -27,59 +51,104 @@ import (
 // only independent evidence of FR-815's batching: the ratio of rows to transactions
 // says whether the relay is draining in batches or one row at a time, which is what
 // makes the §8.1 write model hold.
-func reconcileDB(ctx context.Context, c config, accepted int64, from, to time.Time) reconcile {
-	out := reconcile{Accepted: accepted}
+// Both windows are counted from one pool, with the commit counter read once at the
+// end of the pair (§16): the second window is the graded one, and AC-30's third
+// clause compares its units against §8.1's row.
+//
+// xactBase is the counter's value *before the first publish* and haveXactBase says
+// whether the caller could take it. It has to bracket the run: a delta sampled only
+// around these two count queries, which run after the load has stopped, measures the
+// milliseconds between two reads and the instance's background sweeper instead of the
+// run's commits. That defect was found on card `t_0bf3effa` - a run reporting 0.0
+// xact/s at 0.00 rows/transaction while the database's counter had advanced by
+// thousands - and is why the figures are now either real or reported as unmeasured.
+func reconcileDB(ctx context.Context, c config, run, graded window, xactBase int64, haveXactBase bool) (reconcile, reconcile) {
+	runOut := reconcile{Accepted: run.Accepted}
+	gradedOut := reconcile{Accepted: graded.Accepted}
 	if c.DB == "" {
-		out.Note = "no -db given; the accepted count was not reconciled against the database"
-		return out
+		runOut.Note = "no -db given; the accepted count was not reconciled against the database"
+		gradedOut.Note = runOut.Note
+		return runOut, gradedOut
 	}
 	pool, err := pgxpool.New(ctx, c.DB)
 	if err != nil {
-		out.Note = "database unavailable: " + redactErr(err)
-		return out
+		runOut.Note = "database unavailable: " + redactErr(err)
+		gradedOut.Note = runOut.Note
+		return runOut, gradedOut
 	}
 	defer pool.Close()
-
-	// Sample the commit counter first, then count, so the counter brackets the
-	// rows: a run whose counter advanced but whose rows are missing is the
-	// rollback case, and it must not be hidden behind a snapshot taken later.
-	var xactBefore int64
-	if err := pool.QueryRow(ctx,
-		`select coalesce(sum(xact_commit),0) from pg_stat_database where datname = current_database()`).
-		Scan(&xactBefore); err != nil {
-		out.Note = "pg_stat_database unreadable: " + redactErr(err)
-	}
 
 	q := `select
 	        (select count(*) from events      where created_at >= $1 and created_at < $2),
 	        (select count(*) from outbox      where created_at >= $1 and created_at < $2),
 	        (select count(*) from deliveries  where created_at >= $1 and created_at < $2)`
-	if err := pool.QueryRow(ctx, q, from, to).Scan(&out.Events, &out.Outbox, &out.Deliveries); err != nil {
-		out.Note = "reconciliation query failed: " + redactErr(err)
-		return out
+	if err := pool.QueryRow(ctx, q, run.From, run.To).Scan(&runOut.Events, &runOut.Outbox, &runOut.Deliveries); err != nil {
+		runOut.Note = "reconciliation query failed: " + redactErr(err)
+		return runOut, gradedOut
 	}
-	var xactAfter int64
-	if err := pool.QueryRow(ctx,
-		`select coalesce(sum(xact_commit),0) from pg_stat_database where datname = current_database()`).
-		Scan(&xactAfter); err != nil {
-		out.Note = "pg_stat_database unreadable: " + redactErr(err)
+	if err := pool.QueryRow(ctx, q, graded.From, graded.To).Scan(&gradedOut.Events, &gradedOut.Outbox, &gradedOut.Deliveries); err != nil {
+		gradedOut.Note = "graded-window reconciliation query failed: " + redactErr(err)
+		return runOut, gradedOut
+	}
+	// The commit counter's baseline was taken before the run's first publish; read it
+	// again now, after both count queries, so the bracket covers the run and the rows
+	// it is being compared with. A counter that advanced while the rows are missing is
+	// the rollback case, and it must not be hidden behind a snapshot taken earlier.
+	var xactDelta int64
+	if haveXactBase {
+		var xactAfter int64
+		if err := pool.QueryRow(ctx,
+			`select coalesce(sum(xact_commit),0) from pg_stat_database where datname = current_database()`).
+			Scan(&xactAfter); err != nil {
+			runOut.Note = "pg_stat_database unreadable: " + redactErr(err)
+			gradedOut.Note = runOut.Note
+			haveXactBase = false
+		} else {
+			xactDelta = xactAfter - xactBase
+		}
+	}
+	if !haveXactBase {
+		// Say it rather than guess: an unpinned baseline would make the ratio a
+		// measurement of whatever else committed while the harness was counting.
+		runOut.Note = "FR-815's rows/transaction was not measured: the commit counter was not bracketed across the run"
+		gradedOut.Note = runOut.Note
 	}
 
-	out.Ran = true
-	sec := to.Sub(from).Seconds()
-	if sec > 0 {
-		out.DeliveriesPS = float64(out.Deliveries) / sec
-		out.XactPS = float64(xactAfter-xactBefore) / sec
-	}
-	if out.XactPS > 0 {
-		out.RowsPerXact = (float64(out.Deliveries) + float64(out.Events)) / (out.XactPS * sec)
-	}
+	fillRate(&runOut, run, xactDelta)
+	// The graded window is a slice of the same run, so a commit rate over it would be
+	// a statement about the whole run's sampling interval, not about the window: it
+	// is left zero and FR-815's batching is read from the run window's figures.
+	fillRate(&gradedOut, graded, 0)
+	gradedOut.XactPS, gradedOut.RowsPerXact = 0, 0
 	// The generator's count is the number of 202s it saw. Equality is exact, not
 	// approximate: a tolerance here would hide precisely the defect the check
 	// exists to catch. It is compared per-table so the failing half is named.
-	out.EventsMatch = out.Events == accepted
-	out.OutboxMatch = out.Outbox == accepted
-	return out
+	//
+	// The graded window is deliberately not equated: its edges are the in-flight set
+	// at both ends - an event dispatched just before it opens commits inside it, one
+	// dispatched just before it closes commits after - so its tally is carried as a
+	// cross-check while AC-30's third clause grades the database's own count.
+	runOut.EventsMatch = runOut.Events == run.Accepted
+	runOut.OutboxMatch = runOut.Outbox == run.Accepted
+	return runOut, gradedOut
+}
+
+// fillRate turns a window's counts into per-second figures. The length comes from
+// the window rather than from the span of whatever rows landed in it: a rate
+// computed from observed samples silently improves whenever the collector is
+// starved, which is exactly when the system is in trouble.
+func fillRate(out *reconcile, w window, xactDelta int64) {
+	out.Ran = true
+	out.Accepted = w.Accepted
+	out.WindowS = w.To.Sub(w.From).Seconds()
+	if out.WindowS > 0 {
+		out.DeliveriesPS = float64(out.Deliveries) / out.WindowS
+		out.EventsPS = float64(out.Events) / out.WindowS
+		out.XactPS = float64(xactDelta) / out.WindowS
+	}
+	if out.XactPS > 0 {
+		out.RowsPerXact = (float64(out.Deliveries) + float64(out.Events)) / (out.XactPS * out.WindowS)
+	}
 }
 
 func redactErr(err error) string {
@@ -99,10 +168,12 @@ func emptyIf(empty bool, note string) string {
 
 // judge turns a run into the card's acceptance criteria.
 //
-// Only the criteria a single run can decide are decided here. AC-31's "the ceiling
-// matches the §8.1 table within 20%" and AC-43's scaling are comparisons across
-// runs, so they are `compare`'s job - inventing them from one run would be a claim
-// the data does not support.
+// Only the criteria a single run can decide are decided here. AC-43's scaling is a
+// comparison across runs, so it is `compare`'s job; AC-30's third clause - the
+// ceiling against §8.1's row - is a comparison against the requirement's table and
+// its own protocol preconditions, so it is `grade`'s job (class.go). AC-30's first
+// two clauses are decided here, from the run's own numbers, and `grade` re-decides
+// them from the artifact rather than reading this verdict back.
 func judge(r *report, c config) []verdict {
 	var out []verdict
 
@@ -220,6 +291,12 @@ func printReport(r *report) {
 			r.Reconcile.Accepted, r.Reconcile.Events, r.Reconcile.Outbox, r.Reconcile.Deliveries)
 		fmt.Printf("delivery unit: %.1f deliveries/s | %.1f xact/s | %.2f rows/transaction\n",
 			r.Reconcile.DeliveriesPS, r.Reconcile.XactPS, r.Reconcile.RowsPerXact)
+		if r.Graded.WindowS > 0 {
+			// The graded window AC-30's third clause compares, from the database
+			// rather than from the generator's tally (§16).
+			fmt.Printf("graded window (last %s of the measurement, %.0f s): %.1f events/s and %.1f deliveries/s in the database; the generator's tally was %d accepted\n",
+				r.Evaluated.Name, r.Graded.WindowS, r.Graded.EventsPS, r.Graded.DeliveriesPS, r.Graded.Accepted)
+		}
 	} else if r.Reconcile.Note != "" {
 		fmt.Println("reconciliation:", r.Reconcile.Note)
 	}
@@ -232,8 +309,12 @@ func printReport(r *report) {
 		fmt.Printf("%s %-22s %s\n", status, v.AC, v.Detail)
 	}
 	if r.Label != "" || r.Machine.CPUs > 0 {
-		fmt.Printf("\nmeasured on %s: %d vCPU, %d MiB, %s, %s\n",
-			r.Machine.Hostname, r.Machine.CPUs, r.Machine.MemMiB, r.Machine.Kernel, r.Machine.DB)
+		fmt.Printf("\nmeasured on %s: %s, %s\n", r.Machine.describe(), r.Machine.Kernel, r.Machine.DB)
+		if r.Machine.ObservedClass != "" {
+			fmt.Printf("§8.1 row the machine itself matches: %s\n", r.Machine.ObservedClass)
+		} else {
+			fmt.Printf("§8.1 row the machine itself matches: none (its class must be attested, not observed)\n")
+		}
 	}
 }
 
@@ -358,22 +439,51 @@ func (m *multiFlag) Set(v string) error {
 // Machine description
 // ---------------------------------------------------------------------------
 
+// describeMachine records the machine the harness runs on: what §16's machine block
+// asks for, and what AC-30's third clause checks a declared class against.
+//
+// The CPU and memory figures are *effective*: CPU affinity (what the process may
+// actually run on) capped by any cgroup quota, and /proc/meminfo capped by any
+// cgroup limit. A container given two cores and 4 GiB of a 32-core, 128 GiB host is
+// a 2 vCPU / 4 GiB machine, and reading only the host's totals would let it claim a
+// class it does not carry - which is the failure mode the class gate exists to
+// prevent. Both inputs are recorded, so the arithmetic is auditable.
 func describeMachine() machine {
-	m := machine{CPUs: runtime.NumCPU(), Go: runtime.Version()}
+	m := machine{Go: runtime.Version()}
 	m.Hostname, _ = os.Hostname()
+	m.CPUAffinity = runtime.NumCPU()
+	m.CPUs = m.CPUAffinity
+	if quota, cores := cgroupCPUQuota(); quota != "" {
+		m.CPUQuota = quota
+		if cores > 0 && cores < m.CPUs {
+			m.CPUs = cores
+		}
+	}
 	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
 		for _, line := range strings.Split(string(b), "\n") {
 			if strings.HasPrefix(line, "MemTotal:") {
 				var kib int64
 				_, _ = fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(line, "MemTotal:")), "%d", &kib)
-				m.MemMiB = kib / 1024
+				m.MemHostMiB = kib / 1024
 				break
 			}
+		}
+	}
+	m.MemMiB = m.MemHostMiB
+	if cg := cgroupMemoryMiB(); cg > 0 {
+		m.MemCgroupMiB = cg
+		if m.MemMiB == 0 || cg < m.MemMiB {
+			m.MemMiB = cg
 		}
 	}
 	if b, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
 		m.Kernel = "linux " + strings.TrimSpace(string(b))
 	}
+	if dir, err := os.Getwd(); err == nil {
+		m.DiskGiB, m.DiskFreeGiB = diskUsage(dir)
+	}
+	m.Revision = buildRevision()
+	m.ObservedClass = observedClass(m)
 	// The database version is read here rather than in reconcileDB so it is
 	// recorded even when the reconciliation is skipped for a DSN-less run.
 	if dsn := os.Getenv("PIGEON_LOADGEN_DB"); dsn != "" {
@@ -386,6 +496,108 @@ func describeMachine() machine {
 		}
 	}
 	return m
+}
+
+// cgroupCPUQuota reads the CPU quota the process is held to, whichever cgroup
+// layout is in use, and returns it with the whole cores it amounts to. An empty
+// string means no quota was found, which is not the same as "no limit": a nested
+// cgroup path the process cannot see reads the same way, which is why the raw value
+// is recorded next to the count it produced.
+func cgroupCPUQuota() (string, int) {
+	// cgroup v2: "max 100000" (no limit) or "400000 100000" (4 cores).
+	if b, err := os.ReadFile("/sys/fs/cgroup/cpu.max"); err == nil {
+		f := strings.Fields(strings.TrimSpace(string(b)))
+		if len(f) == 2 {
+			if f[0] == "max" {
+				return strings.TrimSpace(string(b)), 0
+			}
+			q, err1 := strconv.ParseInt(f[0], 10, 64)
+			p, err2 := strconv.ParseInt(f[1], 10, 64)
+			if err1 == nil && err2 == nil {
+				return strings.TrimSpace(string(b)), quotaCores(q, p)
+			}
+		}
+	}
+	// cgroup v1: two files, -1 meaning no limit.
+	qb, err1 := os.ReadFile("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+	pb, err2 := os.ReadFile("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+	if err1 != nil || err2 != nil {
+		return "", 0
+	}
+	q, err1 := strconv.ParseInt(strings.TrimSpace(string(qb)), 10, 64)
+	p, err2 := strconv.ParseInt(strings.TrimSpace(string(pb)), 10, 64)
+	if err1 != nil || err2 != nil {
+		return "", 0
+	}
+	return fmt.Sprintf("%d %d", q, p), quotaCores(q, p)
+}
+
+// quotaCores is a quota in whole cores, floored: a quota below one core is reported
+// as one rather than as zero, and either way it matches no §8.1 row, which is the
+// direction to fail in.
+func quotaCores(quota, period int64) int {
+	if quota <= 0 || period <= 0 {
+		return 0
+	}
+	if cores := int(quota / period); cores >= 1 {
+		return cores
+	}
+	return 1
+}
+
+// cgroupMemoryMiB is the memory limit the process is held to, or 0 when there is
+// none to read ("max" in cgroup v2, a huge sentinel in v1).
+func cgroupMemoryMiB() int64 {
+	read := func(path string) (int64, bool) {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return 0, false
+		}
+		v := strings.TrimSpace(string(b))
+		if v == "max" {
+			return 0, false
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, false
+		}
+		return n >> 20, true // bytes -> MiB
+	}
+	if mib, ok := read("/sys/fs/cgroup/memory.max"); ok {
+		return mib
+	}
+	if mib, ok := read("/sys/fs/cgroup/memory/memory.limit_in_bytes"); ok {
+		return mib
+	}
+	return 0
+}
+
+// buildRevision reads the VCS revision out of the binary's own build info rather
+// than accepting a flag: the artifact should say which tree produced it even when
+// nobody remembered to pass one.
+func buildRevision() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	var rev, modified string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				modified = "-dirty"
+			}
+		}
+	}
+	if rev == "" {
+		return ""
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	return rev + modified
 }
 
 func orUnset(s string) string {
