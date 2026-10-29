@@ -18,9 +18,12 @@ The claim this document publishes is the measured result, not the design target:
 > instance never shed and never reached a ceiling; and the relay still fans out one
 > row per iteration, so deliveries stop before they reach the dispatch loop. FR-818
 > has since landed on the base as slice **S12** (`t_c6afa452`, `SPEC.md` A-11), and
-> the graded re-run that exercises it, including the §8.1 `-class` comparison, is
-> **`t_0bf3effa`**; the figures in this document are the pre-FR-818 baseline that
-> run is measured against. What the run does *not* show is that this machine class
+> the graded re-run that exercises it is **`t_0bf3effa`** - which also adds the §8.1
+> `-class` comparison this harness did not have (`loadgen grade`, see "AC-30's third
+> clause" below); the figures in this document are the pre-FR-818 baseline that run is
+> measured against. That graded run is the **operator's, on a host that carries the
+> class**, not this box's: see "What this run does not prove". What the run does
+> *not* show is that this machine class
 > cannot do better - it shows that two required paths were missing, and a ceiling
 > cannot be measured on a tree that has none.
 
@@ -76,6 +79,13 @@ answered.
 6. **`-settle` (default 60 s)** exists because fan-out is asynchronous: without it
    the delivery count describes the relay's drain speed at the moment the generator
    stopped, not the instance's fan-out.
+7. **`pg_stat_database.xact_commit` is sampled across the run, not around the
+   reconciliation query** (FR-815's batching, §16). The baseline is taken before the
+   first publish, because a delta between two reads taken *after* the load stopped
+   measures the interval between the reads and the instance's background sweeper.
+   That was the harness's defect until card `t_0bf3effa`, and it is why an artifact
+   from before it reports `0.0 xact/s` at `0.00 rows/transaction`; see "What this run
+   does not prove".
 
 Run it:
 
@@ -94,23 +104,114 @@ go build -o /tmp/loadgen ./cmd/loadgen
 #    of that artifact. -db is what turns the reconciliation into a database count
 #    instead of the generator's own tally - omit it and the report says the
 #    reconciliation did not run rather than quietly grading the generator.
+#    -class NAME is added when the run is claiming a §8.1 machine class: it records
+#    the claim beside the machine block and refuses to start when the machine does
+#    not carry the class, when the run is not at 10 subscriptions per event, or when
+#    -db is absent (see "AC-30's third clause" below).
 /tmp/loadgen run -base http://127.0.0.1:8080 -db "$PIGEON_DATABASE_URL" \
   -key "$PIGEON_LOADGEN_KEY" \
   -event-type load.created -consumer-ref load-consumer \
   -rate 250 -subs 10 -warmup 5m -measure 30m -evaluate 10m -settle 60s \
-  -concurrency 512 -label "2vCPU-4GB-1replica-defaults" -out run.json
+  -concurrency 512 -class 2vCPU-4GB -label "2vCPU-4GB-1replica-defaults" -out run.json
 
-# 4. AC-43: compare a run set across replica counts. Two reports minimum, in
-#    ascending replica order; the exit status is the verdict. Note what this
-#    command does and does not decide: it is the SCALING comparison. AC-30's
-#    "the ceiling matches §8.1 within 20%" has no implementation in this harness,
-#    so it is not decided here - see "What this run does not prove".
+# 4. AC-30: grade that artifact against the §8.1 row the run declared. The exit
+#    status is the verdict. This is one run of one instance against one row, in both
+#    units - not step 5.
+/tmp/loadgen grade -label run.json -out run-verdict.json
+
+# 5. AC-43: compare a run set across replica counts. Two reports minimum, in
+#    ascending replica order; the exit status is the verdict. This is the SCALING
+#    comparison and only that: AC-30's ceiling clause is step 4's.
 /tmp/loadgen compare -label run-1replica.json -label run-2replica.json -label run-4replica.json
 ```
 
 The seeded endpoints are written with `internal = true`, FR-402's operator escape
 hatch, so a loopback sink is reachable. Using the flag is honest; weakening the
 SSRF check for the sake of a test would not be.
+
+### AC-30's third clause
+
+The class comparison. AC-30's third clause is "the ceiling matches the §8.1 table
+within 20%". It compares **one run of one instance against one row of §8.1's table**,
+in both units, and it is not AC-43: `compare` stays the replica-scaling comparison,
+because folding scaling into this would lose the clause's own failure mode - a graded
+number taken on a machine that does not carry the class. `grade` decides the clause
+from the artifact:
+
+```sh
+/tmp/loadgen grade -label run.json                    # the exit status is the verdict
+/tmp/loadgen grade -label run.json -class 2vCPU-4GB   # assert the class intended
+```
+
+The table is in `cmd/loadgen/class.go`, cited to `REQUIREMENTS.md` §8.1, and pinned
+against the requirement's own text row by row by `TestClassTableIsSection81`:
+
+| class | delivery ceiling (deliveries/s) | events/s at 10 subscriptions |
+|---|---|---|
+| 2 vCPU / 2 GB | ~1,200 | ~120 |
+| 2 vCPU / 4 GB | ~2,500 | ~250 |
+| 4 vCPU / 8 GB | ~5,000 | ~500 |
+| 8 vCPU / 16 GB | ~10,000 | ~1,000 |
+
+Both units are checked, because §8.1 states the same workload twice: the delivery
+ceiling is the event column times the subscription count the heading names. A run
+passes when **both** measured rates are within 20% of the declared row (inclusive),
+and the verdict prints the measured numbers, the row's, and the deviation of each.
+
+**A run must declare its class, and a mismatch is refused rather than explained.**
+`run -class NAME` records the claim beside the machine block, and `grade` grades it
+only when the machine carries it:
+
+- The machine block's CPU and memory are **effective**, not the host's: the CPU count
+  is the process's affinity intersected with its cgroup quota, and memory is
+  `/proc/meminfo` capped by the cgroup limit, with the host's own figures recorded
+  beside them. A container holding two cores of a 32-core host is a 2 vCPU machine,
+  and a claim of 8 vCPU is refused **before** the 35-minute run rather than measured
+  and explained afterwards.
+- Cores are exact and memory is a band (25%), because §8.1's rows differ by vCPU and
+  by RAM and no machine reports its class's RAM exactly: a "16 GB" host that reports
+  15 GiB is that row, and this repository's 2 vCPU / 7.8 GiB box is no row at all.
+- A class is **observed** (the generator ran on the machine under test, so the machine
+  block describes the machine being graded) or **attested** (the generator ran off it,
+  §12, so the block describes the generator and the machine check does not apply). The
+  evidence is derived from how the run was launched, never passed in: an artifact
+  cannot claim observation while recording that the generator ran elsewhere.
+- `grade` refuses to decide the clause at all when the run cannot support it, naming
+  which of these it is: no class declared; the machine does not carry the declared
+  class; a class §8.1 does not rate; not 10 subscriptions per event; §12's windows
+  (5 m warm-up excluded, 30 m measured, the last 10 m graded); an offered rate at or
+  below the row (the run never went past the ceiling, so the ceiling is not what it
+  measured); a graded window that was never reconciled against the database; or a
+  generator that shared the machine under test.
+- The clause reads `events`/`deliveries` **as the database counted them** over the
+  graded window (§16); the generator's own tally over the same window is printed as a
+  cross-check and is not graded, because the window's edges are the in-flight set at
+  both ends.
+
+The verdict rule is §12's: pass, or a defect to fix (named, with its owning card), or
+an **amendment to §8.1** recorded as one in the gap list with the measurement attached.
+A tolerance is not an outcome, and the harness is not tuned to fit either direction:
+when the measured ceiling is *above* the row by more than 20% the verdict says
+"amendment to §8.1" rather than "within tolerance", because a host that beats its
+class's table is a finding about the table.
+
+**The graded run is the operator's, on a host that carries the class.** This box is
+2 vCPU / 7.8 GiB and matches no §8.1 row, and §12 wants the generator off the machine
+under test as well (Jay's standing rule: rated-class measurement happens on his
+machine, not on this instance). `t_94f397ba` was archived after it correctly blocked
+`capability`, and its comments carry the reproduction recipe. What lands here is the
+mechanism: the comparison, its refusals, and the deterministic tests behind them
+(`class_test.go`, 18 tests, names registered in `ci.yml`'s required-name guard). The
+harness was exercised end to end on this box against a real instance, database and
+Redis - a 100 s run at 40 offered events/s with 10 subscriptions per event, no class
+claimed - and the parts the clause reads all worked: the graded window counted 563
+events and 5,630 deliveries in 20 s (10.0 deliveries per event, the fan-out intact),
+the machine block reported "§8.1 row the machine itself matches: none", `grade` refused
+the artifact for declaring no class, and an artifact doctored to claim `2vCPU-4GB`
+was refused for the six named reasons (the machine's 7.8 GiB against the row's 4 GiB,
+a 20 s warm-up, a 60 s measurement, a 20 s graded window, 40 offered against 250,
+and the generator on the machine under test). **That is a statement about the harness,
+not about any machine class**, and no clause number is claimed from it.
 
 ### The rate limiter is a safety limit, not the ceiling
 
@@ -262,7 +363,7 @@ report was later annotated against, each by its own card.
    **8 write-budget transactions (12,000 rows) instead of none**. Both figures are
    *lower bounds on the shape*, not graded claims - §16 wants the generator off the
    machine under test and this box cannot provide that, so the rated-class numbers
-   remain the operator's run (see "Where the scale claim is measured"). What the fix
+   remain the operator's run (see "What this run does not prove"). What the fix
    settles is the mechanism: the fan-out leg is no longer bounded by one round-trip
    chain per event, and at 10 subscriptions it now carries the delivery unit §8.1
    states for it with room to spare on a box far weaker than the reference.
@@ -287,10 +388,11 @@ The pool measurement above is the same fact from the other side: at the shipped
 
 So AC-30 could not pass on the measured tree at any rate, and it was not this
 slice's to fix: FR-818 was a P0 with no owning slice. It is now slice **S12**
-(`t_c6afa452`, `SPEC.md` A-11), landed on the base after this run, and the graded
-run that exercises the mechanism is **`t_0bf3effa`**. This card keeps the report and
-the harness; the numbers above are the pre-FR-818 baseline the graded run is
-measured against.
+(`t_c6afa452`, `SPEC.md` A-11), landed on the base after this run, and the graded run
+that exercises the mechanism is the **operator's on a rated host** - card `t_0bf3effa`
+already landed the harness side of it (the §8.1 `-class` comparison and `grade`). This
+card keeps the report and the harness; the numbers above are the pre-FR-818 baseline
+the graded run is measured against.
 
 ## What this run does not prove
 
@@ -321,13 +423,15 @@ Reported here so the gap is a sentence rather than a discovery:
   broken, and is expected to fail** - see "Why the delivery number is 3.3% of the
   claim". Publishing both numbers with the cause between them is the honest form;
   the fix is S11's and this card does not tune the numbers to hide it.
-- **AC-30's "the ceiling matches the §8.1 table within 20%" is not implemented by
-  this harness and is therefore not decided by any run in this repository.** There
-  is no `-class` comparison, no §8.1 table in `cmd/loadgen`, and `compare` is the
-  AC-43 scaling comparison only. That leg needs the instance to reach its ceiling -
-  which the measured tree could not, because it had no FR-818 - and it is carded as
-  **`t_0bf3effa`** (the `-class` comparison and the graded run on a rated host).
-  Recorded as a gap here, not claimed.
+- **AC-30's "the ceiling matches the §8.1 table within 20%" is now implemented, and is
+  still not measured here.** The harness has the comparison (`loadgen grade` against
+  the §8.1 table in `cmd/loadgen/class.go`, with `run -class` recording the claim and
+  the machine block - see "AC-30's third clause"), so the clause is gradeable at all:
+  it was not, before card `t_0bf3effa`, and no run in this repository decided it. What
+  is still missing is the **run**: it needs an instance that reaches its ceiling, which
+  needs a host that carries a §8.1 class (this box matches no row - 2 vCPU / 7.8 GiB)
+  and §12's generator-off-the-machine-under-test. That is the **operator's, on a rated
+  host**; the harness side lands here, and no clause number is claimed from it.
 - **AC-34 is measured at the criterion's own figure, and the earlier reading of it
   was wrong.** `TestAttemptFanOutIsBounded` (`internal/delivery`) has three legs, and
   the third drives AC-34's literal **2,500 due deliveries offered at once** to one
@@ -407,8 +511,19 @@ Reported here so the gap is a sentence rather than a discovery:
       `TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas` (an endpoint capped at
       10 never observes more than 10 in flight, identically at 1 and 2 replicas),
       and AC-34's census below (never above the cap with 2,500 deliveries offered).
-    - *commit rate stays under 100/s* - **measured** in this run: 0.17 xact/s at
-      1,638.74 rows per transaction.
+    - *commit rate stays under 100/s* - **recorded here as measured, and the figure
+      is not a measurement of the run.** The harness bracketed
+      `pg_stat_database.xact_commit` around its *reconciliation queries*, which run
+      after the load has stopped, so the delta was the instance's own background
+      commits between two reads milliseconds apart: "0.17 xact/s at 1,638.74 rows per
+      transaction" is that too-small delta read as a rate, and the ratio beside it is
+      its reciprocal rather than a batching figure. The bracket is fixed on card
+      `t_0bf3effa` (the baseline is taken before the first publish), and on this box
+      the same shape of run then reads **98.9 xact/s at 2.42 rows/transaction** - a
+      figure about that 100 s run at ~28 accepted events/s, not about the rated load,
+      and one that sits on the wrong side of a coin toss against this leg's 100/s.
+      **Owner: the operator on a rated host**, with the rest of AC-16. No leg of
+      AC-16 is claimed by this run.
     - *NFR-1 at 1,000 events/s* - **unmeasurable on this machine class**; needs the
       8 vCPU / 16 GB reference host.
     - *NFR-2 (publish -> first attempt <= 60 s)* - **unmeasured because the rated
