@@ -113,7 +113,7 @@ type DeliverySummary struct {
 	// being held, which is every delivery whose attempt has started.
 	HeldBackSince  *time.Time
 	HeldBackReason *string
-	// IsTest is the marker UI-4 sets on a synthetic test event (0020): it rides
+	// IsTest is the marker UI-4 sets on a synthetic test event (0021): it rides
 	// on the delivery row's event, so a producer reading the log can tell a test
 	// delivery from a production one wherever the two appear side by side.
 	IsTest bool
@@ -407,7 +407,7 @@ type EventView struct {
 	RoutingState      *string
 	NonDeliveryReason *string
 	Rollup            string
-	// IsTest is UI-4's marker (0020) on the event itself, so the event page the
+	// IsTest is UI-4's marker (0021) on the event itself, so the event page the
 	// portal sends a test from can say so when it sends the user to look at it.
 	IsTest     bool
 	Deliveries []DeliveryDetail

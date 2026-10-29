@@ -13,7 +13,7 @@ import (
 	"github.com/m7jay/pigeon/internal/identity"
 )
 
-// S9a's password reset (FR-111, migration 0020). The two properties the SQL is
+// S9a's password reset (FR-111, migration 0021). The two properties the SQL is
 // written around are asserted here from the outside: the token is only ever
 // stored as a hash and is single-use, and accepting one rewrites exactly one
 // account's credential - no membership, no consumer binding, no invitation.
