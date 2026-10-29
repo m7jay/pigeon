@@ -290,6 +290,8 @@ jobs:
             TestForeignDeliveryIsNotFoundFromThePortal \
             TestConsumerReplayIsConfirmedByTheAPIsOwnCountAndRate \
             TestConsumerReplayShowsTheAPIsBoundWhereTheUserActed \
+            TestConsumerSnippetRendersEveryLanguageAndNeverSendsTheSecret \
+            TestConsumerGuideRendersTheLiveEventTypeSchemas \
             TestCoreDoesNotDependOnThePortal \
             TestRetryThenDelivered \
             TestTerminalFailureOn404 \
@@ -407,7 +409,38 @@ jobs:
             TestGradeReportsTheGeneratorTallyWithoutGradingIt \
             TestGradeRecomputesClausesOneAndTwoFromTheArtifact \
             TestGradeExitStatusIsTheVerdict \
-            TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase
+            TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase \
+            TestPasswordResetTokenIsStoredHashedAndBurnable \
+            TestPasswordResetAcceptChangesOnlyTheCredential \
+            TestEndpointHealthCountsTheFailureStreak \
+            TestProducerPortalSeesOnlyItsOwnProducerEvents \
+            TestTestPublishMarkerRidesTheEventToTheDeliveryLog \
+            TestSubscribableEventTypesCarryTheirSchema \
+            TestProducerRoutesRefuseAMachineKeyAndAConsumerToken \
+            TestProducerPublishTakesTheProducerFromTheSessionClaim \
+            TestTestPublishIsMarkedSyntheticEverywhere \
+            TestProducerRotateEndpointSecretOpensAnOverlapWindow \
+            TestPasswordResetRequestCannotEnumerateAccounts \
+            TestPasswordResetAcceptRewritesOnlyTheCredential \
+            TestOIDCLoginMintsASessionForAMappedIdentity \
+            TestOIDCLoginIsAbsentWithoutAProvider \
+            TestOnboardingChecklistIsDerivedFromTheAPI \
+            TestEndpointListShowsEveryConsumerWithHealth \
+            TestDeliveryLogShowsAttemptsAndFiltersByConsumer \
+            TestTestEventIsSubmittedWithTheSyntheticMarker \
+            TestReplayNeedsConfirmationStatingTheCountAndTheRate \
+            TestRotationExplainsTheOverlapWindow \
+            TestSnippetRendersFourLanguagesWithoutSendingTheSecret \
+            TestRetentionPanelSaysItCannotTellRatherThanZero \
+            TestIntegrationGuideRendersTheLiveSchemas \
+            TestConsumerInviteAndRevokeAreOwnerOnly \
+            TestConsumerViewShowsFailureStreakAndUnroutableEvents \
+            TestEveryFormCarriesTheCSRFToken \
+            TestLoginStartsWithTheCoresSessionAndRefusesANonMemberSession \
+            TestPasswordResetPagesCannotEnumerateAccounts \
+            TestOIDCControlIsAbsentWhenUnconfiguredAndCallbackChecksState \
+            TestLazyVerifierConstructsWithoutIO \
+            TestLazyVerifierDiscoversOnceAndVerifies
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
