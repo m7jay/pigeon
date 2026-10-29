@@ -10,20 +10,29 @@
 //
 //   - one deployment key, validated at startup (config.Validate), never a
 //     per-row or per-request key;
-//   - one AAD string that names the row the ciphertext belongs to, so a value
-//     cannot be moved between rows (or columns) by anyone who can write the
-//     column but does not hold the key;
+//   - one AAD string that names where the ciphertext belongs - the table, the
+//     row, and the field when one row holds several encrypted values - so a
+//     value cannot be moved to another row or onto another field by anyone who
+//     can write the column but does not hold the key. The primitive cannot
+//     enforce that: the AAD is the caller's string. It is therefore a rule in
+//     docs/at-rest-encryption.md, and the store builds it next to the SQL that
+//     names the row;
 //   - the ciphertext is stored as base64(nonce || ciphertext), so a column holds
 //     one self-contained value and no separate nonce column can drift from it;
 //   - plaintext never travels further than the write and the delivery path, and
 //     an error from here never quotes the plaintext or the ciphertext
 //     (FR-1008).
 //
-// What this does not do, and deliberately: key rotation. Rotating the key would
-// require re-sealing every stored value in the same transaction that swaps the
-// key, which is a migration and not a helper; a deployment that must rotate
-// re-seals through a migration. docs/at-rest-encryption.md states that limitation
-// rather than leaving it to be discovered.
+// What this does not do, and deliberately: key rotation, and per-producer key
+// derivation. Rotating the key would require re-sealing every stored value in the
+// same transaction that swaps the key, which is a migration and not a helper; a
+// deployment that must rotate re-seals through a migration. And the key is one
+// deployment key: the AAD keeps a ciphertext from being moved between rows or
+// fields, but every producer's value opens under that one key, so a holder of it
+// reads all of them - which is what §15.1's MT-7 asks the tree not to do. That
+// derivation is deferred to v1.1, with the cost stated in REQUIREMENTS.md §17.1.
+// docs/at-rest-encryption.md states both limitations rather than leaving them to
+// be discovered.
 package atrest
 
 import (
