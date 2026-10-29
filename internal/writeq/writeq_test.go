@@ -496,6 +496,41 @@ func TestAdmitShedsWithinItsDeadline(t *testing.T) {
 	}
 }
 
+// TestAShedAdmitMeansTheBudgetWasFull pins the other half of Admit's contract.
+// ErrSaturated claims the budget stayed full for the whole deadline, so a shed
+// with the budget free is the one outcome a loaded instance may never report -
+// measured at `InFlight=0 Depth=4` on a starved -race run, where a plain timer arm
+// shed because the goroutine came back to a select with both its slot send and the
+// fired timer ready and Go picks between them at random. The deadline here has
+// always already expired (1 ns), so every call faces exactly that choice: a shed
+// can only come from the arm that returns without looking at the budget.
+func TestAShedAdmitMeansTheBudgetWasFull(t *testing.T) {
+	rec := newRecorder()
+	m := metrics.New()
+	q := newQueue(t, Options{
+		Depth: 1, Workers: 1, Pending: 1, AdmitTimeout: time.Nanosecond,
+		Tx: rec.tx, Metrics: m,
+	})
+
+	const tries = 1000
+	for i := 0; i < tries; i++ {
+		rel, err := q.Admit(context.Background())
+		if err != nil {
+			t.Fatalf("Admit on a free one-slot budget = %v on call %d: a shed is only ever a claim that the budget was full", err, i+1)
+		}
+		if got := q.Stats().InFlight; got != 1 {
+			t.Fatalf("Admit on a free budget left %d writes in flight, want 1", got)
+		}
+		rel()
+	}
+	if got := q.Stats().InFlight; got != 0 {
+		t.Fatalf("%d slots of the budget are still held after every admit was released", got)
+	}
+	if got := m.Counter(metrics.WriteQueueSaturated); got != 0 {
+		t.Fatalf("saturation counter = %d over %d admits against a free budget, want 0", got, tries)
+	}
+}
+
 // TestWritePathGrowsNoGoroutines is AC-3: offering far more batches and publishes
 // than the budget holds must leave the goroutine count and the open descriptors a
 // function of the budget and the fixed worker pool. Nothing in the steady state
