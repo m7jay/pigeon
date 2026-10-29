@@ -44,7 +44,12 @@ mechanism. The slice is card `t_c6afa452`; the graded AC-30 load run it unblocks
 `t_0bf3effa`, which also implements the §8.1 `-class` comparison the harness never had.
 S10 keeps the report and the harness - S12 does not touch `cmd/loadgen`. The relay's
 fan-out batch is `t_b9850e1b`'s, not this slice's; S12 owns the queue that batch is
-submitted through. The contract change is `SPEC.md` A-11.
+submitted through. The contract change is `SPEC.md` A-11. `t_b9850e1b` fixed it:
+`ProcessPending` leases a batch of outbox rows in one call
+(`pigeon_lease_outbox_batch`, migration `0020`) and writes the whole fan-out - the
+delivery rows, the §7.5a routing outcomes and the outbox marks - in one write-budget
+transaction per pack that fills FR-815's row bound, which took the drain from 41.5
+events/s to 496.7 events/s on the box that measured it (`docs/load-test.md`).
 
 **S9 is split.** `t_0eea0b84` landed the consumer portal (M2b); the producer portal
 (M2a) is S9a, card `t_c0144baa`, and AC-01 moved with it. The S9 row above still

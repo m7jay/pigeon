@@ -207,7 +207,8 @@ AC-30/AC-31's saturation seen a second time, not the bound.
 
 ### Why the delivery number is 3.3% of the claim
 
-Two independent defects, both owned by other cards. Neither is tuned around here.
+Two independent defects, neither tuned around here. Both are fixed on the tree this
+report was later annotated against, each by its own card.
 
 1. **The dispatch path parks on a capped endpoint (S11, card `t_558a9f59`).**
    `PIGEON_DELIVERY_WORKERS` ships as **1** (`internal/config/config.go`), and
@@ -216,7 +217,10 @@ Two independent defects, both owned by other cards. Neither is tuned around here
    call) before spawning the attempt goroutine. One slow or capped endpoint
    therefore occupies a process's only dispatch loop, and everything else queues
    behind it. Recorded before this run on `t_4b766094` and in `SPEC.md` A-10; S11
-   owns the fix and this card does not tune the test around it.
+   owns the fix and this card does not tune the test around it. **Landed** as
+   `7a7c997 feat(delivery): stop parking the dispatch path on a capped endpoint
+   (FR-1303, FR-1304)`, so the pre-S11 parking is no longer a second cause in the
+   delivery number.
 2. **The relay's outbox loop, which is a *different* path from S11's.** Over a
    five-minute sample the relay published 99 outbox rows while ingest created
    62,391, so deliveries stop at the fan-out before they ever reach the dispatch
@@ -239,6 +243,29 @@ Two independent defects, both owned by other cards. Neither is tuned around here
    measure it on a compliant host before closing it as not-a-defect or fixing it.
    Both legs are real and both are required for the delivery unit; they are simply
    two mechanisms, and sending this one to S11's dispatch scope would have lost it.
+
+   **Fixed (card `t_b9850e1b`).** This leg is a defect, not a latency artifact of
+   the box: the loop did one lease, one publish, one fan-out transaction and one
+   mark per event, so its rate was one round-trip chain per event by construction,
+   and nothing on that path was batched at all - it did not touch the write budget
+   FR-818 gives it. The drain is now batched: one lease call claims a batch of
+   outbox rows (`pigeon_lease_outbox_batch`, migration `0020`), their delivery sets
+   are resolved together, and the whole fan-out - the delivery rows, the §7.5a
+   routing outcomes and the outbox marks - is written one write-budget transaction
+   per pack that fills FR-815's row bound (`internal/store/relaybatch.go`,
+   `internal/relay/relay.go`).
+
+   Measured on this same 2 vCPU box, 1,000 accepted events at 10 subscriptions, the
+   instance idle of ingest, the same in-process probe on both sides of the change:
+   **41.5 events/s (414.9 deliveries/s) before -> 496.7 events/s (4,966.8
+   deliveries/s) after**, the drain finishing in 2.0 s instead of 24.1 s and using
+   **8 write-budget transactions (12,000 rows) instead of none**. Both figures are
+   *lower bounds on the shape*, not graded claims - §16 wants the generator off the
+   machine under test and this box cannot provide that, so the rated-class numbers
+   remain the operator's run (see "Where the scale claim is measured"). What the fix
+   settles is the mechanism: the fan-out leg is no longer bounded by one round-trip
+   chain per event, and at 10 subscriptions it now carries the delivery unit §8.1
+   states for it with room to spare on a box far weaker than the reference.
 
 ### Why nothing was shed: the measured tree had no FR-818 (it has landed since)
 
