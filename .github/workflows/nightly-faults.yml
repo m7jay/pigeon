@@ -50,8 +50,14 @@ jobs:
           --health-retries 20
 
     env:
-      PIGEON_TEST_DATABASE_URL: postgres://postgres:***@localhost:5432/pigeon_test?sslmode=disable
+      PIGEON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/pigeon_test?sslmode=disable
       PIGEON_TEST_REDIS_URL: redis://localhost:6379/0
+      # FR-1006's at-rest key for endpoint custom header values. config.Load
+      # refuses to boot without a 32-byte base64 key (internal/config/config.go
+      # Validate -> atrest.ParseKey), so every process-level step below needs it;
+      # without it /tmp/pigeon exits 1 before it binds and the health probe fails.
+      # A test-only value, the same one ci.yml carries: it protects nothing.
+      PIGEON_HEADERS_KEY: /mxm1i7pxOA1RGvIcQHGx1EPyWXCuUTPrG9l0DtCza4=
 
     steps:
       - uses: actions/checkout@v4
@@ -127,6 +133,11 @@ jobs:
           # The probe type is broadcast: it is accepted and recorded but writes no
           # delivery rows, so the probes below measure the ingest gate without
           # touching the delivery path.
+          #
+          # The seeded payload schema is {"required":["data"]} (cmd/loadgen/seed.go),
+          # so every publish below MUST carry payload.data or it is refused with a
+          # 422 before the ingest gate is even reached - which would look like a
+          # passing "shed" and a failing 202 after recovery.
           /tmp/loadgen seed -db "$PIGEON_TEST_DATABASE_URL" \
             -producer nightly -event-type nightly.probe -routing broadcast \
             -endpoints 1 -url https://example.invalid/hook >/tmp/seed.out
@@ -157,10 +168,39 @@ jobs:
           KEY=$(cat /tmp/key)
           code=$(curl -s -o /tmp/shed.json -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/events \
             -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-            -d '{"event_type":"nightly.probe","payload":{}}')
+            -d '{"event_type":"nightly.probe","payload":{"data":"probe"}}')
           echo "publish while over budget -> $code"
           cat /tmp/shed.json
           test "$code" = "429" || { echo "SB-7: over budget must shed with 429, got $code"; exit 1; }
+          # The over-budget instance is permanently over budget by construction:
+          # PIGEON_DISK_BYTES=1 against /tmp computes UsedPct in the millions, so
+          # retention.IngestGate stays true for as long as it runs and every later
+          # publish would be shed with 429. The two steps below need a publish to be
+          # ACCEPTED again, so leave a normally-budgeted instance behind instead.
+          pkill -f '/tmp/pigeon' || true
+          sleep 1
+
+      - name: restart a normally-budgeted instance (the disk scenario is over)
+        run: |
+          set -euo pipefail
+          # Same env as "start an instance for the process-level scenarios" - no
+          # PIGEON_DISK_* knobs, so retention's TotalBytes is 0 and IngestGate is
+          # false. This is also the assertion the old job was missing: the gate must
+          # have REOPENED, not merely stop shedding because nothing was published.
+          export PIGEON_INSTANCE_ADMIN_PASSWORD="$(head -c 32 /dev/urandom | base64)"
+          export PIGEON_DATABASE_URL="$PIGEON_TEST_DATABASE_URL"
+          export PIGEON_REDIS_URL="localhost:6379"
+          export PIGEON_HTTP_ADDR="127.0.0.1:8080"
+          export PIGEON_ATTEMPT_LOG_MODE=buffered
+          nohup /tmp/pigeon >/tmp/pigeon-normal.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:8080/health && break; sleep 1; done
+          curl -fsS -o /dev/null http://127.0.0.1:8080/health
+          KEY=$(cat /tmp/key)
+          code=$(curl -s -o /tmp/normal.json -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/events \
+            -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+            -d '{"event_type":"nightly.probe","payload":{"data":"probe"}}')
+          echo "publish after the disk scenario -> $code"
+          test "$code" = "202" || { echo "the ingest gate did not reopen after the disk scenario (got $code)"; exit 1; }
 
       - name: stop Postgres for 30 s
         run: |
@@ -175,7 +215,7 @@ jobs:
           for i in $(seq 1 10); do
             code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/events \
               -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-              -d '{"event_type":"nightly.probe","payload":{}}' || true)
+              -d '{"event_type":"nightly.probe","payload":{"data":"probe"}}' || true)
             echo "publish during the outage -> ${code:-no-response}"
             if [ "$code" != "202" ]; then saw_failure=1; fi
             sleep 3
@@ -185,7 +225,7 @@ jobs:
           for i in $(seq 1 30); do
             code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/events \
               -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-              -d '{"event_type":"nightly.probe","payload":{}}' || true)
+              -d '{"event_type":"nightly.probe","payload":{"data":"probe"}}' || true)
             [ "$code" = "202" ] && break
             sleep 2
           done
@@ -200,7 +240,7 @@ jobs:
           for i in $(seq 1 50); do
             curl -fsS -o /dev/null -X POST http://127.0.0.1:8080/v1/events \
               -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-              -d '{"event_type":"nightly.probe","payload":{}}'
+              -d '{"event_type":"nightly.probe","payload":{"data":"probe"}}'
           done
           accepted=$(docker exec "$PG" psql -U postgres -d pigeon_test -tAc "select count(*) from events")
           pkill -9 -f '/tmp/pigeon'
