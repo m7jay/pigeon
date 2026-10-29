@@ -188,8 +188,10 @@ const dropOutcomeTimeout = 30 * time.Second
 // connection is still acquired with the caller's: a context that is already
 // cancelled when the call starts never sends the DROP - the caller gets its error
 // and the partition is left for the next tick - and a cancellation that lands
-// later, including one between the acquire and the BEGIN, can no longer discard
-// the record of a commit that happened.
+// later, including one between the acquire and the BEGIN, no longer aborts the
+// transaction at all, so the call returns the server's outcome instead of an
+// error: (true, nil) once the drop is committed, (false, nil) when the partition
+// was already gone or a writer held it past its lock_timeout.
 func (s *Store) DropPartition(ctx context.Context, table, name string, reason retention.DropReason) (bool, error) {
 	if err := checkRetentionTable(table); err != nil {
 		return false, err
