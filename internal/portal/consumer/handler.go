@@ -95,7 +95,7 @@ func buildRenderer() (*portalui.Renderer, error) {
 }
 
 // pageNames is the set of page files, each a {{define "content"}} template.
-var pageNames = []string{"login", "invite", "me", "endpoints", "endpoint", "deliveries", "delivery", "problem", "snippet"}
+var pageNames = []string{"login", "invite", "me", "endpoints", "endpoint", "deliveries", "delivery", "problem", "snippet", "guide"}
 
 // Handler returns the portal's HTTP surface: assets, then the portal routes.
 func (h *Handler) Handler() http.Handler {
@@ -144,6 +144,9 @@ func (h *Handler) Handler() http.Handler {
 	// browser history and shared links.
 	mux.HandleFunc("GET /snippet", h.requireLogin(h.snippetForm))
 	mux.HandleFunc("POST /snippet", h.requireLogin(h.snippetSubmit))
+	// UI-9: the consumer-side integration guide, rendered from the live event-type
+	// schemas the core exposes to this consumer. Same read UI-14 uses, one route.
+	mux.HandleFunc("GET /guide", h.requireLogin(h.guide))
 	// FR-1009/AC-50: every state-changing request in this portal carries a CSRF
 	// token bound to the session cookie and verified in constant time, and the
 	// anonymous /login and /invite are not exceptions - a cross-site login logs a
