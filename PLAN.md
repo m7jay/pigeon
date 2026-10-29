@@ -42,8 +42,9 @@ consequence on the 2 vCPU reference box (`docs/load-test.md`: 250 events/s offer
 at the shipped pool of 10 against 86 ms at 40), and AC-30's three clauses have no other
 mechanism. The slice is card `t_c6afa452`; the graded AC-30 load run it unblocks is
 `t_0bf3effa`, which also implements the §8.1 `-class` comparison the harness never had
-(the comparison and its refusals landed with that card; the graded run itself is the
-operator's, on a host that carries the class).
+(the comparison, its refusals and the machine under test it checks the class against
+landed with that card; the graded run itself is the operator's, on a host that carries
+the class).
 S10 keeps the report and the harness - S12 does not touch `cmd/loadgen`. The relay's
 fan-out batch is `t_b9850e1b`'s, not this slice's; S12 owns the queue that batch is
 submitted through. The contract change is `SPEC.md` A-11. `t_b9850e1b` fixed it:
@@ -256,7 +257,7 @@ Per-requirement map, corrected:
 | OPS-10 | `TestConnectionBudgetNamesTheArithmetic` (check id `db.connection_budget`, substituted formula as the observed value) |
 | OPS-11 | `TestObservedValuesAreSingleLine`, `TestNoSecretAppearsInAnyRendering`, `TestNothingToObserveIsExitThree`, `TestJSONMatchesTheLineOutput`, `TestChecksAreBoundedAndOrdered` |
 | AC-22 | OPS-4's rows; `TestAConfiguredDependencyThatWillNotAnswerIsAFailure` and `TestArithmeticChecksSkipWhenTheConfigurationDidNotLoad` pin the two kinds of silence |
-| AC-30, AC-31, AC-34 | `docs/load-test.md` and the runnable harness `cmd/loadgen` (`run`, `seed`, `sink`, `compare`, `grade`); the document reports what was measured; AC-34 is measured by `TestAttemptFanOutIsBounded` (its literal 2,500 leg included); AC-30's ceiling comparison is `grade`'s, decided from the artifact against the §8.1 table in `cmd/loadgen/class.go` (card `t_0bf3effa`, with its deterministic tests), and the graded run on a rated host is the **operator's** - not measured here |
+| AC-30, AC-31, AC-34 | `docs/load-test.md` and the runnable harness `cmd/loadgen` (`run`, `seed`, `sink`, `compare`, `grade`); the document reports what was measured; AC-34 is measured by `TestAttemptFanOutIsBounded` (its literal 2,500 leg included); AC-30's ceiling comparison is `grade`'s, decided from the artifact against the §8.1 table in `cmd/loadgen/class.go` and the `machine_under_test` the artifact records (`-class` plus `-sut-cpus`/`-sut-mem-gib`; card `t_0bf3effa`, with its deterministic tests), and the graded run on a rated host is the **operator's** - not measured here |
 | AC-43 | **not measured here** - one host cannot show per-doubling scaling; `docs/load-test.md` says so; owned by the operator on a rated host, with AC-16/AC-17 |
 | §16.5 / AC-42 | `internal/faults/faults_test.go` behind `-tags faults`, run nightly by `.github/workflows/nightly-faults.yml` |
 
