@@ -1093,15 +1093,15 @@ Neither is the mechanism. The budget that separates is the worker's.
   its own class. Today it cannot: it selects `order by d.id limit 1` over every pending delivery
   (`0013_s5_retry_pause_limits.sql:308`), so the oldest row wins and a retry backlog is claimed
   ahead of every newer first attempt.
-- **Lane side.** The two allowances are a **partition** of the process's existing attempt budget, not
-  an addition to it: the process cap `C` is
+- **Lane side.** The two allowances are a **partition** of the process's existing attempt budget,
+  not an addition to it: the process cap `C` is
   `PIGEON_DELIVERY_CONCURRENCY` (FR-816's per-process cap, default 64), the retry lane's
   configurable allowance `R` is `PIGEON_DELIVERY_RETRY_CONCURRENCY` (default 16), and the lanes hold
   `R` and `C - R` slots respectively (48 first-attempt slots at those defaults). Attempts in flight
   for one process therefore still total at most `C`, the ceiling FR-816 already shipped; the
   trade-off below is the price of the split, not a raised budget.
-  `R = clamp(configured, 0, C - 1)`, with the knob validated `>= 1` at config load exactly as `C` is
-  (`internal/config/config.go:420-421`), so `C - R >= 1` holds at every accepted `C` and `R >= 1` at
+  `R = clamp(configured, 0, C - 1)`, with the knob validated `>= 1` at config load
+  (`internal/config/config.go:442-443`), so `C - R >= 1` holds at every accepted `C` and `R >= 1` at
   every `C >= 2`; a configured value above `C - 1` is clamped rather than refused, because the
   result still leaves the first-attempt lane one slot.
   `R = 0` is a defined state, not an error, and the clamp reaches it only at `C = 1`: it means **no
@@ -1118,14 +1118,14 @@ Neither is the mechanism. The budget that separates is the worker's.
   bucket), the worker MUST NOT sleep holding the claim and the lane slot. `limit.Acquire` and
   `limit.Allow` already return the wait; the worker reschedules the delivery at `now + wait`,
   consumes no attempt, leaves `retry_deadline` untouched, and records the hold.
-- **Why the hold is load-bearing, and what it replaces.** `dispatch` claims a delivery and takes
-  the process slot *before* `acquireEndpointLimits` (`internal/delivery/delivery.go:439-486`), then
-  sleeps inside that path (the two wait loops at `:502-514` and `:521-534`). With
-  `PIGEON_DELIVERY_WORKERS=1`, the shipped default
-  (`internal/config/config.go:165`), one capped endpoint therefore occupies the process's only
-  dispatch loop. An endpoint at its default cap of 10 with 5 s hangs drains at 2 attempts/s, so a
-  due backlog of `D` rows parks that process for `D/2` seconds - 1,000 rows for about 8 minutes -
-  while every other endpoint and producer waits, and nothing says why. That is FR-1304's "silent
+- **Why the hold is load-bearing, and what it replaces.** The pre-S11 `dispatch` claimed a delivery
+  and took the process slot *before* `acquireEndpointLimits` (`internal/delivery/delivery.go` at
+  `a9b3a67:439-486`), then slept inside that path (the two wait loops at `:502-514` and
+  `:521-534`). With `PIGEON_DELIVERY_WORKERS=1`, the shipped default
+  (`internal/config/config.go:171`), one capped endpoint therefore occupied the process's only
+  dispatch loop. An endpoint at its default cap of 10 with 5 s hangs drained at 2 attempts/s, so a
+  due backlog of `D` rows parked that process for `D/2` seconds - 1,000 rows for about 8 minutes -
+  while every other endpoint and producer waited, and nothing said why. That is FR-1304's "silent
   latency", and it is also the precondition of AC-16's NFR-2 leg: S10 measures that leg, and it
   cannot pass while the dispatch path parks.
 - **Visibility.** The hold is control state, not evidence: `held_back_since` and `held_back_reason`
@@ -1135,14 +1135,23 @@ Neither is the mechanism. The budget that separates is the worker's.
 
 **The lanes are served by a rotation, and the number of loops is not what A-10 fixes.** A-10 first
 read "the worker runs one claim loop per lane"; the shipped shape is one claim loop per worker -
-`PIGEON_DELIVERY_WORKERS` (default 1), the count FR-816 already shipped - rotating over the lanes, and
-the difference is not observable. The rotation advances its cursor on every dispatch and a lane at its
-allowance or with nothing due hands the pass to the next one, so neither lane starves the other; each
-claim carries the lane's own class, so a retry backlog cannot enter the first-attempt allowance; the
-allowances are semaphores on the process rather than on a loop, so the number of claim loops does not
-multiply them (`R` and `C - R` whatever the loop count); and one delivery is claimed per pass, the
-claim throughput the base's single loop already had. A goroutine per lane would add no property those
-sentences do not already hold, and would widen `PIGEON_DELIVERY_WORKERS` from claim loops to lanes.
+`PIGEON_DELIVERY_WORKERS` (default 1), the count FR-816 already shipped - rotating over the lanes.
+Nothing A-10 fixes distinguishes the two shapes: the rotation advances its cursor on every dispatch
+and a lane at its allowance or with nothing due hands the pass to the next one, so neither lane
+starves the other; each claim carries the lane's own class, so a retry backlog cannot enter the
+first-attempt allowance; and the allowances are semaphores on the process rather than on a loop, so
+the number of claim loops does not multiply them (`R` and `C - R` whatever the loop count). Claim
+refill is the one dimension in which they differ: with `PIGEON_DELIVERY_WORKERS = 1`, a claim loop
+per lane would claim up to two deliveries per pass where the rotation claims one. That dimension is
+untested - AC-52 and AC-53 bound *attempts* in flight by the lane allowances, not claims in flight,
+and the literal shape would not move those bounds - so a claim loop per lane would widen
+`PIGEON_DELIVERY_WORKERS` from claim loops to lanes for nothing those criteria observe. The wording
+this replaces also survives in `internal/db/migrations/0016_s11_delivery_lanes_and_holds.sql:20-21`,
+whose header still says "The worker runs one claim loop per lane against this predicate"; that file
+is checksum-frozen - `db.Migrate` refuses a migration whose content changed after it ran
+(`internal/db/migrate.go:128-129`), the same checksum rule that had 0010/0011 renumbered rather than
+edited in place above - so the header is not edited and this paragraph is the record that supersedes
+it.
 
 **Composition with FR-1308, stated once.** An attempt passes two independent admissions: its lane's
 allowance (FR-1303, platform capacity, per process) and the endpoint's shared limits (FR-1302,
