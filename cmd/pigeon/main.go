@@ -218,6 +218,14 @@ func run() error {
 		KeyLimiter:       ratelimit.New(cfg.RateLimitPerKeyRPS, cfg.RateLimitPerKeyBurst),
 		ProducerLimiter:  ratelimit.New(cfg.RateLimitPerProducerRPS, cfg.RateLimitPerProducerBurst),
 		SelfRegistration: cfg.SelfRegistration,
+		// FR-111 (S9a): the reset window, and the delivery seam. The core holds no
+		// mailer, so the notifier is the deployment's to wire; see resetNotifier.
+		PasswordResetTTL:    cfg.PasswordResetTTL,
+		NotifyPasswordReset: resetNotifier(log, cfg.PasswordResetLogTokens),
+		// FR-106 (S9a): nil unless the operator configured an issuer, in which case
+		// the API verifies the id_tokens the portal obtains. The core never holds the
+		// client secret.
+		OIDC: oidcVerifier(cfg),
 	}, log)
 
 	httpServer := &http.Server{
