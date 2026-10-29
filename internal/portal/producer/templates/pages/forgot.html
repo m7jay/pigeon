@@ -1,0 +1,18 @@
+{{define "content"}}
+<div class="card narrow">
+  <h1>Reset your password</h1>
+  {{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+  {{if .Data.Sent}}
+  <p class="flash flash-success">If that address has an account, a link has been sent.</p>
+  <p class="page-sub">The link is delivered by whoever operates this instance; there is no mailer built into the platform. Open the link to choose a new password.</p>
+  {{else}}
+  <p class="page-sub">Enter the email you use here and the API will mint a one-time reset link. The page says the same thing whatever the answer, so the form is not a way to find out who has an account.</p>
+  <form method="post" action="/forgot">
+    {{template "csrf_field" .}}
+    <div class="form-row"><label for="email">Email</label><input id="email" type="email" name="email" required autofocus autocomplete="username"></div>
+    <button class="btn" type="submit">Send the reset link</button>
+  </form>
+  {{end}}
+  <p class="page-sub"><a href="/login">Back to the login form</a></p>
+</div>
+{{end}}

@@ -1,0 +1,11 @@
+{{define "content"}}
+<div class="card narrow">
+  <h1>{{if .Data.Title}}{{.Data.Title}}{{else}}Something went wrong{{end}}</h1>
+  <p class="page-sub">{{if .Data.Message}}{{.Data.Message}}{{else}}There is nothing to show for this request.{{end}}</p>
+  {{if .Data.Detail}}<p class="muted">{{.Data.Detail}}</p>{{end}}
+  <p class="row-actions">
+    <a class="btn btn-sm btn-secondary" href="/onboarding">Back to the checklist</a>
+    <a class="btn btn-sm btn-secondary" href="/login">Log in again</a>
+  </p>
+</div>
+{{end}}

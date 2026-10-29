@@ -1,0 +1,111 @@
+{{define "content"}}
+<h1>{{.Data.Consumer.Name}}</h1>
+<p class="page-sub">One consumer in the <strong>{{.Data.Env}}</strong> environment (UI-11): its endpoints with their health, the users who can see it, and the events that could not be routed.</p>
+
+{{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+
+<div class="card">
+  <dl class="kv">
+    <dt>Reference</dt><dd class="mono">{{.Data.Consumer.Ref}}</dd>
+    <dt>ID</dt><dd class="mono">{{.Data.Consumer.ID}}</dd>
+    <dt>Environment</dt><dd>{{.Data.Consumer.Env}}</dd>
+    <dt>Created</dt><dd class="muted">{{.Data.Consumer.CreatedAt}}</dd>
+    <dt>This consumer's deliveries</dt><dd><a href="/deliveries?consumer_id={{.Data.Consumer.ID}}">Open the filtered delivery log</a></dd>
+  </dl>
+</div>
+
+{{if .Data.NewInviteToken}}
+<div class="notice">
+  <strong>Invitation created.</strong> The token is shown once - there is no mailer in v1.0, so pass it to {{.Data.NewInviteEmail}} yourself.
+  <pre class="snippet">{{.Data.NewInviteToken}}</pre>
+</div>
+{{end}}
+
+<div class="card">
+  <h2>Endpoints</h2>
+  {{if .Data.Endpoints}}
+  <table class="data-table">
+    <thead><tr><th>Name</th><th>URL</th><th>Status</th><th>Verified</th><th>Failure streak</th><th>Last status</th><th>Last delivery</th><th></th></tr></thead>
+    <tbody>
+    {{range .Data.Endpoints}}
+    <tr>
+      <td><a href="/endpoints/{{.ID}}">{{.Name}}</a></td>
+      <td class="mono muted">{{.URL}}</td>
+      <td>{{template "badge" .Status}}</td>
+      <td>{{if .Verified}}{{template "badge" "active"}} verified{{else}}{{template "badge" "unverified"}} not verified{{end}}</td>
+      <td>{{.FailureStreak}}</td>
+      <td class="mono">{{if .LastStatus}}{{.LastStatus}}{{else}}<span class="muted">no delivery yet</span>{{end}}</td>
+      <td class="muted">{{if .LastDeliveryAt}}{{.LastDeliveryAt}}{{else}}never{{end}}</td>
+      <td class="row-actions"><a class="btn btn-sm btn-secondary" href="/endpoints/{{.ID}}">Health and secret</a></td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">This consumer has no endpoints yet, so there is nothing of its to deliver to.</p>
+  {{end}}
+</div>
+
+<div class="card">
+  <h2>Unroutable and undelivered events</h2>
+  <p class="page-sub">Events that produced no delivery for this consumer, each with the API's reason (UI-11).</p>
+  {{if .Data.Events}}
+  <table class="data-table">
+    <thead><tr><th>Event</th><th>Event type</th><th>Routing state</th><th>Reason</th><th>Occurred</th><th></th></tr></thead>
+    <tbody>
+    {{range .Data.Events}}
+    <tr>
+      <td class="mono"><a href="/events/{{.ID}}">{{.ID}}</a></td>
+      <td class="mono">{{.EventType}}</td>
+      <td>{{if .RoutingState}}{{template "badge" .RoutingState}}{{else}}<span class="muted">not reported</span>{{end}}</td>
+      <td>{{if .NonDeliveryReason}}{{.NonDeliveryReason}}{{else}}<span class="muted">none given</span>{{end}}</td>
+      <td class="muted">{{.OccurredAt}}</td>
+      <td>{{if .IsTest}}<span class="muted">test</span>{{end}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">The API reported no unroutable or undelivered events for this consumer: nothing has been refused.</p>
+  {{end}}
+</div>
+
+<div class="card">
+  <h2>Users</h2>
+  {{if .Data.Users}}
+  <table class="data-table">
+    <thead><tr><th>Email</th><th>User ID</th><th>Added</th>{{if .Data.IsOwner}}<th></th>{{end}}</tr></thead>
+    <tbody>
+    {{range .Data.Users}}
+    <tr>
+      <td>{{.Email}}</td>
+      <td class="mono">{{.UserID}}</td>
+      <td class="muted">{{.CreatedAt}}</td>
+      {{if $.Data.IsOwner}}
+      <td class="row-actions">
+        <form method="post" action="/consumers/{{$.Data.Consumer.ID}}/users/{{.UserID}}/revoke" onsubmit="return confirm('Revoke access for this account? The consumer and its endpoints are untouched.')">
+          {{template "csrf_field" $}}
+          <button class="btn btn-sm btn-danger" type="submit">Revoke access</button>
+        </form>
+      </td>
+      {{end}}
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">No user has accepted an invitation to this consumer yet.</p>
+  {{end}}
+
+  {{if .Data.IsOwner}}
+  <p class="page-sub">Invite someone by email (UI-10). The API returns the invitation token once and there is no mailer in v1.0, so pass it on yourself; it is the only way into this consumer's portal.</p>
+  <form method="post" action="/consumers/{{.Data.Consumer.ID}}/invite">
+    {{template "csrf_field" .}}
+    <div class="form-row"><label for="email">Email</label><input id="email" type="email" name="email" required placeholder="their.address@example.com"></div>
+    <button class="btn btn-sm" type="submit">Create the invitation</button>
+  </form>
+  {{else}}
+  <p class="page-sub">Only an owner of this producer can invite consumer users or revoke their access. This account is a member, so no invitation or revoke control is shown here - and the API refuses those calls for a member either way. Hiding the control is not the control.</p>
+  {{end}}
+</div>
+{{end}}

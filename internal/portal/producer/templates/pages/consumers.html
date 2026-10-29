@@ -1,0 +1,68 @@
+{{define "content"}}
+<h1>Consumers and endpoints</h1>
+<p class="page-sub">Every consumer of this producer in the <strong>{{.Data.Env}}</strong> environment, with the number of endpoints each has (UI-2, UI-11). Open a consumer for its endpoints' health, its users and its unroutable events.</p>
+
+{{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+{{if .Data.Created.Ref}}<p class="flash flash-success">Consumer {{.Data.Created.Ref}} created.</p>{{end}}
+
+<div class="card">
+  <h2>Consumers</h2>
+  {{if .Data.Consumers}}
+  <table class="data-table">
+    <thead><tr><th>Reference</th><th>Name</th><th>Environment</th><th>Created</th><th>Endpoints</th><th></th></tr></thead>
+    <tbody>
+    {{range .Data.Consumers}}
+    <tr>
+      <td class="mono">{{.Ref}}</td>
+      <td>{{.Name}}</td>
+      <td>{{.Env}}</td>
+      <td class="muted">{{.CreatedAt}}</td>
+      <td>{{.EndpointCnt}}</td>
+      <td class="row-actions"><a class="btn btn-sm btn-secondary" href="/consumers/{{.ID}}">Endpoints and users</a></td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">No consumers in this environment yet. Create the first one below.</p>
+  {{end}}
+</div>
+
+<div class="card">
+  <h2>Endpoints and health</h2>
+  <p class="page-sub">Every endpoint of every consumer in the <strong>{{.Data.Env}}</strong> environment (UI-2). The failure streak and last status are the API's own numbers: a streak is how many deliveries have not succeeded since the last one that did, so a long streak is an endpoint that needs attention.</p>
+  {{if .Data.Endpoints}}
+  <table class="data-table">
+    <thead><tr><th>Endpoint</th><th>Consumer</th><th>URL</th><th>Status</th><th>Verified</th><th>Failure streak</th><th>Last status</th><th>Last delivery</th><th></th></tr></thead>
+    <tbody>
+    {{range .Data.Endpoints}}
+    <tr>
+      <td><a href="/endpoints/{{.ID}}">{{.Name}}</a></td>
+      <td class="mono">{{.ConsumerRef}}</td>
+      <td class="mono muted">{{.URL}}</td>
+      <td>{{template "badge" .Status}}</td>
+      <td>{{if .Verified}}{{template "badge" "active"}} verified{{else}}{{template "badge" "unverified"}} not verified{{end}}</td>
+      <td>{{if .FailureStreak}}<strong>{{.FailureStreak}}</strong>{{else}}0{{end}}</td>
+      <td class="mono">{{if .LastStatus}}{{.LastStatus}}{{else}}<span class="muted">no delivery yet</span>{{end}}</td>
+      <td class="muted">{{if .LastDeliveryAt}}{{.LastDeliveryAt}}{{else}}never{{end}}</td>
+      <td class="row-actions"><a class="btn btn-sm btn-secondary" href="/endpoints/{{.ID}}">Health and secret</a></td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">No endpoint exists in this environment yet. Create a consumer below, then add an endpoint to it (UI-1's checklist walks the same steps).</p>
+  {{end}}
+</div>
+
+<div class="card">
+  <h2>Create a consumer</h2>
+  <p class="page-sub">A consumer is one of your customers (UI-10). The reference is its routing key: unique per producer, case-sensitive, and immutable once set (FR-506).</p>
+  <form method="post" action="/consumers">
+    {{template "csrf_field" .}}
+    <div class="form-row"><label for="ref">Reference</label><input id="ref" type="text" name="ref" required placeholder="acme" class="mono"></div>
+    <div class="form-row"><label for="name">Name</label><input id="name" type="text" name="name" required placeholder="Acme Inc."></div>
+    <button class="btn btn-sm" type="submit">Create the consumer</button>
+  </form>
+</div>
+{{end}}

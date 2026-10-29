@@ -1,0 +1,34 @@
+{{define "content"}}
+<h1>Verification snippets</h1>
+<p class="page-sub">Copy-paste signature verification for one of your endpoints, in four languages (UI-7). The snippet is rendered by this portal's own server from the secret you submit; the secret is never forwarded to the API and is never stored or logged here.</p>
+
+{{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+
+<div class="card">
+  <form method="post" action="/snippet">
+    {{template "csrf_field" .}}
+    <div class="form-row"><label for="endpoint_id">Endpoint ID</label><input id="endpoint_id" type="text" name="endpoint_id" value="{{.Data.EndpointID}}" placeholder="end_..." class="mono"></div>
+    <div class="form-row">
+      <label for="whsec">Signing secret</label>
+      <input id="whsec" type="password" name="whsec" placeholder="whsec_..." autocomplete="off" class="mono">
+      <span class="muted">The <span class="mono">whsec_</span> secret for that endpoint, from its registration or its rotation (UI-6). It is used to build the snippet in this process only.</span>
+    </div>
+    <button class="btn btn-sm" type="submit">Generate the snippets</button>
+  </form>
+  {{if .Data.Note}}<p class="page-sub muted">{{.Data.Note}}</p>{{end}}
+</div>
+
+{{if .Data.Whsec}}
+{{range .Data.Snippet}}
+<div class="card">
+  <h2>{{.Label}}{{if .Language}} <span class="muted">({{.Language}})</span>{{end}}</h2>
+  <pre class="snippet">{{.Source}}</pre>
+  {{if .Note}}<p class="page-sub muted">{{.Note}}</p>{{end}}
+</div>
+{{end}}
+{{else}}
+<div class="card">
+  <p class="empty">Submit an endpoint id and its signing secret to render the snippets. Nothing is fetched and nothing is stored: the snippets appear below this form.</p>
+</div>
+{{end}}
+{{end}}

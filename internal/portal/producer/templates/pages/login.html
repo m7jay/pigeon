@@ -1,0 +1,20 @@
+{{define "content"}}
+<div class="card narrow">
+  <h1>Log in</h1>
+  <p class="page-sub">This portal shows one producer's data. Sign in with your producer account; every panel here is read with your own session, and the API decides what that session may see.</p>
+  {{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+  {{if .Data.ForgotOK}}<p class="flash flash-success">If that address has an account, a link has been sent.</p>{{end}}
+  <form method="post" action="/login">
+    {{template "csrf_field" .}}
+    <input type="hidden" name="next" value="{{.Data.Next}}">
+    <div class="form-row"><label for="email">Email</label><input id="email" type="email" name="email" required autofocus autocomplete="username"></div>
+    <div class="form-row"><label for="password">Password</label><input id="password" type="password" name="password" required autocomplete="current-password"></div>
+    <button class="btn" type="submit">Log in</button>
+  </form>
+  {{if .Data.OIDCEnable}}
+  <p class="page-sub"><a class="btn btn-sm btn-secondary" href="/login/oidc{{if .Data.Next}}?next={{.Data.Next}}{{end}}">Sign in with single sign-on</a></p>
+  {{end}}
+  <p class="page-sub"><a href="/forgot">Forgot your password?</a></p>
+  <p class="page-sub muted">Environment: {{.Data.Env}}</p>
+</div>
+{{end}}
