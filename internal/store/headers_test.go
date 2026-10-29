@@ -433,7 +433,7 @@ func TestClaimDropsACiphertextMovedToAnotherEndpointsRow(t *testing.T) {
 
 	got := map[string]LeasedDelivery{}
 	for i := 0; i < 2; i++ {
-		d, ok, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour)
+		d, ok, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour, AttemptClassAny)
 		if err != nil {
 			t.Fatalf("ClaimDelivery: %v", err)
 		}
