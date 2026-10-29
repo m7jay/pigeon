@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -169,21 +170,75 @@ func TestOpenRedisReportsASilentServerAsAnError(t *testing.T) {
 // TestOpenRedisDoesNotLeakTheDSNInItsError is FR-1008 on the path this change
 // adds: the client is built by internal/redisconn, whose refusal quotes the value
 // it could not parse - and a Redis URL may carry a password in its userinfo. The
-// reason reaches the operator's line, so it must not carry the raw DSN past the
-// redaction doctor's own lines apply.
+// reason reaches the operator's line, so no rendering of the value may travel in
+// it.
+//
+// The escaped cases are the ones a substitution cannot survive. redisconn wraps
+// its refusal with %q and net/url quotes the value again, so a value containing a
+// literal `"` or `\` comes back as \" or \\ - no longer equal to the string a
+// redaction goes looking for. Substituting the raw value therefore misses exactly
+// the values the parser rejected, and that is the class checks.go documents as
+// withheld: "an unparseable URL is exactly the kind that has a password embedded
+// in a place the parser did not expect". The reason OpenRedis returns is built
+// without the value at all, and these cases pin the renderings escaping produces.
 func TestOpenRedisDoesNotLeakTheDSNInItsError(t *testing.T) {
 	const password = "sup3rs3cretpw"
-	raw := "redis://default:" + password + "@127.0.0.1:6399/%zz"
 
-	p, err := OpenRedis(context.Background(), raw)
-	if err == nil {
-		p.Close()
-		t.Fatalf("OpenRedis(%q) returned a probe, want the parse failure", raw)
+	for _, tc := range []struct {
+		name     string
+		password string
+		raw      string
+	}{
+		{
+			name:     "an unparseable database index",
+			password: password,
+			raw:      "redis://default:" + password + "@127.0.0.1:6399/%zz",
+		},
+		{
+			name:     "a password with a literal quote",
+			password: `sup3r"s3cretpw`,
+			raw:      `redis://default:sup3r"s3cretpw@127.0.0.1:6399/%zz`,
+		},
+		{
+			name:     "a password with a literal backslash",
+			password: `sup3r\s3cretpw`,
+			raw:      `redis://default:sup3r\s3cretpw@127.0.0.1:6399/%zz`,
+		},
+		{
+			name:     "a database index with a literal quote",
+			password: password,
+			raw:      "redis://default:" + password + `@127.0.0.1:6399/"%zz`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := OpenRedis(context.Background(), tc.raw)
+			if err == nil {
+				p.Close()
+				t.Fatalf("OpenRedis(%q) returned a probe, want the parse failure", tc.raw)
+			}
+			// Every rendering of the value has to stay out: the raw spelling
+			// and the %q-escaped one quoting produces. Asserting only the raw
+			// string leaves the escaped leak unpinned - that is the whole
+			// reason the substitution missed it.
+			for _, f := range []struct{ what, text string }{
+				{"the password", tc.password},
+				{"the value", tc.raw},
+				{"the password as %q escapes it", quoteBody(tc.password)},
+				{"the value as %q escapes it", quoteBody(tc.raw)},
+			} {
+				if strings.Contains(err.Error(), f.text) {
+					t.Errorf("OpenRedis(%q) carries %s (as %q) in its error: %v",
+						tc.raw, f.what, f.text, err)
+				}
+			}
+		})
 	}
-	if strings.Contains(err.Error(), password) {
-		t.Fatalf("OpenRedis(%q) leaks the password in its error: %v", raw, err)
-	}
-	if strings.Contains(err.Error(), raw) {
-		t.Fatalf("OpenRedis(%q) echoes the raw DSN in its error: %v", raw, err)
-	}
+}
+
+// quoteBody is how %q renders s inside a longer message: the body of the quoted
+// string, without the surrounding quotes. Both redisconn's `%q` and net/url's own
+// quoting of a bad URL produce this shape.
+func quoteBody(s string) string {
+	q := strconv.Quote(s)
+	return q[1 : len(q)-1]
 }
