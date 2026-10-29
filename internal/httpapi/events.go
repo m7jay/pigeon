@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/m7jay/pigeon/internal/store"
+	"github.com/m7jay/pigeon/internal/writeq"
 )
 
 // This file is the producer-facing publish and event-type surface (§11):
@@ -90,6 +91,44 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	// copy is accepted too, but the header wins when both are present.
 	if h := r.Header.Get("Idempotency-Key"); h != "" {
 		in.IdempotencyKey = h
+	}
+
+	// FR-818 / SPEC.md A-11: one bounded write budget per process, shared by every
+	// control-state writer. Past the machine's write ceiling the instance must
+	// shed rather than park on the pgx pool - S10's load test measured exactly
+	// that parking: 250 events/s for 30 minutes, zero 429s, p99 3,593.4 -> 4,281.6
+	// ms (card t_b5272d2d).
+	//
+	// The slot is taken HERE, after the body is read, and held for this request's
+	// one transaction: a slot is the duration of one database write, so a client
+	// that streams its body slowly must not hold one while it does. The
+	// transaction itself is unchanged (FR-604: the 202 is the commit) - what
+	// changed is admission, not the write.
+	//
+	// `over_capacity` is deliberately NOT SB-7's `over_budget`: a producer that
+	// gets a 429 needs to know whether the disk is full or the write path is, and
+	// an operator alerting on the shed counter can then tell the two apart from
+	// the same series (SB-6).
+	if s.deps.Writes != nil {
+		release, err := s.deps.Writes.Admit(r.Context())
+		if err != nil {
+			if errors.Is(err, writeq.ErrSaturated) {
+				if s.deps.Metrics != nil {
+					s.deps.Metrics.RecordShed(1)
+				}
+				// One second, not the disk gate's thirty: write pressure clears in
+				// the time a transaction takes, so a producer that backs off for a
+				// second is very likely to be admitted on the retry.
+				w.Header().Set("Retry-After", "1")
+				writeError(w, http.StatusTooManyRequests, "over_capacity",
+					"the write path is saturated; this instance sheds ingest after its admission deadline instead of queueing it, and resumes as transactions complete")
+				return
+			}
+			// The client went away or the process is stopping: there is nothing to
+			// admit and no response anybody could act on.
+			return
+		}
+		defer release()
 	}
 
 	sc := p.Scope()
