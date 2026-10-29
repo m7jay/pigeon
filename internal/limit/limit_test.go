@@ -2,6 +2,7 @@ package limit
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -103,8 +104,8 @@ func TestCapHoldsAcrossReplicas(t *testing.T) {
 // slept 90 ms for the expiry, so on a loaded box (and under -race, which slows
 // every Redis round trip) the "live" holder had already lapsed by the second
 // Acquire: the missing refusal was reported as a broken cap rather than as a
-// scheduling delay (measured 2 FAIL / 100 on a busy box, every failure on the
-// refusal line).
+// scheduling delay (measured 36 FAIL / 500 at -race -count=500 under load, every
+// failure on the refusal line).
 func TestCrashedHolderSlotsExpire(t *testing.T) {
 	ctx := context.Background()
 	r, rdb := newRedisRegistry(t)
@@ -201,46 +202,131 @@ func markLeaseLapsed(t *testing.T, rdb *redis.Client, key, member string) {
 // FR-1306: RPS is a rate over time, not a counter per second, and it is a
 // DIFFERENT mechanism from the concurrency cap - a bucket bounds how many start,
 // a slot bounds how many are in flight.
+//
+// No leg here is timed against the box. The bucket's state is written by this test
+// (seedBucket) and read back (bucketTokens) around each call, with ts pinned at or
+// ahead of the caller's clock: rateScript refills from `now - ts` and clamps a
+// negative elapsed to 0, so every call below sees exactly zero refill and its
+// arithmetic is exact whatever the box is doing. The shape it replaces filled a
+// burst through five round trips and required the sixth to land inside 200 ms -
+// and computed the expected wait from that same refill, so the busier the box the
+// smaller the reported wait. Measured on the landed tree at -race under load: 44
+// reds in one -count=200 package run, 15 of them on the 6th token and 29 on the
+// wait, which was reported as low as 4 ms.
 func TestRateBucketIsContinuousAndSeparateFromConcurrency(t *testing.T) {
 	ctx := context.Background()
-	r, _ := newRedisRegistry(t)
+	r, rdb := newRedisRegistry(t)
 	const endpoint, rps, burst = "ep_rate", 5.0, 5
 
-	// A burst is available immediately, then the bucket is empty.
+	// A bucket that does not exist yet starts full, at the configured burst. This
+	// direction is latency-independent on purpose: a refill can only ADD tokens, so
+	// no amount of load can turn a served token into a refusal. (An initial count
+	// other than `burst` reds on the second call.)
+	const fresh = "ep_rate_fresh"
 	for i := 0; i < burst; i++ {
-		ok, wait, err := r.Allow(ctx, endpoint, rps, burst)
-		if err != nil || !ok {
-			t.Fatalf("token %d of the burst = (ok=%v, wait=%s, err=%v)", i+1, ok, wait, err)
+		if ok, wait, err := r.Allow(ctx, fresh, rps, burst); err != nil || !ok {
+			t.Fatalf("token %d from an endpoint with no bucket yet = (ok=%v, wait=%s, err=%v); a fresh bucket holds a burst of %d", i+1, ok, wait, err, burst)
 		}
 	}
+
+	// A burst is spent one token at a time and the bucket is empty exactly at 0.
+	// Each call starts from a state this test wrote and must leave it exactly one
+	// token lighter; reading that state back is what makes this a check of the
+	// limiter's arithmetic rather than of the test's own seeds.
+	for left := burst; left >= 1; left-- {
+		seedBucket(t, rdb, endpoint, float64(left), pinnedAhead)
+		ok, wait, err := r.Allow(ctx, endpoint, rps, burst)
+		if err != nil || !ok {
+			t.Fatalf("a bucket holding %d token(s) refused one (ok=%v, wait=%s, err=%v)", left, ok, wait, err)
+		}
+		if got := bucketTokens(t, rdb, endpoint); got != float64(left-1) {
+			t.Fatalf("a bucket holding %d token(s) holds %v after serving one, want %d", left, got, left-1)
+		}
+	}
+
+	// An empty bucket serves nothing, and the wait it reports is the rate's (200 ms
+	// at 5 RPS) rather than a whole second, which is the difference between a
+	// bucket and a counter. Still with elapsed pinned at 0, so it is the exact
+	// value the rate implies instead of whatever the box left in the bucket.
+	seedBucket(t, rdb, endpoint, 0, pinnedAhead)
 	ok, wait, err := r.Allow(ctx, endpoint, rps, burst)
 	if err != nil {
 		t.Fatalf("Allow: %v", err)
 	}
 	if ok {
-		t.Fatal("the bucket served a 6th token from a burst of 5")
+		t.Fatalf("the bucket served a token from an empty bucket, after a burst of %d was spent", burst)
 	}
-	// At 5 RPS a token is 200 ms away; the wait must reflect the rate rather than a
-	// whole second, which is the difference between a bucket and a counter.
+	t.Logf("an empty bucket at %g RPS reports wait=%s", rps, wait)
 	if wait < 100*time.Millisecond || wait > 400*time.Millisecond {
 		t.Errorf("wait for the next token = %s, want about 200 ms at 5 RPS (FR-1306)", wait)
 	}
-	// And the bucket refills continuously.
+
+	// And the bucket refills continuously, at the rate, up to the burst and no
+	// further. Seeded empty at the caller's own clock, a 250 ms Sleep is the whole
+	// of the elapsed time rateScript can see, which is more than the 200 ms a token
+	// costs; Sleep is a floor, so a slower box only adds tokens. An endpoint idle
+	// for an hour is then worth exactly `burst` tokens, not eighteen thousand:
+	// elapsed is enormous there, and the ceiling is what makes the value exact.
+	seedBucket(t, rdb, endpoint, 0, 0)
 	time.Sleep(250 * time.Millisecond)
 	if ok, _, err := r.Allow(ctx, endpoint, rps, burst); err != nil || !ok {
 		t.Errorf("after 250 ms a token was refused (ok=%v, err=%v); the bucket refills continuously", ok, err)
 	}
+	seedBucket(t, rdb, endpoint, 0, -time.Hour)
+	if ok, _, err := r.Allow(ctx, endpoint, rps, burst); err != nil || !ok {
+		t.Fatalf("a bucket idle for an hour refused a token (ok=%v, err=%v)", ok, err)
+	}
+	if got := bucketTokens(t, rdb, endpoint); got != burst-1 {
+		t.Fatalf("a bucket idle for an hour holds %v after serving one, want %d: the refill is capped at the burst (FR-1306)", got, burst-1)
+	}
 
-	// The two mechanisms do not share state: exhausting the concurrency cap leaves
-	// the rate bucket untouched, and vice versa (FR-1306 forbids conflating them).
+	// The two mechanisms do not share state, in either direction: an endpoint whose
+	// rate bucket is empty still hands out concurrency slots, and a full
+	// concurrency cap leaves the rate bucket working (FR-1306 forbids conflating).
+	seedBucket(t, rdb, endpoint, 0, pinnedAhead)
 	mustAcquire(t, ctx, r, endpoint, 1, 30*time.Second, "holder")
 	if _, ok, _, err := r.Acquire(ctx, endpoint, 1, 30*time.Second, "holder"); err != nil || ok {
 		t.Fatalf("the concurrency cap did not hold on its own (ok=%v, err=%v)", ok, err)
 	}
-	time.Sleep(250 * time.Millisecond) // let the bucket refill
+	seedBucket(t, rdb, endpoint, 1, pinnedAhead)
 	if ok, _, err := r.Allow(ctx, endpoint, rps, burst); err != nil || !ok {
 		t.Errorf("a full concurrency cap refused a rate token (ok=%v, err=%v): the caps are independent", ok, err)
 	}
+}
+
+// pinnedAhead is how far ahead of the caller's clock the bucket legs below pin a
+// bucket's ts. rateScript refills from `now - ts` and clamps a negative elapsed to
+// zero, so a ts a minute ahead makes elapsed exactly 0 for a whole leg: for one of
+// those assertions to be wrong, a minute of wall clock must pass between two
+// statements of this file, whatever the box is doing. It is also a state
+// production can reach - a replica whose clock runs ahead writes exactly this.
+const pinnedAhead = time.Minute
+
+// seedBucket writes an endpoint's bucket hash directly: the {tokens, ts} a burst of
+// Allow calls would have left, without the round trips and without depending on
+// how long the previous call took.
+func seedBucket(t *testing.T, rdb *redis.Client, endpoint string, tokens float64, ahead time.Duration) {
+	t.Helper()
+	err := rdb.HSet(context.Background(), RPSKey(endpoint),
+		"tokens", tokens, "ts", time.Now().Add(ahead).UnixMilli()).Err()
+	if err != nil {
+		t.Fatalf("seed bucket %s: %v", endpoint, err)
+	}
+}
+
+// bucketTokens reads back the count the last call stored, so an assertion can name
+// the state the limiter left behind instead of only the boolean it returned.
+func bucketTokens(t *testing.T, rdb *redis.Client, endpoint string) float64 {
+	t.Helper()
+	raw, err := rdb.HGet(context.Background(), RPSKey(endpoint), "tokens").Result()
+	if err != nil {
+		t.Fatalf("HGET %s tokens: %v", RPSKey(endpoint), err)
+	}
+	got, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		t.Fatalf("bucket %s holds tokens=%q, which is not a number: %v", endpoint, raw, err)
+	}
+	return got
 }
 
 // FR-1307: the limit is a property of the ENDPOINT. Two endpoints do not share a
