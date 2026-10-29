@@ -28,8 +28,31 @@ func TestDedupeArchiveSizingAndGaugeAgree(t *testing.T) {
 	st := store.New(admin)
 	ctx := context.Background()
 
-	if _, err := admin.Exec(ctx, `truncate table events, deliveries cascade`); err != nil {
-		t.Fatalf("reset the event/delivery tables: %v", err)
+	// The state asserted on here is global, and deliberately so: FR-905's gauge is
+	// the WHOLE archive's pg_total_relation_size, the number an operator scrapes,
+	// so this fixture has to own the whole archive before it seeds - the same rule
+	// the store leaf fixtures follow for the day they assert on. `delivery_dedupe`
+	// is not part of the routing schema this truncate used to cover, and every
+	// ordinary drop of a `deliveries` partition in this shared test database copies
+	// that day's keys into it, so a day another package's tests dropped is still
+	// parked in the archive when this test starts: on a database a full `-p 1`
+	// suite had just used, the count below read 104,002 (measured). TRUNCATE on the
+	// parent clears every archive partition and the storage behind it, so both the
+	// row count and the per-pair byte figure are this run's rows alone - which is
+	// also what makes the test re-runnable (`-count=2`) against one database.
+	if _, err := admin.Exec(ctx, `truncate table events, deliveries, delivery_dedupe cascade`); err != nil {
+		t.Fatalf("reset the event/delivery/archive tables: %v", err)
+	}
+
+	// The reset is what makes the exact counts below mean anything, so assert it
+	// happened rather than trusting it: a resident row here would be counted below
+	// as if this run had seeded it.
+	var resident int64
+	if err := admin.QueryRow(ctx, `select count(*) from delivery_dedupe`).Scan(&resident); err != nil {
+		t.Fatalf("count the archive after the reset: %v", err)
+	}
+	if resident != 0 {
+		t.Fatalf("the archive holds %d pairs after the reset, want 0 (the counts below must be this run's own rows)", resident)
 	}
 
 	// The archive's day, three days back, so an hour-long deliveries window has
