@@ -196,9 +196,10 @@ FAIL §16    reconciliation: events 438998, outbox 438998 against 438997 accepte
 
 AC-34's criterion (goroutines bounded by the caps, FDs within the documented
 `ulimit`, CPU largely idle) is decided by `TestAttemptFanOutIsBounded`, which drives
-the literal 2,500 and passes in CI on this head; the harness's AC-34 line is its
-ingest-path proxy, so its FAIL is AC-30/AC-31's saturation seen a second time, not
-the bound.
+the literal 2,500; its runs, and the one failure among them (the CPU threshold, not
+the bound), are recorded under "AC-34 is measured at the criterion's own figure"
+below. The harness's AC-34 line is its ingest-path proxy, so its FAIL is
+AC-30/AC-31's saturation seen a second time, not the bound.
 
 ### Why the delivery number is 3.3% of the claim
 
@@ -292,18 +293,17 @@ Reported here so the gap is a sentence rather than a discovery:
   AC-43 scaling comparison only. That leg needs the instance to reach its ceiling,
   which the FR-818 gap above prevents. Recorded as a gap, not claimed.
 - **AC-34 is measured at the criterion's own figure, and the earlier reading of it
-  was wrong.** `TestAttemptFanOutIsBounded` (`internal/delivery`) now has three legs,
-  and the third drives AC-34's literal **2,500 due deliveries offered at once** to
-  one endpoint capped at 10. On this box that leg reported **peak 5 attempts in
-  flight, 39 goroutines, 34 open descriptors, 0.12 CPU cores**, with all 2,500
-  deliveries served, and `RLIMIT_NOFILE` at 524287/524288 entering the leg and
-  524288/524288 during it - the test raises the soft limit to the hard limit itself,
-  which needs no privilege, so "the limit was raised" is a fact in the log rather
-  than a claim in this document.
-  The two shorter legs are the bound: 20 offered gave 9 in flight / 55 goroutines /
-  42 descriptors, 120 offered gave 10 / 85 / 62, and 2,500 offered - twenty times
-  the load - gave 5 / 39 / 34. The footprint tracks *concurrency*, which is capped,
-  not the backlog behind it, and the peak never exceeded the endpoint's cap of 10.
+  was wrong.** `TestAttemptFanOutIsBounded` (`internal/delivery`) has three legs, and
+  the third drives AC-34's literal **2,500 due deliveries offered at once** to one
+  endpoint capped at 10. Legs 1 and 2 are the comparison: 20 offered gave peak 10
+  attempts in flight / 52 goroutines / 37 descriptors, 120 offered gave 10 / 87 / 61,
+  and 2,500 offered - twenty times the load - gave **5 / 41 / 36**, with all 2,500
+  deliveries served. The footprint tracks *concurrency*, which is capped, not the
+  backlog behind it, and the peak never exceeded the endpoint's cap of 10.
+  `RLIMIT_NOFILE` was 524287/524288 entering the literal leg and 524288/524288 during
+  it - the test raises the soft limit to the hard limit itself, which needs no
+  privilege, so "the limit was raised" is a fact in the log rather than a claim in
+  this document.
 
   An earlier version of this paragraph said that 2,500 in-flight attempts "hold
   roughly 5,000 descriptors" and that the run "needs the soft `ulimit -n` raised
@@ -312,23 +312,46 @@ Reported here so the gap is a sentence rather than a discovery:
   soft limit here is not 4096. The figures above are the correction, and the
   literal leg is now in the suite so the claim cannot drift back.
 
-  **Those peaks are one run's sample, not a fingerprint, and the leg is
-  load-sensitive in a way worth naming.** A repeat of the same three legs on the
-  same box reported 8 and 10 attempts in flight where this run reported 9 and 10,
-  44 and 78 goroutines where it reported 55 and 85, and 34 and 56 descriptors
-  where it reported 42 and 62 - the legs measure concurrency under a scheduler,
-  and the criterion's assertion is the bound (never above the endpoint's cap of
-  10; the footprint does not grow with the offered backlog), not the sample. A
-  third repeat failed the literal leg on its *wall-clock* deadline instead: with
-  this box also running another slice's `-race` suite (load average 18 on 2 vCPU)
-  251 of the 2,500 deliveries were still pending at the five-minute mark, and
-  that leg's footprint is never logged because the drain check comes first. That
-  is contention, not a broken bound - both legs that did report stayed inside the
-  cap, and neither the goroutine nor the descriptor ceiling was threatened - but
-  it makes this test a red on a box that is already saturated by someone else's
-  suite. The green it needs is a dedicated one, and it has it: the `ci` run on
-  this head exercises the whole package under `-race` on its own 2 vCPU runner and
-  passes.
+  **The drain is bounded by the property, not by the clock, and the leg is
+  load-sensitive in a way worth naming.** The wait ends when the receiver is idle,
+  every attempt has started and nothing is left pending; the 10-minute deadline
+  behind it is a hang escape, so a completed drain never spends it. Measured on this
+  box: **6m56.8s for the literal leg's drain at load average 15**, the property
+  breaking the loop 183 s before the escape, and 231 s for the whole test binary at
+  load ~3 (the pre-change baseline run on the same box). A repeat of the same three
+  legs on this box reported 8 and 10 attempts in flight where this run reported 10
+  and 10, 44 and 78 goroutines where it reported 52 and 87, and 34 and 56 descriptors
+  where it reported 37 and 61 - the legs measure concurrency under a scheduler, and
+  the criterion's assertion is the bound (never above the endpoint's cap of 10; the
+  footprint does not grow with the offered backlog), not the sample. The leg is slow
+  because the dispatch loop claims **one delivery per database round trip** - 2,500
+  of them drain at the box's claim rate, not at the endpoint's cap - and on a box
+  that is already saturated by someone else's `-race` suite (load average 18 on
+  2 vCPU, 251 of the 2,500 still pending at a five-minute mark) that rate collapses.
+  Both are contention over a claim path this criterion does not govern, not a broken
+  bound: the legs that reported stayed inside the cap, and neither the goroutine nor
+  the descriptor ceiling was threatened.
+
+  **AC-34's CPU clause is asserted comparatively, and the literal leg's absolute
+  figure is reported rather than asserted.** `cpuCores` is the whole test binary's
+  user+system CPU (the sampler, the in-process receiver, the Go runtime, the race
+  detector and the claim loop) over wall clock, so it lands on either side of half a
+  core on a shared 2 vCPU runner whether or not the bound holds: three runs of the
+  same file on the same head (`c807966`, the previous review's SHA) measured **0.44,
+  0.49 and 0.51 cores** on this leg - two passed, and the third failed a `0.5`
+  threshold while the bound held in all three (peaks of 3, 10 and 7 attempts in
+  flight, all 2,500 deliveries served, 45, 61 and 52 descriptors). A threshold sitting
+  on the sample's own boundary is a coin flip, and one high enough to survive the
+  spread stops biting, so that assertion is gone. What replaced it is the property the
+  clause is about: the process's CPU *rate* must not track the offered backlog. Legs 1
+  and 2 offer the same endpoint 20 and 120 deliveries at the same one second of
+  service, so they attempt at the same rate and must cost the same CPU per second; a
+  fan-out that paid per offered delivery would make the 6x leg cost about 6x the rate.
+  Those same three CI runs measured **0.12/0.12, 0.09/0.11 and 0.12/0.14 cores/s** on
+  that pair, against an allowance of twice the small leg's rate plus a fifth of a core,
+  and this box's latest run measured **0.08 and 0.13 cores/s**. The literal leg's
+  figure is logged either way: 0.13 cores over its 6m56.8s drain here, 0.44, 0.49 and
+  0.51 on CI.
 - **AC-43 (1 → 2 → 4 replicas scaling ≥ 80% per doubling, and no improvement above
   the Postgres ceiling)** needs more than one host, and `compare` needs at least
   two reports to say anything. This run is a single replica and cannot speak to it.
