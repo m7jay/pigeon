@@ -1059,8 +1059,9 @@ reason, so §16's table reads as one contiguous AC-44…AC-51 block and no crite
 restates another. AC-52 and AC-53 are the delivery-fairness criteria added by `SPEC.md`
 A-10 (FR-1303, FR-1304). They are integration-level - two endpoints, one capped, one
 healthy - so they are slice S11's exit rather than a load measurement; AC-16, AC-17 and
-AC-43 are measured on the 8 vCPU / 16 GB class by card `t_94f397ba`; S10 records them as
-deferred with the measured legs named (`t_bcfda850`), because this project has no host that
+AC-43 are measured on the 8 vCPU / 16 GB class by the operator on a rated host; S10 records them as
+deferred with the measured legs named (`t_bcfda850`) and the recipe preserved on the archived
+deferral card `t_94f397ba`, because this project has no host that
 carries the rating. AC-16's NFR-2 leg was blocked on S11, which has landed (PR #54); the
 measurement it enables is now waiting only on the rated host. The partition's boundary is
 part of S11's exit rather than an inference from the row: `R = clamp(PIGEON_DELIVERY_RETRY_CONCURRENCY,

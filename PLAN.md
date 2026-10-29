@@ -27,7 +27,7 @@ disagree, the requirements win and this file is wrong.
 | S7 | Replay (bounded, idempotent), inspect API, event-level rollup | AC-12, AC-13, AC-32 | S4 | — |
 | S8 | Partitioning, retention-by-disk, partition drop under the sweeper lease | AC-10, AC-18, AC-42 | S4 | — |
 | S9 | Portals — consumer portal (M2b) landed as `t_0eea0b84`; producer portal (M2a) is S9a `t_c0144baa` — scoped tokens, branding; **FR-106 optional OIDC login** and FR-111's password-reset flow (both deferred here — a second login method is a portal-visible feature, and neither exists in S1) | AC-38, AC-39, AC-40, AC-47 (AC-01 → S9a) | S3 | — |
-| S10 | Hardening: SSRF at three points, secret rotation, `doctor`, load test, fault-injection matrix in CI; **portal session security (FR-1009)** — `HttpOnly`/`Secure`/`SameSite=Lax` on every portal cookie, a CSRF token on every state-changing POST, cookie lifetime read from the core's `expires_at` | AC-19, AC-22, AC-34, AC-49, AC-50, AC-51 (AC-30 → S12, its graded run `t_0bf3effa`; AC-31's honest-reporting clause here, its 245/250 + NFR-1 leg → `t_b9850e1b` and S12; AC-43 → `t_94f397ba`) | S5…S9 | — |
+| S10 | Hardening: SSRF at three points, secret rotation, `doctor`, load test, fault-injection matrix in CI; **portal session security (FR-1009)** — `HttpOnly`/`Secure`/`SameSite=Lax` on every portal cookie, a CSRF token on every state-changing POST, cookie lifetime read from the core's `expires_at` | AC-19, AC-22, AC-34, AC-49, AC-50, AC-51 (AC-30 → S12, its graded run `t_0bf3effa`; AC-31's honest-reporting clause here, its 245/250 + NFR-1 leg → `t_b9850e1b` and S12; AC-43 → the operator on a rated host) | S5…S9 | — |
 | S11 | Delivery fairness (**FR-1303**, **FR-1304**): stop parking the dispatch path on a capped endpoint, split the attempt budget into a first-attempt lane and a retry lane, and make a hold visible | AC-52, AC-53 | S5 | — |
 | S12 | Bounded write budget (**FR-818**, amended by `SPEC.md` A-11): one fixed-capacity write budget per process with a fixed worker pool, batched control-state writes (the fan-out insert and the delivery completion/terminal updates), and an ingest admission deadline that sheds `429`/`over_capacity` instead of parking on the pgx pool; `PIGEON_DB_MAX_CONNS` 10 → 40 | AC-30 (its mechanism - the graded run is card `t_0bf3effa`), FR-815's control-state leg, FR-818 | S5…S8, and `t_b9850e1b`'s relay loop for the fan-out batch | — |
 
@@ -90,7 +90,8 @@ disposes of them, and the split is deliberate:
 is measured in S10, and its NFR-2 leg (normal publish to first attempt ≤ 60 s) could not pass
 while the dispatch path parked behind the first capped endpoint. S11 was a precondition for that
 measurement, not a replacement for it. AC-16, AC-17 and AC-43 are measured on the 8 vCPU / 16 GB
-class by card `t_94f397ba`; S10 records them as deferred with the measured legs named (`t_bcfda850`),
+class by the operator on a rated host; S10 records them as deferred with the measured legs named
+(`t_bcfda850`) and the recipe preserved on the archived deferral card `t_94f397ba`,
 because this project has no host that carries the rating. AC-16's NFR-2 leg was blocked on S11,
 which has landed (PR #54); the measurement it enables is now waiting only on the rated host. Whether
 that re-gates S10's `Depends on` was the leader's call and is answered by the disposition ruling:
@@ -249,7 +250,7 @@ Per-requirement map, corrected:
 | OPS-11 | `TestObservedValuesAreSingleLine`, `TestNoSecretAppearsInAnyRendering`, `TestNothingToObserveIsExitThree`, `TestJSONMatchesTheLineOutput`, `TestChecksAreBoundedAndOrdered` |
 | AC-22 | OPS-4's rows; `TestAConfiguredDependencyThatWillNotAnswerIsAFailure` and `TestArithmeticChecksSkipWhenTheConfigurationDidNotLoad` pin the two kinds of silence |
 | AC-30, AC-31, AC-34 | `docs/load-test.md` and the runnable harness `cmd/loadgen` (`run`, `seed`, `sink`, `compare`); the document reports what was measured; AC-34 is measured by `TestAttemptFanOutIsBounded` (its literal 2,500 leg included) and AC-30's ceiling comparison is a harness gap owned by `t_8e39d4eb` |
-| AC-43 | **not measured here** - one host cannot show per-doubling scaling; `docs/load-test.md` says so; owned by `t_94f397ba`, with AC-16/AC-17 |
+| AC-43 | **not measured here** - one host cannot show per-doubling scaling; `docs/load-test.md` says so; owned by the operator on a rated host, with AC-16/AC-17 |
 | §16.5 / AC-42 | `internal/faults/faults_test.go` behind `-tags faults`, run nightly by `.github/workflows/nightly-faults.yml` |
 
 Honest limits — the next slices own these:

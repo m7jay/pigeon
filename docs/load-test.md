@@ -364,14 +364,14 @@ Reported here so the gap is a sentence rather than a discovery:
 - **AC-43 (1 → 2 → 4 replicas scaling ≥ 80% per doubling, and no improvement above
   the Postgres ceiling)** needs more than one host, and `compare` needs at least
   two reports to say anything. This run is a single replica and cannot speak to it.
-  Owned by `t_94f397ba`, with AC-16 and AC-17 (`t_bcfda850`).
+  Owned by the operator on a rated host, with AC-16 and AC-17 (`t_bcfda850`).
 - **AC-16 and AC-17 were this card's to record, and this box cannot rate them.**
   Both are recorded here explicitly rather than dropped: `PLAN.md`'s slice notes
   and S11's card both said AC-16 and AC-17 remain S10's measurements, and silence
   in this document would delete two criteria from the project. Each is split into the part
   that is measured, the part that is unmeasurable here, and the part that needs the
   rated host - all three are dispositioned on `t_bcfda850`, and the unmeasured parts
-  move to `t_94f397ba`.
+  move to the operator on a rated host.
   - **AC-16** asks for 1,000 events/s with 10 subscriptions and one hanging endpoint
     on **8 vCPU / 16 GB**. This box is 2 vCPU / 7.9 GB, a quarter of the cores, and
     it accepted 207.1 of 250 offered events/s with a 4.3 s p99: a 1,000 events/s run
@@ -390,12 +390,15 @@ Reported here so the gap is a sentence rather than a discovery:
       `acquireEndpointLimits` wait that used to park the process's only dispatch
       loop. The measurement it enables is now waiting only on the 8 vCPU / 16 GB
       reference host.
-    - **Owner: `t_94f397ba`** (pigeon-ops), which owns AC-16, AC-17 and AC-43 on
-      that machine class and blocks `capability` rather than measuring on this box.
+    - **Owner: the operator on a rated host.** AC-16, AC-17 and AC-43 are measured
+      there, not on this box; the deferral card `t_94f397ba` was archived after it
+      blocked `capability`, and its comment keeps the reproduction recipe (harness,
+      seed, sinks, the rated `run` invocation, `compare` for AC-43, AC-17's
+      differential leg, and the instance-side env block).
 
     **Disposition (`t_bcfda850`):** the split above is accepted as S10's recording -
-    the two measured legs stand, and the remaining legs are deferred to
-    `t_94f397ba` with the measured legs named. AC-16 is not S10's exit leg.
+    the two measured legs stand, and the remaining legs are deferred to the operator
+    on a rated host with the measured legs named. AC-16 is not S10's exit leg.
   - **AC-17** asks that with one producer at 50% of the load the other producer's
     p99 degrades by <= 20%. It is not a machine rating, but it *is* a differential
     measurement, and on a box already saturated at 207 of 250 events/s with a 4.3 s
@@ -404,9 +407,9 @@ Reported here so the gap is a sentence rather than a discovery:
     than producer isolation. It needs a host with headroom at the rated load (the
     8 vCPU class again) and two independent generators.
 
-    **Disposition (`t_bcfda850`):** AC-17 moves to `t_94f397ba` and is measured on
-    the 8 vCPU / 16 GB host with two independent generators. It is not claimed by
-    this run and is not S10's exit leg.
+    **Disposition (`t_bcfda850`):** AC-17 moves to the operator on a rated host and
+    is measured on the 8 vCPU / 16 GB host with two independent generators. It is
+    not claimed by this run and is not S10's exit leg.
 - **A first full run was discarded, and why it is worth saying so.** It was taken
   while the test suites were also running on the same 2 vCPU box, which is a
   measurement error: the instance shared its cores with `go test`. It also exposed
