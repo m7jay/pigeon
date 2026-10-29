@@ -1,12 +1,14 @@
 BINARY     := bin/pigeon
 PORTAL     := bin/consumer-portal
+PRODUCER_PORTAL := bin/producer-portal
 VERSION    := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS    := -s -w -X main.version=$(VERSION)
 
-.PHONY: build test test-integration vet lint run run-portal compose-up compose-down migrate-check clean
+.PHONY: build test test-integration vet lint run run-portal run-producer-portal compose-up compose-down migrate-check clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/pigeon
+	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(PRODUCER_PORTAL) ./cmd/producer-portal
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(PORTAL) ./cmd/consumer-portal
 
 test:
@@ -33,6 +35,11 @@ run:
 # sensible local defaults are used when the env is unset.
 run-portal:
 	CGO_ENABLED=0 PIGEON_CORE_API_URL=$${PIGEON_CORE_API_URL:-http://localhost:8080} PORTAL_SESSION_SECRET=$${PORTAL_SESSION_SECRET:-dev-insecure-secret} go run ./cmd/consumer-portal
+
+# Run the producer portal locally. Same shape as run-portal: it needs a reachable
+# core and a session secret; sensible local defaults are used when the env is unset.
+run-producer-portal:
+	CGO_ENABLED=0 PIGEON_CORE_API_URL=$${PIGEON_CORE_API_URL:-http://localhost:8080} PIGEON_PRODUCER_PORTAL_SESSION_SECRET=$${PIGEON_PRODUCER_PORTAL_SESSION_SECRET:-dev-insecure-secret} go run ./cmd/producer-portal
 
 compose-up:
 	docker compose up -d --build

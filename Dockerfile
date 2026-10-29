@@ -19,6 +19,12 @@ RUN CGO_ENABLED=0 go build -trimpath \
 RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags "-s -w -X main.version=${VERSION}" \
       -o /out/consumer-portal ./cmd/consumer-portal
+# The producer portal is the third deployable in the same image (§14, AC-40):
+# like the consumer portal, a stateless proxy with no database, started by
+# overriding the command.
+RUN CGO_ENABLED=0 go build -trimpath \
+      -ldflags "-s -w -X main.version=${VERSION}" \
+      -o /out/producer-portal ./cmd/producer-portal
 
 FROM alpine:3.20 AS certs
 RUN apk add --no-cache ca-certificates
@@ -27,9 +33,10 @@ FROM scratch
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/pigeon /pigeon
 COPY --from=build /out/consumer-portal /consumer-portal
+COPY --from=build /out/producer-portal /producer-portal
 
-# Non-root, no shell, no package manager: both binaries are outbound-only static
-# Go processes with no reason to own anything in the image.
+# Non-root, no shell, no package manager: every binary is an outbound-only static
+# Go process with no reason to own anything in the image.
 USER 65532:65532
-EXPOSE 8080 8082
+EXPOSE 8080 8082 8083
 ENTRYPOINT ["/pigeon"]

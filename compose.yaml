@@ -1,9 +1,11 @@
 # Pigeon — reference deployment (OPS-1, §2.1).
 #
 # Five containers on one modest host: core, producer portal, consumer portal,
-# Postgres, Redis. The portals are separate deployables (§14) and arrive in M2a
-# and M2b; until then this file brings up the three that exist, so `compose up`
-# is always a working command rather than an aspirational one.
+# Postgres, Redis. The portals are separate deployables (§14, M2a and M2b) that
+# may each be omitted (AC-40): the core keeps serving both APIs with the same
+# scoping, and whoever had a UI simply has none. The image builds all three
+# binaries (§14, AC-40), so a deployment starts the containers it wants and this
+# file brings up all five.
 
 name: pigeon
 
@@ -89,7 +91,57 @@ services:
       timeout: 3s
       retries: 5
 
-  # producer-portal:   # M2a — UI-1…UI-11 (a later slice; not built yet)
+  # The producer portal (M2a, UI-1…UI-11). A separate, independently themeable
+  # deployable that is a thin client of the core API. It may be removed entirely:
+  # the core keeps serving the producer API with the same scoping, and producer
+  # members simply have no UI (AC-40).
+  producer-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # The base URL of the core API on the compose network. The portal never
+      # touches Postgres or Redis: it is a stateless proxy of the core, holds no
+      # database and runs no workers.
+      PIGEON_CORE_API_URL: http://core:8080
+      # Encrypts the producer session cookie (AES-256-GCM, internal/portal). Must
+      # be set and kept stable across restarts; changing it logs every user out.
+      PIGEON_PRODUCER_PORTAL_SESSION_SECRET: ${PIGEON_PRODUCER_PORTAL_SESSION_SECRET:?PIGEON_PRODUCER_PORTAL_SESSION_SECRET must be set}
+      # Producer branding the producer portal carries (UI-17). All optional: an
+      # unset value falls back to a neutral wordmark with no Pigeon branding.
+      PORTAL_BRAND_NAME: ${PORTAL_BRAND_NAME:-}
+      PORTAL_BRAND_ACCENT: ${PORTAL_BRAND_ACCENT:-}
+      PORTAL_BRAND_LOGO_URL: ${PORTAL_BRAND_LOGO_URL:-}
+      PORTAL_BRAND_COMPANY: ${PORTAL_BRAND_COMPANY:-}
+      # The plane the portal starts in (test or live). A default, not a decision:
+      # the signed-in human switches planes and every call carries the plane
+      # explicitly (FR-103), so this only decides where a fresh visitor lands.
+      PIGEON_PRODUCER_PORTAL_ENV: ${PIGEON_PRODUCER_PORTAL_ENV:-test}
+      # FR-106's optional OIDC login, all optional together: with no issuer the
+      # portal renders no OIDC control and the core answers 404 for
+      # POST /v1/session/oidc, so an instance without an IdP loses nothing.
+      PIGEON_OIDC_ISSUER: ${PIGEON_OIDC_ISSUER:-}
+      PIGEON_OIDC_CLIENT_ID: ${PIGEON_OIDC_CLIENT_ID:-}
+      # The client secret stays here, in the portal (the relying party), and is
+      # deliberately not passed to the core: the core only verifies the id_token
+      # the portal obtained, so it never holds the value that lets a caller speak
+      # for this portal at the issuer.
+      PIGEON_OIDC_CLIENT_SECRET: ${PIGEON_OIDC_CLIENT_SECRET:-}
+      PIGEON_OIDC_REDIRECT_URL: ${PIGEON_OIDC_REDIRECT_URL:-}
+      PIGEON_OIDC_SCOPES: ${PIGEON_OIDC_SCOPES:-}
+    ports:
+      - "8083:8083"
+    depends_on:
+      core:
+        condition: service_healthy
+    healthcheck:
+      # The image is scratch: no shell, curl or wget, so the binary answers its
+      # own liveness rather than running a shell script (cmd/producer-portal).
+      test: ["CMD", "/producer-portal", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   # The consumer portal (M2b, UI-12…UI-19). A separate, independently themeable
   # deployable that is a thin client of the core API. It may be removed entirely:
