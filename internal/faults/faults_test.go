@@ -44,6 +44,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/m7jay/pigeon/internal/db"
 	"github.com/m7jay/pigeon/internal/retention"
 	"github.com/m7jay/pigeon/internal/store"
 )
@@ -77,6 +78,29 @@ type tenant struct {
 	adminDSN string
 }
 
+// migrateTestDatabase applies the migration set to the disposable test database.
+//
+// The matrix opens the test database directly rather than through the HTTP
+// harness, so it owns its own schema: store, relay, delivery and httpapi all
+// migrate the database they are pointed at, and this package did not. That made
+// "pass" depend on an earlier suite having migrated first. A fresh CI service
+// container is exactly the opposite case - the nightly job runs this package
+// first, against an empty postgres:16 - and six of the eight scenarios failed
+// there with `relation "producers" does not exist` (42P01). Migrating here is the
+// same contract as the other harnesses: the database named by
+// PIGEON_TEST_DATABASE_URL is disposable and this package prepares it.
+//
+// It runs per tenant rather than behind a sync.Once: the set is idempotent and
+// cheap after the first call (db.Migrate skips applied versions by checksum), and
+// an Once whose first call failed would leave the remaining scenarios running
+// against an unmigrated database and reporting the wrong failure.
+func migrateTestDatabase(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	if err := db.Migrate(ctx, pool, 30*time.Second); err != nil {
+		t.Fatalf("migrate the disposable test database: %v", err)
+	}
+}
+
 func newTenant(t *testing.T, slug string) *tenant {
 	t.Helper()
 	ctx := context.Background()
@@ -86,6 +110,7 @@ func newTenant(t *testing.T, slug string) *tenant {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	migrateTestDatabase(t, ctx, pool)
 
 	// Every tenant is a FRESH producer, per run. The alternative - a fixed slug plus
 	// a cleanup of the previous run's rows - makes a re-run depend on the previous
