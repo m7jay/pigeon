@@ -169,7 +169,7 @@ func TestClassPreflightRefusesAMachineThatDoesNotCarryTheClass(t *testing.T) {
 	if unrated == "" {
 		t.Fatalf("every §8.1 row matches %s, so this test cannot build an unrated claim", m.describe())
 	}
-	_, err := classPreflight(config{
+	_, _, err := classPreflight(config{
 		Class: unrated, Subs: classSubs, DB: "postgres://user@localhost/db",
 		BaseURL: "http://127.0.0.1:8080",
 	})
@@ -182,9 +182,10 @@ func TestClassPreflightRefusesAMachineThatDoesNotCarryTheClass(t *testing.T) {
 		}
 	}
 	// The mirror: a class the machine *does* carry is accepted, with the class
-	// observed rather than attested (the generator is on the machine under test here).
+	// observed rather than attested (the generator is on the machine under test here)
+	// and the machine under test resolved from the machine this process describes.
 	if carried := observedClass(m); carried != "" {
-		claim, err := classPreflight(config{
+		claim, sut, err := classPreflight(config{
 			Class: carried, Subs: classSubs, DB: "postgres://user@localhost/db",
 			BaseURL: "http://127.0.0.1:8080",
 		})
@@ -195,6 +196,105 @@ func TestClassPreflightRefusesAMachineThatDoesNotCarryTheClass(t *testing.T) {
 			t.Errorf("claim on %s = evidence %q, generator_on_sut %v; want observed/true for a loopback run",
 				carried, claim.Evidence, claim.GeneratorOnSUT)
 		}
+		if sut.Source != machineObserved || sut.CPUs != m.CPUs {
+			t.Errorf("machine under test for %s = %s, want the observed %s", carried, sut.describe(), m.describe())
+		}
+	}
+}
+
+// TestClassPreflightRequiresTheMachineUnderTestWhenTheGeneratorIsOffIt is the class
+// gate's other half. §12 puts the generator off the machine under test, and this
+// harness *is* the generator: the machine block then describes the generator's box,
+// so a graded run has to declare the machine the class is claimed for, and the class
+// is checked against that declaration - not against the machine the generator
+// happened to run on.
+func TestClassPreflightRequiresTheMachineUnderTestWhenTheGeneratorIsOffIt(t *testing.T) {
+	base := func() config {
+		// A non-loopback address: the generator is off the machine under test.
+		return config{Class: "8vCPU-16GB", Subs: classSubs, DB: "postgres://user@localhost/db",
+			BaseURL: "http://192.0.2.10:8080"}
+	}
+	// No declaration: refused, and the refusal names the flags.
+	if _, _, err := classPreflight(base()); err == nil || !strings.Contains(err.Error(), "-sut-cpus") {
+		t.Fatalf("an attested class with no machine under test: err = %v, want a refusal naming -sut-cpus", err)
+	}
+	// Half a machine is not a machine.
+	c := base()
+	c.SUTCPUs = 8
+	if _, _, err := classPreflight(c); err == nil || !strings.Contains(err.Error(), "together") {
+		t.Fatalf("-sut-cpus without -sut-mem-gib: err = %v, want a refusal saying they go together", err)
+	}
+	// The declared machine carries the class: accepted, attested, and the machine
+	// under test is the declaration.
+	c = base()
+	c.SUTCPUs, c.SUTMemGiB = 8, 16
+	claim, sut, err := classPreflight(c)
+	if err != nil {
+		t.Fatalf("-sut-cpus 8 -sut-mem-gib 16 on the 8 vCPU row: %v", err)
+	}
+	if claim.Evidence != "attested" || claim.GeneratorOnSUT {
+		t.Errorf("claim = evidence %q / generator_on_sut %v, want attested/false", claim.Evidence, claim.GeneratorOnSUT)
+	}
+	if sut.Source != machineDeclared || sut.CPUs != 8 || sut.MemMiB != 16*1024 {
+		t.Errorf("machine under test = %s, want the declared 8 vCPU / 16 GiB", sut.describe())
+	}
+	if claim.Note == "" || !strings.Contains(claim.Note, "attested") {
+		t.Errorf("the claim does not say the class is attested: %q", claim.Note)
+	}
+	// The declared machine does not carry the class: refused, and unlike the
+	// generator's own box this refusal is about the machine under test.
+	c = base()
+	c.SUTCPUs, c.SUTMemGiB = 2, 4
+	if _, _, err := classPreflight(c); err == nil || !strings.Contains(err.Error(), "does not carry") {
+		t.Fatalf("a 2 vCPU / 4 GiB machine under test claiming the 8 vCPU row: err = %v, want a refusal naming the class", err)
+	}
+}
+
+// TestSUTDeclarationMustAgreeWithTheObservedMachine: when the generator shared the
+// machine under test, the machine under test is the machine this process can see, and
+// a declaration that disagrees with it is refused - otherwise a run could describe a
+// 2 vCPU box in the machine block and claim another class in a flag.
+func TestSUTDeclarationMustAgreeWithTheObservedMachine(t *testing.T) {
+	m := describeMachine()
+	if _, _, err := classPreflight(config{
+		Class: "8vCPU-16GB", Subs: classSubs, DB: "postgres://user@localhost/db",
+		BaseURL: "http://127.0.0.1:8080", // loopback: the generator shares the machine
+		SUTCPUs: m.CPUs + 4, SUTMemGiB: float64(m.MemMiB) / 1024,
+	}); err == nil || !strings.Contains(err.Error(), "-sut-cpus") {
+		t.Fatalf("a -sut-cpus that disagrees with the observed machine: err = %v, want a refusal naming -sut-cpus", err)
+	}
+	// The agreement case is accepted, and the class gate then does the deciding.
+	if _, _, err := classPreflight(config{
+		Class: "8vCPU-16GB", Subs: classSubs, DB: "postgres://user@localhost/db",
+		BaseURL: "http://127.0.0.1:8080",
+		SUTCPUs: m.CPUs, SUTMemGiB: float64(m.MemMiB) / 1024,
+	}); err == nil || !strings.Contains(err.Error(), "does not carry") {
+		t.Fatalf("an agreeing declaration on %s: err = %v, want the class refusal (this box carries no §8.1 row)", m.describe(), err)
+	}
+}
+
+// TestDeclaredSUTNeedsBothFiguresAndIsRecorded: -sut-cpus/-sut-mem-gib are recorded
+// as machine_under_test with their source, and half a declaration is refused rather
+// than completed with a guess.
+func TestDeclaredSUTNeedsBothFiguresAndIsRecorded(t *testing.T) {
+	m, ok, err := config{SUTCPUs: 8, SUTMemGiB: 16}.declaredSUT()
+	if err != nil || !ok {
+		t.Fatalf("declaredSUT(8, 16) = %v/%v, want an 8 vCPU / 16 GiB machine: %v", ok, m.describe(), err)
+	}
+	if m.CPUs != 8 || m.MemMiB != 16*1024 || m.Source != machineDeclared || m.ObservedClass != "8vCPU-16GB" {
+		t.Errorf("declaredSUT(8, 16) = %+v, want 8 vCPU / 16384 MiB, source declared, class 8vCPU-16GB", m)
+	}
+	// A fractional declaration is allowed: a host that reports 15.3 GiB is a 16 GB box.
+	if m, ok, err := (config{SUTCPUs: 8, SUTMemGiB: 15.3}).declaredSUT(); err != nil || !ok || m.MemMiB != 15667 {
+		t.Errorf("declaredSUT(8, 15.3) = %v/%d/%v, want an 8 vCPU / 15667 MiB machine", ok, m.MemMiB, err)
+	}
+	for _, c := range []config{{SUTCPUs: 8}, {SUTMemGiB: 16}, {SUTCPUs: -1, SUTMemGiB: 16}} {
+		if _, ok, err := c.declaredSUT(); err == nil || ok {
+			t.Errorf("declaredSUT(%+v) = %v/%v, want a refusal", c, ok, err)
+		}
+	}
+	if _, ok, err := (config{}).declaredSUT(); ok || err != nil {
+		t.Errorf("declaredSUT(nothing) = %v/%v, want no declaration and no error", ok, err)
 	}
 }
 
@@ -208,17 +308,17 @@ func TestClassPreflightRequiresSection81BasisAndTheDatabase(t *testing.T) {
 	}
 	c := base()
 	c.Subs = 1
-	if _, err := classPreflight(c); err == nil || !strings.Contains(err.Error(), "10 subscriptions") {
+	if _, _, err := classPreflight(c); err == nil || !strings.Contains(err.Error(), "10 subscriptions") {
 		t.Errorf("-subs 1 with -class: err = %v, want a refusal naming §8.1's 10-subscription basis", err)
 	}
 	c = base()
 	c.DB = ""
-	if _, err := classPreflight(c); err == nil || !strings.Contains(err.Error(), "-db") {
+	if _, _, err := classPreflight(c); err == nil || !strings.Contains(err.Error(), "-db") {
 		t.Errorf("-class without -db: err = %v, want a refusal naming the database", err)
 	}
 	c = base()
 	c.Class = "3vCPU-6GB"
-	if _, err := classPreflight(c); err == nil || !strings.Contains(err.Error(), "3vCPU-6GB") {
+	if _, _, err := classPreflight(c); err == nil || !strings.Contains(err.Error(), "3vCPU-6GB") {
 		t.Errorf("-class 3vCPU-6GB: err = %v, want a refusal naming the table", err)
 	}
 }
@@ -264,12 +364,17 @@ func TestGeneratorOnSUTResolvesFromBaseAndFlag(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // classArtifact builds the artifact `run -class` would write: §12's windows, a
-// declared class, and a graded window reconciled against the database. The two units
-// are passed as *counts* over the 600 s window, so the expected rates are exact and
-// the tolerance's boundary can be tested without floating-point drift.
+// declared class, a machine under test, and a graded window reconciled against the
+// database. The two units are passed as *counts* over the 600 s window, so the
+// expected rates are exact and the tolerance's boundary can be tested without
+// floating-point drift.
 //
 // onSUT is §12's generator fact. When it is true the generator shared the machine
-// under test, which makes the class observable - and the run a lower bound.
+// under test, which makes the class observable - and the run a lower bound, so the
+// machine block and the machine under test are one machine. When it is false the
+// generator ran off the machine under test (§12's arrangement): the block describes
+// the *generator's* box - deliberately a box that carries no §8.1 row - and the
+// machine the class is claimed for is the declared one.
 func classArtifact(t *testing.T, className string, events, deliveries int64, onSUT bool) *report {
 	t.Helper()
 	row, ok := lookupClass(className)
@@ -285,13 +390,24 @@ func classArtifact(t *testing.T, className string, events, deliveries int64, onS
 		Subs: classSubs, WarmupS: classWarmupS, MeasureS: classMeasureS,
 		EvaluateS: classEvaluateS, Concurrency: 512,
 	}
-	// The machine block the harness records. For an observed class it is the graded
-	// machine; for an attested one the generator's box happens to be the same class.
-	r.Machine = machine{
+	sut := machine{
 		Hostname: "sut", CPUs: row.CPUs, MemMiB: int64(row.MemGiB) * 1024,
 		MemHostMiB: int64(row.MemGiB) * 1024, ObservedClass: row.Name,
-		Kernel: "linux fixture", Go: runtime.Version(),
 	}
+	if onSUT {
+		sut.Source = machineObserved
+		r.MachineUnderTest = &sut
+		r.Machine = sut
+	} else {
+		sut.Source = machineDeclared
+		r.MachineUnderTest = &sut
+		// The generator's box, which is not the machine being graded: 2 vCPU / 7.75
+		// GiB matches no §8.1 row, so an artifact that checked the class against the
+		// block instead of the machine under test cannot pass by accident.
+		r.Machine = machine{Hostname: "generator", CPUs: 2, MemMiB: 7936}
+	}
+	r.Machine.Kernel = "linux fixture"
+	r.Machine.Go = runtime.Version()
 	// The graded window: the last 10 minutes, reconciled against the database (§16).
 	r.Graded = reconcile{Events: events, Outbox: events, Deliveries: deliveries}
 	fillRate(&r.Graded, window{
@@ -370,22 +486,29 @@ func TestGradeReadsTheTargetFromTheTableNotTheArtifact(t *testing.T) {
 }
 
 // TestGradeFailsWhenTheMachineDoesNotCarryTheClass is the clause's own failure mode,
-// asserted at the verdict as well as at the preflight: the harness records the
-// machine and refuses a class that machine does not carry.
+// asserted at the verdict as well as at the preflight: the machine under test is
+// recorded, and a class that machine does not carry is refused rather than graded.
+//
+// The fixture is §12's arrangement - the generator off the machine under test - so
+// the machine block is the generator's box and the class is checked against the
+// declared machine under test. That is the case the clause is graded from, and the
+// case that used to be unchecked.
 func TestGradeFailsWhenTheMachineDoesNotCarryTheClass(t *testing.T) {
 	cases := []struct {
 		name    string
 		machine machine
 		want    []string
 	}{
-		{"a 2 vCPU box claiming the 8 vCPU row", machine{Hostname: "shared-box", CPUs: 2, MemMiB: 7936},
+		{"a 2 vCPU machine under test claiming the 8 vCPU row", machine{Hostname: "sut", CPUs: 2, MemMiB: 7936},
 			[]string{"8vCPU-16GB", "2 vCPU"}},
-		{"enough cores, the wrong RAM", machine{Hostname: "shared-box", CPUs: 8, MemMiB: 40 * 1024},
+		{"enough cores, the wrong RAM", machine{Hostname: "sut", CPUs: 8, MemMiB: 40 * 1024},
 			[]string{"8vCPU-16GB", "RAM"}},
 	}
 	for _, tc := range cases {
-		r := classArtifact(t, "8vCPU-16GB", 600000, 6000000, true)
-		r.Machine = tc.machine
+		r := classArtifact(t, "8vCPU-16GB", 600000, 6000000, false)
+		sut := tc.machine
+		sut.Source = machineDeclared
+		r.MachineUnderTest = &sut
 		cmp := compareClass(r)
 		if cmp.Verdict.OK {
 			t.Fatalf("%s: a number on a machine that does not carry the class was graded green: %s", tc.name, cmp.Verdict.Detail)
@@ -402,19 +525,65 @@ func TestGradeFailsWhenTheMachineDoesNotCarryTheClass(t *testing.T) {
 	}
 }
 
+// TestGradeRefusesAnAttestedClassWithNoMachineUnderTest: an artifact can attest a
+// class on a machine the generator never saw - that is §12's arrangement and the only
+// one clause 3 is graded from - so the machine the class is claimed for has to be in
+// the artifact. Without it there is nothing to check the class against, and a run on
+// an unrated box would be graded green on the generator's machine block: exactly the
+// failure mode the clause exists to prevent.
+func TestGradeRefusesAnAttestedClassWithNoMachineUnderTest(t *testing.T) {
+	r := classArtifact(t, "8vCPU-16GB", 600000, 6000000, false) // otherwise exactly on the row
+	r.MachineUnderTest = nil
+	cmp := compareClass(r)
+	if cmp.Verdict.OK {
+		t.Fatalf("an attested class with no machine under test was graded green: %s", cmp.Verdict.Detail)
+	}
+	joined := strings.Join(cmp.Blockers, "; ")
+	for _, want := range []string{"no machine under test", "-sut-cpus"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the blocker does not mention %q: %s", want, joined)
+		}
+	}
+	if cmp.Evidence != "attested" {
+		t.Errorf("class evidence = %q, want attested (the generator ran off the machine under test)", cmp.Evidence)
+	}
+}
+
 // TestGradeChecksTheMachineWhenTheArtifactRecordsNoClassEvidence: an artifact from a
 // build that did not record how the class was evidenced is checked rather than
 // trusted, because the failure it could be hiding is the one the clause exists for.
 func TestGradeChecksTheMachineWhenTheArtifactRecordsNoClassEvidence(t *testing.T) {
 	r := classArtifact(t, "8vCPU-16GB", 600000, 6000000, false)
 	r.Class.Evidence = ""
-	r.Machine = machine{Hostname: "unrated", CPUs: 2, MemMiB: 7936}
+	sut := machine{Hostname: "unrated", CPUs: 2, MemMiB: 7936, Source: machineDeclared}
+	r.MachineUnderTest = &sut
 	cmp := compareClass(r)
 	if cmp.Verdict.OK {
-		t.Fatalf("an artifact with no class evidence was graded green on %s", r.Machine.describe())
+		t.Fatalf("an artifact with no class evidence was graded green on %s", r.MachineUnderTest.describe())
 	}
 	if !strings.Contains(strings.Join(cmp.Blockers, "; "), "8vCPU-16GB") {
 		t.Errorf("the blockers do not name the claimed class: %v", cmp.Blockers)
+	}
+}
+
+// TestGradeRefusesAnObservedClassOnAnUnratedMachine: "observed" means the class was
+// checked against the machine the generator ran on, so an artifact whose two machine
+// blocks disagree is not describing one machine - and the class gate reads the
+// machine under test, so a doctored pair must not pass.
+func TestGradeRefusesAnObservedClassOnAnUnratedMachine(t *testing.T) {
+	r := classArtifact(t, "8vCPU-16GB", 600000, 6000000, true)
+	// The machine block is the box the harness actually ran on, while the machine
+	// under test is the declared row: an observed class must be one machine.
+	r.Machine = machine{Hostname: "real-box", CPUs: 2, MemMiB: 7936}
+	cmp := compareClass(r)
+	if cmp.Verdict.OK {
+		t.Fatalf("an observed class whose machine blocks disagree was graded green: %s", cmp.Verdict.Detail)
+	}
+	joined := strings.Join(cmp.Blockers, "; ")
+	for _, want := range []string{"observed", "disagree"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the blocker does not mention %q: %s", want, joined)
+		}
 	}
 }
 
@@ -459,6 +628,8 @@ func TestGradeRefusesRunsThatCannotSupportTheClaim(t *testing.T) {
 		{"the graded window was never reconciled", func(r *report) {
 			r.Graded = reconcile{Note: "no -db given; the accepted count was not reconciled against the database"}
 		}, "not reconciled against the database"},
+		{"no machine under test recorded", func(r *report) { r.MachineUnderTest = nil },
+			"records no machine under test"},
 	}
 	for _, tc := range cases {
 		r := classArtifact(t, "8vCPU-16GB", 600000, 6000000, false)
@@ -671,13 +842,14 @@ func TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase(t *testing.T) {
 	defer srv.Close()
 
 	row, _ := lookupClass("2vCPU-4GB")
+	sut := machine{CPUs: 2, MemMiB: 4 * 1024, Source: machineDeclared}
 	c := config{
 		BaseURL: srv.URL, Key: "fixture-key", EventType: "load.created",
 		Rate: 60, Subs: classSubs, PayloadBytes: referencePayloadBytes,
 		Warmup: 200 * time.Millisecond, Measure: 700 * time.Millisecond,
 		Evaluate: 300 * time.Millisecond, Concurrency: 8,
 		RequestTimeout: 2 * time.Second, Settle: 0, Label: "fixture",
-		Claim: row.claim(false, "flag"),
+		Claim: row.claim(false, "flag"), SUT: &sut,
 	}
 	rep, err := runLoad(c)
 	if err != nil {
@@ -685,6 +857,9 @@ func TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase(t *testing.T) {
 	}
 	if rep.Class == nil || rep.Class.Name != row.Name {
 		t.Fatalf("the artifact's class claim = %+v, want %s", rep.Class, row.Name)
+	}
+	if rep.MachineUnderTest == nil || rep.MachineUnderTest.CPUs != 2 || rep.MachineUnderTest.Source != machineDeclared {
+		t.Fatalf("the artifact's machine under test = %+v, want the declared 2 vCPU / 4 GiB machine", rep.MachineUnderTest)
 	}
 	if rep.Class.Evidence != "attested" || rep.Class.GeneratorOnSUT {
 		t.Errorf("claim evidence = %q / generator_on_sut %v, want attested/false", rep.Class.Evidence, rep.Class.GeneratorOnSUT)
