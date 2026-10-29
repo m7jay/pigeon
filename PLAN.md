@@ -29,10 +29,22 @@ disagree, the requirements win and this file is wrong.
 | S9 | Portals — consumer portal (M2b) landed as `t_0eea0b84`; producer portal (M2a) is S9a `t_c0144baa` — scoped tokens, branding; **FR-106 optional OIDC login** and FR-111's password-reset flow (both deferred here — a second login method is a portal-visible feature, and neither exists in S1) | AC-38, AC-39, AC-40, AC-47 (AC-01 → S9a) | S3 | — |
 | S10 | Hardening: SSRF at three points, secret rotation, `doctor`, load test, fault-injection matrix in CI; **portal session security (FR-1009)** — `HttpOnly`/`Secure`/`SameSite=Lax` on every portal cookie, a CSRF token on every state-changing POST, cookie lifetime read from the core's `expires_at` | AC-19, AC-22, AC-30, AC-31, AC-34, AC-43, AC-49, AC-50, AC-51 | S5…S9 | — |
 | S11 | Delivery fairness (**FR-1303**, **FR-1304**): stop parking the dispatch path on a capped endpoint, split the attempt budget into a first-attempt lane and a retry lane, and make a hold visible | AC-52, AC-53 | S5 | — |
+| S12 | Bounded write budget (**FR-818**, amended by `SPEC.md` A-11): one fixed-capacity write budget per process with a fixed worker pool, batched control-state writes (the fan-out insert and the delivery completion/terminal updates), and an ingest admission deadline that sheds `429`/`over_capacity` instead of parking on the pgx pool; `PIGEON_DB_MAX_CONNS` 10 → 40 | AC-30 (its mechanism - the graded run is card `t_0bf3effa`), FR-815's control-state leg, FR-818 | S5…S8, and `t_b9850e1b`'s relay loop for the fan-out batch | — |
 
 Two items are in S2/S3 rather than later, for the reason §17 gives: the outbox
 changes the ingest transaction, and per-endpoint throttling changes the queue
 topology. Retrofitting either is a rewrite of the paths around it.
+
+S12 is not a new feature: it exists because **FR-818 was a P0 with no owning slice**,
+so the instance queued on the pgx pool instead of shedding. S10 measured the
+consequence on the 2 vCPU reference box (`docs/load-test.md`: 250 events/s offered for
+30 minutes, **zero** sheds, p99 3,593.4 → 4,281.6 ms, and a single publish taking 10.2 s
+at the shipped pool of 10 against 86 ms at 40), and AC-30's three clauses have no other
+mechanism. The slice is card `t_c6afa452`; the graded AC-30 load run it unblocks is
+`t_0bf3effa`, which also implements the §8.1 `-class` comparison the harness never had.
+S10 keeps the report and the harness - S12 does not touch `cmd/loadgen`. The relay's
+fan-out batch is `t_b9850e1b`'s, not this slice's; S12 owns the queue that batch is
+submitted through. The contract change is `SPEC.md` A-11.
 
 **S9 is split.** `t_0eea0b84` landed the consumer portal (M2b); the producer portal
 (M2a) is S9a, card `t_c0144baa`, and AC-01 moved with it. The S9 row above still
