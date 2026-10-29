@@ -18,6 +18,20 @@ import (
 // (FR-704), batched so N rows are one round trip (FR-706). The lease is set here,
 // at creation, never at claim (FR-813).
 //
+// There are two entry points, and they differ only in how many events one
+// transaction carries:
+//
+//   - FanOutEvent is one event in one transaction, and FanOutEventAndMark adds the
+//     outbox mark to that same transaction. It is what a single event whose fan-out
+//     set is itself larger than the write budget's batch capacity is handled with
+//     (see relaybatch.go): one transaction per event is already §8.1's floor when
+//     that set is at the floor.
+//   - PlanFanOut and RelayBatch (relaybatch.go) are the relay's batch path: many
+//     events resolved together and written in the one transaction FR-818's write
+//     budget opened for them. That is the path the relay's drain loop uses, because
+//     a per-event transaction cannot reach FR-815's rows per transaction at the
+//     reference rate.
+//
 // The four ways an event delivers to nothing are recorded distinctly (§7.5a,
 // FR-509), each with its own reason code, which the metric layer uses as its
 // label (FR-508):
@@ -66,111 +80,147 @@ type fanOutMatch struct {
 // replay (idempotent). It runs in one synchronous_commit=on transaction (FR-703):
 // the delivery rows are control state §6 promises cannot be lost.
 func (s *Store) FanOutEvent(ctx context.Context, sc Scope, eventID string) (FanOutResult, error) {
-	result := FanOutResult{EventID: eventID}
+	var result FanOutResult
 	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
-		// Read the event under the caller's scope: a foreign event id is ErrNotFound
-		// (FR-108), and the routing fields are what fan-out intersects.
-		var routingMode, eventType, consumerRef string
-		var eventAt time.Time
-		if err := tx.QueryRow(ctx, `
-			select routing_mode, event_type, coalesce(consumer_ref, ''), created_at
-			from events
-			where producer_id = $1 and env = $2 and id = $3`,
-			sc.ProducerID, sc.Env, eventID,
-		).Scan(&routingMode, &eventType, &consumerRef, &eventAt); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return ErrNotFound
-			}
-			return err
-		}
-		result.RoutingMode = routingMode
-
-		// SB-1/FR-704: deliveries are partitioned by day and stamped with the
-		// EVENT's day, so a retried fan-out lands in the same partition and still
-		// conflicts on (event_id, endpoint_id, created_at). The partition for that
-		// day is created before the insert; the cached check costs nothing on the
-		// normal path because the sweeper creates partitions ahead.
-		if err := s.EnsurePartitionCached(ctx, "deliveries", eventAt); err != nil {
-			return err
-		}
-
-		// Broadcast events carry no consumer (§7.5a). The M0 endpoint model is a
-		// consumer-owned endpoint, so there is nothing to intersect; broadcast
-		// fan-out writes no rows. (Consumer-less endpoints land where broadcast
-		// endpoints are modelled; noted in SPEC.md.)
-		if routingMode != RoutingConsumer {
-			result.Idle = true
-			return nil
-		}
-
-		// Resolve the ref to a consumer (FR-508). A miss is the unroutable case:
-		// accepted (the event is already committed), recorded, zero deliveries.
-		var consumerID string
-		err := tx.QueryRow(ctx, `
-			select id from consumers
-			where producer_id = $1 and env = $2 and ref = $3`,
-			sc.ProducerID, sc.Env, consumerRef,
-		).Scan(&consumerID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			result.RoutingState = "unroutable"
-			result.EventReason = ReasonUnroutableNotRegistered
-			return recordEventReason(ctx, tx, sc, eventID, "unroutable", ReasonUnroutableNotRegistered)
-		}
-		if err != nil {
-			return err
-		}
-
-		// Intersect: the consumer's non-deleted endpoints that carry a non-deleted
-		// subscription for this type. Paused and unverified are sub-states read
-		// here, not filtered out, so each produces its own reason rather than
-		// vanishing (FR-509).
-		matches, err := queryFanOutMatches(ctx, tx, sc, eventType, consumerID)
-		if err != nil {
-			return err
-		}
-		if len(matches) == 0 {
-			// The consumer exists but nothing is subscribed to this type (AC-24).
-			result.RoutingState = "routable"
-			result.EventReason = ReasonNoMatchingSubscription
-			return recordEventReason(ctx, tx, sc, eventID, "routable", ReasonNoMatchingSubscription)
-		}
-
-		// Classify each match: deliverable, or skipped with an endpoint-level
-		// reason (paused, or unverified in live).
-		var deliverable []string
-		for _, m := range matches {
-			switch {
-			case m.subStatus == "paused" || m.status == "paused":
-				result.Skipped = append(result.Skipped, SkippedDelivery{EndpointID: m.endpointID, Reason: ReasonEndpointPaused})
-			case !m.verified && sc.Env == EnvLive:
-				result.Skipped = append(result.Skipped, SkippedDelivery{EndpointID: m.endpointID, Reason: ReasonEndpointUnverified})
-			default:
-				deliverable = append(deliverable, m.endpointID)
-			}
-		}
-
-		if n, err := insertDeliveries(ctx, tx, sc, eventID, consumerID, eventAt, deliverable); err != nil {
-			return err
-		} else {
-			result.Deliveries = n
-		}
-		if n, err := insertSkippedDeliveries(ctx, tx, sc, eventID, consumerID, eventAt, result.Skipped); err != nil {
-			return err
-		} else {
-			// Skipped rows are terminal; they advance nothing but the record.
-			_ = n
-		}
-
-		// The event routed (a delivery or a recorded skip exists); clear any
-		// stale non-delivery reason so a re-fan-out of a previously-unroutable
-		// event that has since been onboarded reads back as routed.
-		result.RoutingState = "routable"
-		_, err = tx.Exec(ctx, `
-			update events set routing_state = 'routable', non_delivery_reason = null
-			where producer_id = $1 and env = $2 and id = $3`,
-			sc.ProducerID, sc.Env, eventID)
+		var err error
+		result, err = s.fanOutInTx(ctx, tx, sc, eventID)
 		return err
 	})
+	return result, err
+}
+
+// FanOutEventAndMark is FanOutEvent plus FR-701's mark, in the SAME transaction:
+// the delivery set and the claim that the event was honoured commit together, so
+// there is no state in which the outbox says published and the delivery rows are
+// missing.
+//
+// It is the escape hatch for a single event whose fan-out set on its own is larger
+// than the write budget's batch capacity - a consumer subscribed on more endpoints
+// than one batch may hold. Such an event is at §8.1's 2,000-row floor in one
+// transaction already, and splitting it across transactions is the one thing that
+// could lose rows: the second transaction would carry deliveries the first
+// transaction's mark already claimed. The relay's batched path therefore leaves
+// that one event to this method and batches everything else.
+func (s *Store) FanOutEventAndMark(ctx context.Context, sc Scope, outboxID int64, eventID string) (FanOutResult, error) {
+	var result FanOutResult
+	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
+		r, err := s.fanOutInTx(ctx, tx, sc, eventID)
+		if err != nil {
+			return err
+		}
+		result = r
+		return markOutbox(ctx, tx, []int64{outboxID})
+	})
+	return result, err
+}
+
+// fanOutInTx is FanOutEvent's body, over a transaction the caller owns, so the
+// single-event paths can add their own statements to the same transaction without
+// a second implementation of the intersection.
+func (s *Store) fanOutInTx(ctx context.Context, tx pgx.Tx, sc Scope, eventID string) (FanOutResult, error) {
+	result := FanOutResult{EventID: eventID}
+
+	// Read the event under the caller's scope: a foreign event id is ErrNotFound
+	// (FR-108), and the routing fields are what fan-out intersects.
+	var routingMode, eventType, consumerRef string
+	var eventAt time.Time
+	if err := tx.QueryRow(ctx, `
+		select routing_mode, event_type, coalesce(consumer_ref, ''), created_at
+		from events
+		where producer_id = $1 and env = $2 and id = $3`,
+		sc.ProducerID, sc.Env, eventID,
+	).Scan(&routingMode, &eventType, &consumerRef, &eventAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return result, ErrNotFound
+		}
+		return result, err
+	}
+	result.RoutingMode = routingMode
+
+	// SB-1/FR-704: deliveries are partitioned by day and stamped with the
+	// EVENT's day, so a retried fan-out lands in the same partition and still
+	// conflicts on (event_id, endpoint_id, created_at). The partition for that
+	// day is created before the insert; the cached check costs nothing on the
+	// normal path because the sweeper creates partitions ahead.
+	if err := s.EnsurePartitionCached(ctx, "deliveries", eventAt); err != nil {
+		return result, err
+	}
+
+	// Broadcast events carry no consumer (§7.5a). The M0 endpoint model is a
+	// consumer-owned endpoint, so there is nothing to intersect; broadcast
+	// fan-out writes no rows. (Consumer-less endpoints land where broadcast
+	// endpoints are modelled; noted in SPEC.md.)
+	if routingMode != RoutingConsumer {
+		result.Idle = true
+		return result, nil
+	}
+
+	// Resolve the ref to a consumer (FR-508). A miss is the unroutable case:
+	// accepted (the event is already committed), recorded, zero deliveries.
+	var consumerID string
+	err := tx.QueryRow(ctx, `
+		select id from consumers
+		where producer_id = $1 and env = $2 and ref = $3`,
+		sc.ProducerID, sc.Env, consumerRef,
+	).Scan(&consumerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		result.RoutingState = "unroutable"
+		result.EventReason = ReasonUnroutableNotRegistered
+		return result, recordEventReason(ctx, tx, sc, eventID, "unroutable", ReasonUnroutableNotRegistered)
+	}
+	if err != nil {
+		return result, err
+	}
+
+	// Intersect: the consumer's non-deleted endpoints that carry a non-deleted
+	// subscription for this type. Paused and unverified are sub-states read
+	// here, not filtered out, so each produces its own reason rather than
+	// vanishing (FR-509).
+	matches, err := queryFanOutMatches(ctx, tx, sc, eventType, consumerID)
+	if err != nil {
+		return result, err
+	}
+	if len(matches) == 0 {
+		// The consumer exists but nothing is subscribed to this type (AC-24).
+		result.RoutingState = "routable"
+		result.EventReason = ReasonNoMatchingSubscription
+		return result, recordEventReason(ctx, tx, sc, eventID, "routable", ReasonNoMatchingSubscription)
+	}
+
+	// Classify each match: deliverable, or skipped with an endpoint-level
+	// reason (paused, or unverified in live).
+	var deliverable []string
+	for _, m := range matches {
+		switch {
+		case m.subStatus == "paused" || m.status == "paused":
+			result.Skipped = append(result.Skipped, SkippedDelivery{EndpointID: m.endpointID, Reason: ReasonEndpointPaused})
+		case !m.verified && sc.Env == EnvLive:
+			result.Skipped = append(result.Skipped, SkippedDelivery{EndpointID: m.endpointID, Reason: ReasonEndpointUnverified})
+		default:
+			deliverable = append(deliverable, m.endpointID)
+		}
+	}
+
+	if n, err := insertDeliveries(ctx, tx, sc, eventID, consumerID, eventAt, deliverable); err != nil {
+		return result, err
+	} else {
+		result.Deliveries = n
+	}
+	if n, err := insertSkippedDeliveries(ctx, tx, sc, eventID, consumerID, eventAt, result.Skipped); err != nil {
+		return result, err
+	} else {
+		// Skipped rows are terminal; they advance nothing but the record.
+		_ = n
+	}
+
+	// The event routed (a delivery or a recorded skip exists); clear any
+	// stale non-delivery reason so a re-fan-out of a previously-unroutable
+	// event that has since been onboarded reads back as routed.
+	result.RoutingState = "routable"
+	_, err = tx.Exec(ctx, `
+		update events set routing_state = 'routable', non_delivery_reason = null
+		where producer_id = $1 and env = $2 and id = $3`,
+		sc.ProducerID, sc.Env, eventID)
 	return result, err
 }
 
