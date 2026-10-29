@@ -28,11 +28,12 @@ type Metrics struct {
 	heldBacks map[string]HeldBack
 	// Storage budget telemetry (SB-6): how many partitions retention has
 	// dropped, and how many publishes were shed because the volume was over
-	// budget. Both are operator-facing — /metrics is the scrape an alert rule
-	// reads, and AC-18 turns on both being non-zero. They are typed fields
-	// rather than map entries because their readers are typed (the sweeper and
-	// the ingest gate read them without a string key) and because the series
-	// must read zero before the first drop, not be absent.
+	// budget or because the write path was saturated (FR-818). Both are
+	// operator-facing — /metrics is the scrape an alert rule reads, and AC-18
+	// turns on both being non-zero. They are typed fields rather than map
+	// entries because their readers are typed (the sweeper and the ingest gate
+	// read them without a string key) and because the series must read zero
+	// before the first drop, not be absent.
 	partitionDrops int64
 	sheds          int64
 }
@@ -98,6 +99,18 @@ const (
 	// with millisecond resolution, accumulated as milliseconds here.
 	EndpointHeldBackTotal   = "pigeon_endpoint_held_back_total"
 	EndpointHeldBackSeconds = "pigeon_endpoint_held_back_seconds"
+	// WriteQueueDrains, WriteQueueRows and WriteQueuePending are FR-818's
+	// bounded write budget (SPEC.md A-11). Drains is the denominator and Rows the
+	// numerator of FR-815's rows-per-transaction on the batched control-state
+	// path (the same ratio FlushBatches gives for buffered evidence), and Pending
+	// is the accumulation buffer's depth as OBS-9's queue-depth gauge in the same
+	// spirit as AttemptBufferPending. Exposing them matters because the budget is
+	// a new admission point: an operator who sees publishes shed wants to know
+	// whether the queue is what is full, before changing any limit.
+	WriteQueueDrains    = "pigeon_write_queue_drains_total"
+	WriteQueueRows      = "pigeon_write_queue_rows_total"
+	WriteQueuePending   = "pigeon_write_queue_pending_rows"
+	WriteQueueSaturated = "pigeon_write_queue_saturated_total"
 )
 
 // gauges are the series exposed with `# TYPE … gauge` rather than `counter`, so a
@@ -105,6 +118,7 @@ const (
 var gauges = map[string]bool{
 	AttemptBufferPending: true,
 	DedupeArchiveBytes:   true,
+	WriteQueuePending:    true,
 }
 
 // IsGauge reports whether a counter name is exposed as a gauge.
@@ -277,8 +291,13 @@ func (m *Metrics) PartitionDropCount() int64 {
 }
 
 // RecordShed counts publishes refused with 429 because the volume was over the
-// disk budget (SB-7). It is what tells "we shed deliberately" apart from "we
-// were down".
+// disk budget (SB-7) or because the write path was saturated (FR-818, SPEC.md
+// A-11: ingest admitted within its deadline or shed, never parked on the pool).
+// It is what tells "we shed deliberately" apart from "we were down", and it is
+// one counter rather than two on purpose: an operator's question is "is this
+// instance refusing ingest", and the 429's own error code (`over_budget` vs
+// `over_capacity`) is what separates the two causes for the producer that was
+// refused.
 func (m *Metrics) RecordShed(n int) {
 	if n <= 0 {
 		return
