@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"strconv"
@@ -206,5 +207,93 @@ func TestRedisBrokerPublishFailureIsAnError(t *testing.T) {
 	ev := &envelope.Envelope{ID: "evt_x", Type: "x.y", Class: "normal"}
 	if err := b.Publish(ctx, ev); err == nil {
 		t.Fatal("Publish to a dead broker returned nil, want an error")
+	}
+}
+
+// brokerTestServerAddr is the host:port of the Redis the constructor tests dial:
+// the real server CI provides (PIGEON_TEST_REDIS_URL) when it is set, and a
+// fresh in-process miniredis otherwise, so NewRedis is exercised against a real
+// server in both places and a skip is never how a run passes. Only the address
+// is used - each test builds the DSN it wants to assert on - so the env value's
+// own database index is dropped here.
+func brokerTestServerAddr(t *testing.T) string {
+	t.Helper()
+	raw := os.Getenv("PIGEON_TEST_REDIS_URL")
+	if raw == "" {
+		return miniredis.RunT(t).Addr()
+	}
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			t.Fatalf("parse PIGEON_TEST_REDIS_URL %q: %v", raw, err)
+		}
+		return u.Host
+	}
+	return raw
+}
+
+// TestNewRedisHonoursTheDSN is NewRedis's regression test: the constructor takes
+// the documented PIGEON_REDIS_URL form (redis://host:port/db) and a bare
+// host:port, and the database index the URL names reaches the client.
+//
+// It regresses a real boot failure. NewRedis passed the whole value straight
+// through as redis.Options.Addr, and go-redis dials Addr verbatim, so
+// redis://redis:6379/0 - the value .env.example and compose.yaml ship - was
+// dialled as a *hostname* and the PING failed with
+//
+//	dial tcp: address redis://redis:6379/0: too many colons in address
+//
+// which cmd/pigeon turns into "connect broker: ..." and refuses to start. The
+// second leg is the quieter half of the same defect: a client built from the
+// URL's host alone still connects and still PINGs - it just lands in DB 0, so a
+// deployment that asked for its own database shares the default one. A passing
+// PING cannot show that, which is why the database is asserted directly.
+func TestNewRedisHonoursTheDSN(t *testing.T) {
+	addr := brokerTestServerAddr(t)
+
+	for _, tc := range []struct {
+		name   string
+		dsn    string
+		wantDB int
+		other  int
+	}{
+		{name: "url form names a database", dsn: "redis://" + addr + "/9", wantDB: 9, other: 0},
+		{name: "bare host:port is database 0", dsn: addr, wantDB: 0, other: 9},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			b, err := NewRedis(ctx, tc.dsn)
+			if err != nil {
+				t.Fatalf("NewRedis(%q): %v", tc.dsn, err)
+			}
+			defer b.Close()
+
+			if got := b.rdb.Options().DB; got != tc.wantDB {
+				t.Fatalf("NewRedis(%q): client is on DB %d, want DB %d", tc.dsn, got, tc.wantDB)
+			}
+
+			// ... and it is the database the broker publishes in: a key written
+			// through the broker's own client is invisible from the other
+			// database, which is what a dropped index would look like.
+			key := fmt.Sprintf("pigeon:test:newredis:%s:%d",
+				strings.ReplaceAll(t.Name(), "/", "-"), time.Now().UnixNano())
+			if err := b.rdb.Set(ctx, key, "1", time.Minute).Err(); err != nil {
+				t.Fatalf("SET %s through the DB %d client: %v", key, tc.wantDB, err)
+			}
+			if n, err := b.rdb.Exists(ctx, key).Result(); err != nil || n != 1 {
+				t.Fatalf("%s is not in the database the client is on (EXISTS=%d, err %v)", key, n, err)
+			}
+			other := redis.NewClient(&redis.Options{Addr: addr, DB: tc.other})
+			defer other.Close()
+			if n, err := other.Exists(ctx, key).Result(); err != nil || n != 0 {
+				t.Fatalf("%s is visible from DB %d (EXISTS=%d, err %v): the client and the DSN disagree about the database",
+					key, tc.other, n, err)
+			}
+			if err := b.rdb.Del(ctx, key).Err(); err != nil {
+				t.Logf("cleanup: DEL %s: %v", key, err)
+			}
+		})
 	}
 }

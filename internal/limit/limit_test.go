@@ -2,7 +2,11 @@ package limit
 
 import (
 	"context"
+	"fmt"
+	"net/url"
+	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -377,5 +381,96 @@ func TestLocalFallbackHoldsAndExpires(t *testing.T) {
 	}
 	if err := l.Close(); err != nil {
 		t.Errorf("Close: %v", err)
+	}
+}
+
+// limitTestServerAddr is the host:port of the Redis the constructor test dials:
+// the real server CI provides (PIGEON_TEST_REDIS_URL) when it is set, and a
+// fresh in-process miniredis otherwise, so NewRedis is exercised against a real
+// server in both places and a skip is never how a run passes. Only the address
+// is used - the test builds the DSN it wants to assert on - so the env value's
+// own database index is dropped here.
+func limitTestServerAddr(t *testing.T) string {
+	t.Helper()
+	raw := os.Getenv("PIGEON_TEST_REDIS_URL")
+	if raw == "" {
+		return miniredis.RunT(t).Addr()
+	}
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			t.Fatalf("parse PIGEON_TEST_REDIS_URL %q: %v", raw, err)
+		}
+		return u.Host
+	}
+	return raw
+}
+
+// TestNewRedisHonoursTheDSN is NewRedis's regression test: the constructor takes
+// the documented PIGEON_REDIS_URL form (redis://host:port/db) and a bare
+// host:port, and the database index the URL names reaches the client.
+//
+// It regresses the same boot failure the broker's constructor had. NewRedis
+// passed the whole value straight through as redis.Options.Addr, and go-redis
+// dials Addr verbatim, so redis://redis:6379/0 - the value .env.example and
+// compose.yaml ship - was dialled as a *hostname* and the PING failed with
+//
+//	dial tcp: address redis://redis:6379/0: too many colons in address
+//
+// which cmd/pigeon turns into "connect delivery limiter: ..." and refuses to
+// start. The second leg is the quieter half: a client built from the URL's host
+// alone still connects and still PINGs - it just lands in DB 0, where the limits
+// are then per-process rather than shared, which is exactly what FR-1307 forbids
+// and no PING can reveal. So the database is asserted, and then a real limiter
+// operation is checked to have written into it.
+func TestNewRedisHonoursTheDSN(t *testing.T) {
+	addr := limitTestServerAddr(t)
+
+	for _, tc := range []struct {
+		name   string
+		dsn    string
+		wantDB int
+		other  int
+	}{
+		{name: "url form names a database", dsn: "redis://" + addr + "/9", wantDB: 9, other: 0},
+		{name: "bare host:port is database 0", dsn: addr, wantDB: 0, other: 9},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			lim, err := NewRedis(ctx, tc.dsn)
+			if err != nil {
+				t.Fatalf("NewRedis(%q): %v", tc.dsn, err)
+			}
+			defer lim.Close()
+
+			rdb := lim.Client()
+			if got := rdb.Options().DB; got != tc.wantDB {
+				t.Fatalf("NewRedis(%q): client is on DB %d, want DB %d", tc.dsn, got, tc.wantDB)
+			}
+
+			// The limiter's own keys land in the database the DSN named. FR-1307
+			// promises that replicas sharing a Redis share its keyspace, and the
+			// gauge the pause tracker reads is that keyspace: a client in another
+			// database would leave every other replica blind to it.
+			endpoint := fmt.Sprintf("ep_newredis_%d", time.Now().UnixNano())
+			if ok, _, err := lim.Allow(ctx, endpoint, 10, 1); err != nil || !ok {
+				t.Fatalf("Allow(%s) = (ok=%v, err=%v), want a token", endpoint, ok, err)
+			}
+			key := RPSKey(endpoint)
+			if n, err := rdb.Exists(ctx, key).Result(); err != nil || n != 1 {
+				t.Fatalf("%s is not in the database the limiter's client is on (EXISTS=%d, err %v)", key, n, err)
+			}
+			other := redis.NewClient(&redis.Options{Addr: addr, DB: tc.other})
+			defer other.Close()
+			if n, err := other.Exists(ctx, key).Result(); err != nil || n != 0 {
+				t.Fatalf("%s is visible from DB %d (EXISTS=%d, err %v): the limiter and the DSN disagree about the database",
+					key, tc.other, n, err)
+			}
+			if err := rdb.Del(ctx, key).Err(); err != nil {
+				t.Logf("cleanup: DEL %s: %v", key, err)
+			}
+		})
 	}
 }
