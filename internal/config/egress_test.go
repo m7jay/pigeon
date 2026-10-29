@@ -13,6 +13,11 @@ func TestEgressIPsAreListedAndValidated(t *testing.T) {
 	base.DatabaseURL = "postgres://u@h/db"
 	base.RedisURL = "redis://h:6379" // D-2's buffered mode requires it
 	base.InstanceAdminPassword = "a-long-enough-password"
+	// FR-405/FR-1006 landed on the base after this test was written and made
+	// PIGEON_HEADERS_KEY a required at-rest key, so a fixture without it fails
+	// Validate for a reason that is not FR-1007. config_test.go's fixture carries
+	// it for the same reason.
+	base.HeadersKey = testHeadersKey
 
 	t.Run("list form", func(t *testing.T) {
 		c := base
