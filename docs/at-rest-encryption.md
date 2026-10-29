@@ -4,8 +4,10 @@
 FR-1006 requires endpoint custom header values to be encrypted at rest and
 redactable everywhere they are read, and there was nothing in the tree to reuse:
 endpoint signing secrets are stored as plaintext `whsec_...` values because the
-signer needs the key material at sign time (FR-1001), and a hash is useless for a
-value that has to be sent back out on the wire.
+signer must reproduce the stored value itself at sign time (FR-1001), so the
+value cannot be hashed - a hash is useless for something that has to be sent back
+out on the wire, and that is an argument against hashing, not against encrypting
+the column.
 
 This page is the pattern for the next column that needs it, and the rules that
 keep the first one honest. The worked example throughout is FR-405's custom
