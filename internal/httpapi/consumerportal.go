@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -76,23 +77,29 @@ func (s *Server) handleConsumerListEventTypes(w http.ResponseWriter, r *http.Req
 	if cid == "" {
 		return
 	}
-	names, err := s.deps.Data.ListSubscribableEventTypes(r.Context(), sc)
+	types, err := s.deps.Data.ListSubscribableEventTypes(r.Context(), sc)
 	if err != nil {
 		s.storeError(w, r, err)
 		return
 	}
-	out := make([]subscribableEventTypeJSON, 0, len(names))
-	for _, name := range names {
-		out = append(out, subscribableEventTypeJSON{Name: name})
+	out := make([]subscribableEventTypeJSON, 0, len(types))
+	for _, et := range types {
+		out = append(out, subscribableEventTypeJSON{
+			Name: et.Name, PayloadVersion: et.PayloadVersion, PayloadSchema: et.PayloadSchema,
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"event_types": out})
 }
 
-// subscribableEventTypeJSON is deliberately just the name: UI-14 asks the consumer
-// to choose a type, and the payload schema (the producer's contract detail) is not
-// the consumer's business through this route.
+// subscribableEventTypeJSON is the name UI-14's control offers, plus the contract
+// detail UI-9's consumer-side integration guide renders. The schema was originally
+// left out because UI-14 only needed a list; UI-9 is what makes it a consumer's
+// business, and one read satisfies both rather than a second route that would have
+// to be kept in step with this one.
 type subscribableEventTypeJSON struct {
-	Name string `json:"name"`
+	Name           string          `json:"name"`
+	PayloadVersion int             `json:"payload_version"`
+	PayloadSchema  json.RawMessage `json:"payload_schema"`
 }
 
 // handleConsumerListEndpoints is GET /v1/consumer/endpoints: the caller's own

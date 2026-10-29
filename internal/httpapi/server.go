@@ -48,9 +48,18 @@ type Data interface {
 	SelfRegisterProducer(ctx context.Context, slug, name, email, password string) (store.Producer, error)
 
 	CreateSession(ctx context.Context, in store.LoginInput, ttl time.Duration) (store.Session, string, error)
+	// CreateSessionForVerifiedIdentity is FR-106's login: an account whose identity
+	// an id_token proved, instead of a password. It resolves the same claims and
+	// refuses a claim-less account the same way.
+	CreateSessionForVerifiedIdentity(ctx context.Context, email string, ttl time.Duration) (store.Session, string, error)
 	RevokeSession(ctx context.Context, token string) error
 	ChangePassword(ctx context.Context, userID, oldPassword, newPassword string) error
 	AcceptInvite(ctx context.Context, token, password, callerUserID string) (store.AcceptedInvite, error)
+	// FR-111's reset half: mint a single-use reset token for an address, and spend
+	// one. Neither grants a claim - the write is one account's password and the
+	// revocation of its sessions.
+	CreatePasswordReset(ctx context.Context, email string, ttl time.Duration) (string, string, bool, error)
+	AcceptPasswordReset(ctx context.Context, token, newPassword string) (store.PasswordReset, error)
 
 	ListMembers(ctx context.Context, sc store.Scope) ([]store.Member, error)
 	InviteMember(ctx context.Context, sc store.Scope, actor store.Actor, email, role string) (store.Invite, error)
@@ -82,7 +91,7 @@ type Data interface {
 	RotateConsumerEndpointSecret(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.EndpointSecret, error)
 	DeleteConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string) error
 	VerifyConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID, token string) error
-	ListSubscribableEventTypes(ctx context.Context, sc store.Scope) ([]string, error)
+	ListSubscribableEventTypes(ctx context.Context, sc store.Scope) ([]store.SubscribableEventType, error)
 	ListConsumerSubscriptions(ctx context.Context, sc store.Scope, consumerID, endpointID string) ([]store.Subscription, error)
 	CreateConsumerSubscription(ctx context.Context, sc store.Scope, consumerID, endpointID, eventType string) (store.Subscription, error)
 	DeleteConsumerSubscription(ctx context.Context, sc store.Scope, consumerID, endpointID, eventType string) error
@@ -112,6 +121,12 @@ type Data interface {
 	EventView(ctx context.Context, sc store.Scope, eventID string) (store.EventView, error)
 	DedupeAnswer(ctx context.Context, sc store.Scope, endpointID, eventID string) (store.DedupeAnswer, error)
 	ReplayDeliveries(ctx context.Context, sc store.Scope, in store.ReplayInput) (store.ReplayResult, error)
+
+	// S9a's producer-portal reads (M2a): UI-2/UI-11's endpoint health, derived from
+	// the delivery rows, and UI-11's events addressed to one consumer that produced
+	// no delivery to it.
+	EndpointHealth(ctx context.Context, sc store.Scope, endpointIDs []string) (map[string]store.EndpointHealth, error)
+	ConsumerEvents(ctx context.Context, sc store.Scope, consumerID string, limit int) ([]store.ConsumerEvent, error)
 }
 
 // Deps are the collaborators the handlers need. Nil Ready means "nothing to
@@ -171,6 +186,20 @@ type Deps struct {
 	// addresses; the tests set it so the answer does not depend on the machine
 	// the suite runs on.
 	DiscoverEgress func() []string
+
+	// NotifyPasswordReset delivers FR-111's reset token (see passwordreset.go).
+	// Nil means "nowhere": the token is minted and hashed but never leaves the
+	// process, which is the safe default on a shared instance and is why the
+	// operator has to opt into the log transport explicitly.
+	NotifyPasswordReset PasswordResetNotifier
+
+	// PasswordResetTTL is how long an issued reset stays usable
+	// (PIGEON_PASSWORD_RESET_TTL). Zero means store.DefaultResetTTL.
+	PasswordResetTTL time.Duration
+
+	// OIDC is FR-106's optional login (see oidc.go). Nil disables the route: an
+	// instance that configured no provider has no OIDC control to render.
+	OIDC OIDCVerifier
 }
 
 // WriteBudget is FR-818's admission half. Admitting is all the publish path

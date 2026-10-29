@@ -31,6 +31,12 @@ type publishRequest struct {
 	ConsumerID     *string         `json:"consumer_id"`
 	ConsumerRef    *string         `json:"consumer_ref"`
 	IdempotencyKey string          `json:"idempotency_key"`
+	// Test marks the event as synthetic (UI-4). The field is accepted on both the
+	// key route and the producer portal's member route, so a producer's own script
+	// and the portal's "Send test event" button mean the same thing by the same
+	// name; the marker travels on the row (migration 0020), not on the page that
+	// sent it.
+	Test bool `json:"test"`
 }
 
 // publishResponse is the 202 body: enough of the accepted event for the caller to
@@ -47,6 +53,9 @@ type publishResponse struct {
 	ConsumerRef    string          `json:"consumer_ref,omitempty"`
 	PayloadVersion int             `json:"payload_version"`
 	Payload        json.RawMessage `json:"payload"`
+	// IsTest says the accepted event was synthetic (UI-4), read back from the row
+	// so an idempotent replay answers with the same marker as the first 202.
+	IsTest bool `json:"is_test"`
 }
 
 func toPublishResponse(ev store.PublishedEvent) publishResponse {
@@ -54,6 +63,7 @@ func toPublishResponse(ev store.PublishedEvent) publishResponse {
 		ID: ev.ID, EventType: ev.EventType, ProducerID: ev.ProducerID, Env: ev.Env,
 		OccurredAt: ev.OccurredAt, RoutingMode: ev.RoutingMode, EventClass: ev.EventClass,
 		ConsumerRef: ev.ConsumerRef, PayloadVersion: ev.PayloadVersion, Payload: ev.Payload,
+		IsTest: ev.IsTest,
 	}
 }
 
@@ -64,7 +74,16 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no producer credential on request")
 		return
 	}
+	s.servePublish(w, r, p.Scope())
+}
 
+// servePublish is the publish path once a producer scope is known
+// (FR-601..FR-607): SB-7's disk gate, FR-818's write budget, the store's
+// validate-and-write, and the 202. The key route above and the producer portal's
+// session route (POST /v1/producer/events, S9a) both land here, so the portal
+// cannot drift from the documented ingest path: §14's "a portal is a thin API
+// client" is this sharing rather than a promise about it.
+func (s *Server) servePublish(w http.ResponseWriter, r *http.Request, sc store.Scope) {
 	// SB-7: while the volume is over its disk budget, shed load here with a 429
 	// rather than accept events the platform cannot keep. The check is deliberately
 	// before body validation: spending work on a request we are about to refuse is
@@ -131,13 +150,13 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		defer release()
 	}
 
-	sc := p.Scope()
 	input := store.PublishInput{
 		EventType:      in.EventType,
 		Payload:        in.Payload,
 		ConsumerID:     in.ConsumerID,
 		ConsumerRef:    in.ConsumerRef,
 		IdempotencyKey: in.IdempotencyKey,
+		Test:           in.Test,
 	}
 	if in.OccurredAt != nil {
 		input.OccurredAt = *in.OccurredAt
@@ -238,11 +257,18 @@ func (s *Server) handleCreateEventType(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no producer credential on request")
 		return
 	}
+	s.serveCreateEventType(w, r, p.Scope())
+}
+
+// serveCreateEventType is the create once a producer scope is known. S9a's member
+// route (POST /v1/producer/event-types) shares it, so the portal's "new event
+// type" form is the documented create rather than a second implementation of it.
+func (s *Server) serveCreateEventType(w http.ResponseWriter, r *http.Request, sc store.Scope) {
 	var in createEventTypeRequest
 	if !s.decodeJSON(w, r, &in) {
 		return
 	}
-	et, err := s.deps.Data.CreateEventType(r.Context(), p.Scope(), store.NewEventType{
+	et, err := s.deps.Data.CreateEventType(r.Context(), sc, store.NewEventType{
 		Name: in.Name, RoutingMode: in.RoutingMode, EventClass: in.EventClass,
 		PayloadSchema: in.PayloadSchema, PayloadVersion: in.PayloadVersion, Examples: in.Examples,
 	})
@@ -260,7 +286,14 @@ func (s *Server) handleListEventTypes(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no producer credential on request")
 		return
 	}
-	types, err := s.deps.Data.ListEventTypes(r.Context(), p.Scope())
+	s.serveListEventTypes(w, r, p.Scope())
+}
+
+// serveListEventTypes is the list once a producer scope is known. S9a's member
+// route shares it: UI-1's second step and UI-9's integration guide both read the
+// live contracts rather than a copy of them.
+func (s *Server) serveListEventTypes(w http.ResponseWriter, r *http.Request, sc store.Scope) {
+	types, err := s.deps.Data.ListEventTypes(r.Context(), sc)
 	if err != nil {
 		s.storeError(w, r, err)
 		return

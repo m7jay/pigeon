@@ -53,6 +53,10 @@ type deliveryJSON struct {
 	// not held, which is every delivery whose attempt has started.
 	HeldBackSince  *string `json:"held_back_since"`
 	HeldBackReason *string `json:"held_back_reason"`
+	// IsTest is UI-4's synthetic marker (S9a, migration 0020): the delivery's event
+	// was sent as a test, so the log labels it wherever it appears. The delivery
+	// itself is ordinary - same worker, same retries, same signature.
+	IsTest bool `json:"is_test"`
 	// AttemptsRows are the attempt ROWS (FR-1102/FR-1103), in attempt order.
 	// Empty for a successful first attempt, which FR-811 records as columns on
 	// the delivery instead of a row.
@@ -100,6 +104,7 @@ func toDeliveryJSON(d store.DeliverySummary) deliveryJSON {
 		CreatedAt: ts(d.CreatedAt), DurationMs: d.DurationMs(),
 		NonDeliveryReason: d.NonDeliveryReason, ReplayOfDeliveryID: d.ReplayOfDeliveryID,
 		HeldBackSince: tsPtr(d.HeldBackSince), HeldBackReason: d.HeldBackReason,
+		IsTest:       d.IsTest,
 		AttemptsRows: []attemptJSON{},
 	}
 }
@@ -233,6 +238,9 @@ type eventJSON struct {
 	CreatedAt         string  `json:"created_at"`
 	RoutingState      *string `json:"routing_state"`
 	NonDeliveryReason *string `json:"non_delivery_reason"`
+	// IsTest says the event was synthetic (UI-4, S9a), so the event page the portal
+	// sends a test from can label it when it sends the producer to look at it.
+	IsTest bool `json:"is_test"`
 }
 
 // handleEventView is GET /v1/producer/events/{eventID}: the event, its fan-out
@@ -261,6 +269,7 @@ func (s *Server) handleEventView(w http.ResponseWriter, r *http.Request) {
 			PayloadVersion: view.PayloadVersion, OccurredAt: ts(view.OccurredAt),
 			CreatedAt: ts(view.CreatedAt), RoutingState: view.RoutingState,
 			NonDeliveryReason: view.NonDeliveryReason,
+			IsTest:            view.IsTest,
 		},
 		"rollup":     view.Rollup,
 		"deliveries": deliveries,

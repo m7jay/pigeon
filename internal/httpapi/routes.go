@@ -86,6 +86,18 @@ func (s *Server) routes() []route {
 		{http.MethodGet, "/v1/session", kindSession, s.handleSession},
 		{http.MethodPost, "/v1/session/password", kindPasswordChange, s.handleChangePassword},
 		{http.MethodPost, "/v1/invites/accept", kindAnonymous, s.handleAcceptInvite},
+		// FR-111's reset half (S9a): both anonymous, because the account asking has
+		// no session - that is the whole problem the flow solves. The request
+		// endpoint answers the same 202 whether or not the address exists, and the
+		// accept endpoint grants a password, never a claim.
+		{http.MethodPost, "/v1/password-resets", kindAnonymous, s.handleRequestPasswordReset},
+		{http.MethodPost, "/v1/password-resets/accept", kindAnonymous, s.handleAcceptPasswordReset},
+		// FR-106's optional OIDC login (S9a): the second half of the flow, where
+		// the core verifies the id_token the portal's relying party obtained. It is
+		// registered unconditionally - the handler answers 404 when no provider is
+		// configured, so "optional" is visible in the response rather than in
+		// whether the route exists.
+		{http.MethodPost, "/v1/session/oidc", kindAnonymous, s.handleOIDCLogin},
 
 		// The ingest credential (FR-201..FR-207).
 		{http.MethodGet, "/v1/whoami", kindProducerKey, s.handleWhoami},
@@ -189,6 +201,17 @@ func (s *Server) routes() []route {
 		{http.MethodGet, "/v1/producer/deliveries/dedupe", kindMember, s.handleDedupeAnswer},
 		{http.MethodGet, "/v1/producer/deliveries/{deliveryID}", kindMember, s.handleGetDelivery},
 		{http.MethodPost, "/v1/producer/deliveries/replay", kindMember, s.handleReplayDeliveries},
+
+		// S9a's producer-portal surface (M2a, §14). A producer portal session is not
+		// a producer key (FR-112 vs FR-201), so these are member routes under their
+		// own prefix: the environment comes from the session's `env` claim, the
+		// producer and the user from the session, never from a request field.
+		{http.MethodGet, "/v1/producer/event-types", kindMember, s.handleMemberListEventTypes},
+		{http.MethodPost, "/v1/producer/event-types", kindMember, s.handleMemberCreateEventType},
+		{http.MethodPost, "/v1/producer/events", kindMember, s.handleMemberPublish},
+		{http.MethodGet, "/v1/producer/usage", kindMember, s.handleProducerUsage},
+		{http.MethodGet, "/v1/producer/consumers/{consumerID}/events", kindMember, s.handleConsumerEvents},
+		{http.MethodPost, "/v1/producer/consumers/{consumerID}/endpoints/{endpointID}/rotate", kindMember, s.handleProducerRotateEndpointSecret},
 		{http.MethodGet, "/v1/producer/events/{eventID}", kindMember, s.handleEventView},
 		{http.MethodGet, "/v1/consumer/deliveries", kindConsumer, s.handleConsumerListDeliveries},
 		{http.MethodGet, "/v1/consumer/deliveries/{deliveryID}", kindConsumer, s.handleConsumerGetDelivery},

@@ -117,6 +117,11 @@ type endpointJSON struct {
 	// place of every value (FR-1006). Always present, empty array when there are
 	// none, so a client never has to distinguish "none" from "field missing".
 	CustomHeaders []customHeaderJSON `json:"custom_headers"`
+	// Health is UI-2's health for this endpoint: the consecutive non-deliveries
+	// since its last success, and when that last delivery was. Present on the list
+	// route (which is what UI-2 and UI-11 read) and absent on a single-endpoint
+	// read, where the caller is already looking at one endpoint's history.
+	Health *endpointHealthJSON `json:"health,omitempty"`
 }
 
 func toEndpointJSON(ep store.Endpoint) endpointJSON {
@@ -153,6 +158,12 @@ func (s *Server) handleListEndpoints(w http.ResponseWriter, r *http.Request) {
 	out := make([]endpointJSON, 0, len(eps))
 	for _, ep := range eps {
 		out = append(out, toEndpointJSON(ep))
+	}
+	// UI-2 (health across every consumer's endpoints) and UI-11 (one consumer's)
+	// read this one list, so health is attached here, in one query for the page.
+	if err := s.attachHealth(r, sc, out); err != nil {
+		s.storeError(w, r, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"endpoints": out})
 }
