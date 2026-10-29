@@ -530,6 +530,14 @@ func (q *Queue) apply(drain []*item) {
 		release()
 	}
 
+	// The drain is accounted for BEFORE any caller in it is released. Stats
+	// documents itself as what the queue has committed, and a caller that has
+	// been handed its outcome can read it in the same breath: recording after
+	// the release (or interleaved with it) lets a caller that was just told its
+	// batch committed see Drains:0 Rows:0 for the drain it completed, which is
+	// exactly the read AC-3's and AC-5's tests make. The release of the room is
+	// kept in the same pass as the row count so the pending gauge keeps its
+	// post-drain meaning.
 	rows := 0
 	for _, it := range drain {
 		rows += it.rows
@@ -537,9 +545,11 @@ func (q *Queue) apply(drain []*item) {
 		// they are still occupying memory, so the bound is on memory, not on
 		// "rows not yet handed to a worker".
 		q.releaseRoom(it.rows)
-		it.done <- err
 	}
 	q.record(rows)
+	for _, it := range drain {
+		it.done <- err
+	}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		q.log.Error("write queue: drain failed; every caller in it got a retryable error",
 			"rows", rows, "batches", len(drain), "error", err)
