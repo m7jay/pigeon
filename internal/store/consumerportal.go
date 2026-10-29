@@ -317,6 +317,7 @@ func (s *Store) RotateConsumerEndpointSecret(ctx context.Context, sc Scope, cons
 	if err != nil {
 		return EndpointSecret{}, err
 	}
+	out := EndpointSecret{Secret: secret, Hint: hint}
 	err = s.scoped(ctx, sc, func(tx pgx.Tx) error {
 		// FR-1004: the rotation keeps the outgoing secret for SecretOverlapTTL so a
 		// receiver still verifying with it has a day to deploy the new one. The old
@@ -325,25 +326,31 @@ func (s *Store) RotateConsumerEndpointSecret(ctx context.Context, sc Scope, cons
 		// exists to avoid. A second rotation inside the window simply moves the
 		// window: the secret that was current a moment ago is the one a receiver is
 		// most likely still using.
-		res, err := tx.Exec(ctx, `
+		// RETURNING rather than RowsAffected: the same statement answers the
+		// rotation and the window it opened, so a caller that has to explain the
+		// overlap (UI-6) reads the expiry the row actually got instead of
+		// recomputing it and hoping the two agree.
+		err := tx.QueryRow(ctx, `
 			update endpoints
 			set previous_signing_secret = signing_secret,
 			    previous_secret_expires_at = now() + $7::interval,
 			    signing_secret = $5, signing_secret_hint = $6
-			where producer_id = $1 and env = $2 and consumer_id = $3 and id = $4 and status <> 'deleted'`,
-			sc.ProducerID, sc.Env, consumerID, endpointID, secret, hint, SecretOverlapTTL.String())
+			where producer_id = $1 and env = $2 and consumer_id = $3 and id = $4 and status <> 'deleted'
+			returning previous_secret_expires_at`,
+			sc.ProducerID, sc.Env, consumerID, endpointID, secret, hint, SecretOverlapTTL.String(),
+		).Scan(&out.OverlapExpiresAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
 		if err != nil {
 			return mapPgError(err, ErrConflict, ErrNotFound)
-		}
-		if res.RowsAffected() == 0 {
-			return ErrNotFound
 		}
 		return nil
 	})
 	if err != nil {
 		return EndpointSecret{}, err
 	}
-	return EndpointSecret{Secret: secret, Hint: hint}, nil
+	return out, nil
 }
 
 // DeleteConsumerEndpoint is FR-407's soft delete, consumer-scoped: the row is
@@ -410,16 +417,31 @@ func (s *Store) VerifyConsumerEndpoint(ctx context.Context, sc Scope, consumerID
 	})
 }
 
-// ListSubscribableEventTypes returns the names of the event types this producer
-// has left open to public subscription in the caller's environment (UI-14), so the
-// consumer portal can offer a list instead of a free-text field. It is the read
-// side of the same gate CreateConsumerSubscription enforces; a disabled type is
-// omitted because it can never be published (FR-305).
-func (s *Store) ListSubscribableEventTypes(ctx context.Context, sc Scope) ([]string, error) {
-	var out []string
+// SubscribableEventType is one event type a consumer may subscribe to, with its
+// contract detail beside it: the name (UI-14's list) and the payload version and
+// schema (UI-9's integration guide, which the consumer portal renders from the same
+// rows the producer portal reads - "publishable to the consumer portal" is one
+// source rendered twice, not a copy).
+type SubscribableEventType struct {
+	Name           string
+	PayloadVersion int
+	PayloadSchema  []byte
+}
+
+// ListSubscribableEventTypes returns the event types this producer has left open to
+// public subscription in the caller's environment (UI-14), so the consumer portal
+// can offer a list instead of a free-text field. It is the read side of the same
+// gate CreateConsumerSubscription enforces; a disabled type is omitted because it
+// can never be published (FR-305).
+//
+// The schema travels with the name because UI-9 asks the consumer portal to render
+// the integration guide from the live event-type schemas: the consumer's business is
+// the payload it will receive.
+func (s *Store) ListSubscribableEventTypes(ctx context.Context, sc Scope) ([]SubscribableEventType, error) {
+	var out []SubscribableEventType
 	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			select name from event_types
+			select name, payload_version, payload_schema from event_types
 			where producer_id = $1 and env = $2 and publicly_subscribable and enabled
 			order by name`, sc.ProducerID, sc.Env)
 		if err != nil {
@@ -427,11 +449,11 @@ func (s *Store) ListSubscribableEventTypes(ctx context.Context, sc Scope) ([]str
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var name string
-			if err := rows.Scan(&name); err != nil {
+			var et SubscribableEventType
+			if err := rows.Scan(&et.Name, &et.PayloadVersion, &et.PayloadSchema); err != nil {
 				return err
 			}
-			out = append(out, name)
+			out = append(out, et)
 		}
 		return rows.Err()
 	})

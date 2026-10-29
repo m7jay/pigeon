@@ -66,6 +66,11 @@ type NewEndpoint struct {
 type EndpointSecret struct {
 	Secret string // the whsec_... value, shown once
 	Hint   string // safe-to-display prefix of the secret
+	// OverlapExpiresAt is when the secret this rotation replaced stops verifying
+	// (FR-1004's dual-signature window). Zero when the endpoint had no outgoing
+	// secret to carry forward, so the two cases - "no window" and "a window that
+	// has closed" - stay distinguishable to the caller that explains the overlap.
+	OverlapExpiresAt time.Time
 }
 
 // EndpointCreated is the whole creation response: the row, the signing secret,
