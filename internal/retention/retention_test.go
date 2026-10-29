@@ -358,6 +358,60 @@ func TestNilGaugeIsNeverOverBudget(t *testing.T) {
 	}
 }
 
+// TestStatusWithoutAVolumeReadingIsAnError: main.go always builds a gauge, so
+// the nil-gauge case above is not the only shape of "no disk signal". With
+// neither PIGEON_DISK_DIR nor PIGEON_DISK_BYTES set, the gauge main builds is
+// non-nil, reads the database size successfully, and reports Source "none" with
+// TotalBytes 0 - there is no volume to compare against, which is SB-6's
+// documented degraded mode. Status must error on that (the handler answers 503)
+// rather than return a calm 0%, and the ingest gate must stay open.
+func TestStatusWithoutAVolumeReadingIsAnError(t *testing.T) {
+	now := time.Date(2026, time.June, 15, 12, 0, 0, 0, time.UTC)
+	g := &FilesystemGauge{
+		Dir:      "", // PIGEON_DISK_DIR unset
+		Bytes:    0,  // PIGEON_DISK_BYTES unset
+		Database: func(context.Context) (int64, error) { return 12345, nil },
+	}
+	m := NewManager(&fakeStore{dbSize: 12345}, g, Options{MaxDiskPct: 80, Now: func() time.Time { return now }})
+
+	st, err := m.Status(context.Background())
+	if !errors.Is(err, ErrNoVolume) {
+		t.Fatalf("Status error = %v, want ErrNoVolume with neither knob set", err)
+	}
+	if st.Disk.TotalBytes != 0 || st.Disk.Source != "none" {
+		t.Fatalf("Disk = %+v, want the no-signal reading (source none, total 0)", st.Disk)
+	}
+	if st.OverBudget || m.OverBudget() {
+		t.Fatal("OverBudget = true with no volume reading, want false: no signal must never shed")
+	}
+}
+
+// TestStatusWithAVolumeReadingIsNotAnError is the other side of the boundary:
+// the same gauge with PIGEON_DISK_BYTES set has a volume to measure against, so
+// Status answers (and the endpoint is a 200).
+func TestStatusWithAVolumeReadingIsNotAnError(t *testing.T) {
+	now := time.Date(2026, time.June, 15, 12, 0, 0, 0, time.UTC)
+	g := &FilesystemGauge{
+		Bytes:    1000, // PIGEON_DISK_BYTES set
+		Database: func(context.Context) (int64, error) { return 900, nil },
+	}
+	m := NewManager(&fakeStore{dbSize: 900}, g, Options{MaxDiskPct: 80, Now: func() time.Time { return now }})
+
+	st, err := m.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status with a configured budget: %v, want a reading", err)
+	}
+	if st.Disk.Source != "database" || st.Disk.TotalBytes != 1000 || st.Disk.UsedBytes != 900 {
+		t.Fatalf("Disk = %+v, want the database reading against the 1000-byte budget", st.Disk)
+	}
+	if diff := st.Disk.UsedPct - 90; diff > 0.001 || diff < -0.001 {
+		t.Fatalf("Disk.UsedPct = %v, want 90", st.Disk.UsedPct)
+	}
+	if !st.OverBudget {
+		t.Fatal("OverBudget = false at 90%% of an 80%% budget, want true")
+	}
+}
+
 // TestNewManagerFillsDefaults: zero options must not mean "0% budget".
 func TestNewManagerFillsDefaults(t *testing.T) {
 	m := NewManager(&fakeStore{}, &fakeGauge{}, Options{})
