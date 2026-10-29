@@ -62,7 +62,8 @@ var (
 	// the wrong number of bytes.
 	ErrInvalidKey = errors.New("at-rest key is not 32 bytes of base64")
 	// ErrNotAuthentic means the ciphertext did not authenticate: it was tampered
-	// with, it was sealed under a different key, or its AAD names another row.
+	// with, it was sealed under a different key, or its AAD names another table,
+	// row or field.
 	// The three are one error on purpose - telling them apart is something only
 	// an attacker benefits from.
 	ErrNotAuthentic = errors.New("at-rest ciphertext did not authenticate")
@@ -126,10 +127,12 @@ func GenerateKey() (Key, string, error) {
 // Configured reports whether the key can be used.
 func (k Key) Configured() bool { return k.aead != nil }
 
-// Seal encrypts plaintext and returns base64(nonce || ciphertext). aad names the
-// row the value belongs to (see the package comment); a caller that reuses
-// another row's aad has just given up the protection, which is why the AAD is
-// built next to the SQL that names the row rather than passed around by callers.
+// Seal encrypts plaintext and returns base64(nonce || ciphertext). aad names
+// where the value belongs - the table, the row, and the field when one row holds
+// several encrypted values (see the package comment); a caller that hands it
+// another row's aad, or another field's inside the same row, has just given up
+// that protection, which is why the AAD is built next to the SQL that names the
+// row rather than passed around by callers.
 func (k Key) Seal(plaintext []byte, aad string) (string, error) {
 	if k.aead == nil {
 		return "", fmt.Errorf("%w: %s", ErrNoKey, KeyEnv)

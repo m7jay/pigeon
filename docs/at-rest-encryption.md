@@ -35,7 +35,15 @@ Four properties matter, and each is a test in `internal/atrest`:
   copied into another endpoint's row, or from one header name onto another inside
   the same row, fails to open instead of being delivered from the wrong place or
   under a name it was never sealed for. The field is the name the row stores, so
-  the write and the read cannot drift on a trim or a re-render.
+  the write and the read cannot drift on a trim or a re-render. The
+  checksum-frozen `internal/db/migrations/0018_endpoint_custom_headers.sql:20-22`
+  still prints the first, row-only form of this string
+  (`pigeon:endpoint-custom-headers:<endpoint id>`, no header name), which is
+  superseded by `headerAAD` and by this page: `db.Migrate` refuses a migration
+  whose content changed after it ran (`internal/db/migrate.go:128-129`), so that
+  header is not edited, and this paragraph is the record that supersedes it. The
+  same treatment was given to the frozen `0016_...sql` copy of the claim-loop
+  wording (`SPEC.md` A-10).
 - **One error, `ErrNotAuthentic`,** covers a wrong key, a tampered ciphertext and
   a mismatched AAD. The caller cannot tell them apart, and does not need to.
 - **No error ever carries the plaintext or the ciphertext** (FR-1008). A refusal
