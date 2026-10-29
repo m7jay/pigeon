@@ -331,6 +331,13 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 	// is no reading at all does the handler turn this into a 503, which is why
 	// the distinction matters (SB-6: the endpoint must not look calm when it
 	// cannot tell).
+	//
+	// TotalBytes == 0 is exactly that condition: a gauge with neither a
+	// directory nor a configured budget has no volume to report against, so its
+	// reading is Source "none" with nothing to divide by. That is not a 0%
+	// volume, it is no volume reading - main.go always builds a gauge, so the
+	// nil case below is not the only way to get here, and the two must not be
+	// conflated with "the disk is empty" (SB-6's documented degraded mode).
 	if u.TotalBytes == 0 {
 		if m.readErr != nil {
 			return st, m.readErr
@@ -338,6 +345,7 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 		if m.gauge == nil {
 			return st, ErrNoGauge
 		}
+		return st, ErrNoVolume
 	}
 	return st, nil
 }
@@ -583,6 +591,16 @@ func (m *Manager) DroppedTotal() int64 { return m.dropped.Load() }
 // ErrNoGauge is returned by Status when the manager has no disk signal at all;
 // callers treat it as "usage unavailable" rather than a hard failure.
 var ErrNoGauge = errors.New("retention: no disk gauge configured")
+
+// ErrNoVolume is returned by Status when the gauge is configured and reads
+// successfully, but carries no volume to measure against: a *FilesystemGauge
+// with neither Dir nor Bytes (PIGEON_DISK_DIR and PIGEON_DISK_BYTES both unset)
+// reports Source "none" with TotalBytes 0. That is SB-6's documented degraded
+// mode - the same "we cannot tell you how full the disk is" the handler turns
+// into a 503 - and it is deliberately distinct from ErrNoGauge so the message
+// names the actual misconfiguration (two knobs unset) rather than a missing
+// gauge that main.go never builds.
+var ErrNoVolume = errors.New("retention: no volume reading: set PIGEON_DISK_DIR or PIGEON_DISK_BYTES")
 
 // truncDay returns midnight UTC of t's day. Every partition boundary in this
 // package is a UTC day, matching 0012_partitioning.sql.
