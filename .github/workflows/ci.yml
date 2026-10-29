@@ -202,6 +202,26 @@ jobs:
           # leaving the outbox pending (TestRelayFanOutBatchFailureRollsBackAndLeavesTheOutboxPending)
           # and the single-event escape hatch for a fan-out wider than the bound
           # (TestRelayOversizedEventTakesItsOwnTransaction).
+          # AC-30's third clause (card `t_0bf3effa`) registered its names with the
+          # change that implemented it, in `cmd/loadgen`. The clause is "the ceiling
+          # matches the §8.1 table within 20%", so its legs are: the table in the
+          # harness is §8.1's (TestClassTableIsSection81 - row by row, both columns),
+          # a machine is one class and not another (TestClassMatchIsCoresExactAndMemoryABand),
+          # the harness refuses a class the machine does not carry, before the run
+          # (TestClassPreflightRefusesAMachineThatDoesNotCarryTheClass) and at the
+          # verdict (TestGradeFailsWhenTheMachineDoesNotCarryTheClass), it compares
+          # both units of the graded window against the declared row and against the
+          # requirement's numbers rather than the artifact's own copy
+          # (TestGradeComparesBothUnitsOfTheGradedWindow,
+          # TestGradeReadsTheTargetFromTheTableNotTheArtifact), it refuses a run that
+          # cannot support the claim in five named ways
+          # (TestGradeRefusesRunsThatCannotSupportTheClaim) including a generator that
+          # shared the machine under test (TestGradeRefusesASharedGeneratorMachine),
+          # it re-decides clauses 1-2 from the artifact instead of believing the
+          # verdicts the artifact carries
+          # (TestGradeRecomputesClausesOneAndTwoFromTheArtifact), its exit status is
+          # the verdict (TestGradeExitStatusIsTheVerdict), and §12's windows are the
+          # protocol's (TestPhaseWindowsFollowSection12).
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -343,7 +363,18 @@ jobs:
             TestJSONMatchesTheLineOutput \
             TestChecksAreBoundedAndOrdered \
             TestMetaEgressIPsReportsTheInstancesAddresses \
-            TestEgressIPsAreListedAndValidated
+            TestEgressIPsAreListedAndValidated \
+            TestClassTableIsSection81 \
+            TestClassMatchIsCoresExactAndMemoryABand \
+            TestClassPreflightRefusesAMachineThatDoesNotCarryTheClass \
+            TestPhaseWindowsFollowSection12 \
+            TestGradeComparesBothUnitsOfTheGradedWindow \
+            TestGradeReadsTheTargetFromTheTableNotTheArtifact \
+            TestGradeFailsWhenTheMachineDoesNotCarryTheClass \
+            TestGradeRefusesASharedGeneratorMachine \
+            TestGradeRefusesRunsThatCannotSupportTheClaim \
+            TestGradeRecomputesClausesOneAndTwoFromTheArtifact \
+            TestGradeExitStatusIsTheVerdict
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
