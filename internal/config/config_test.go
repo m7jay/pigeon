@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/m7jay/pigeon/internal/atrest"
+	"github.com/m7jay/pigeon/internal/writeq"
 )
 
 // testHeadersKey is a throwaway 32-byte key for FR-1006's at-rest encryption. It
@@ -67,6 +68,12 @@ func valid() Config {
 		// FR-1006's at-rest key, required like the database URL: without it there
 		// is nowhere safe to put a custom header value.
 		HeadersKey: testHeadersKey,
+		// S12's write budget (FR-818, SPEC.md A-11): the writer pool and the
+		// admission deadline are refusals when they are zero, so a "valid config"
+		// carries the shipped defaults, and the depth follows the pool (0).
+		WriteQueueDepth:    0,
+		WriteQueueWorkers:  DefaultWriteQueueWorkers,
+		IngestAdmitTimeout: DefaultIngestAdmitTimeout,
 	}
 }
 
@@ -94,6 +101,13 @@ func TestValidateRefusesUnsafeConfigurations(t *testing.T) {
 		// is refused at load rather than accepted as a mode an operator can pick.
 		"zero retry concurrency":     func(c *Config) { c.DeliveryRetryConcurrency = 0 },
 		"negative retry concurrency": func(c *Config) { c.DeliveryRetryConcurrency = -1 },
+		// S12/FR-818: the write budget's two refusals. The depth is clamped rather
+		// than refused (see TestLoadClampsWriteQueueDepth), but these two decide
+		// whether the budget can work at all.
+		"no write queue writers":       func(c *Config) { c.WriteQueueWorkers = 0 },
+		"no admit deadline":            func(c *Config) { c.IngestAdmitTimeout = 0 },
+		"negative admit deadline":      func(c *Config) { c.IngestAdmitTimeout = -time.Millisecond },
+		"admit deadline over a second": func(c *Config) { c.IngestAdmitTimeout = 2 * time.Second },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -412,5 +426,147 @@ func TestValidateRefusesNonPositiveRetention(t *testing.T) {
 	}
 	if d.RetentionDedupe != 30*24*time.Hour {
 		t.Fatalf("FR-905 archive default drifted: %s, want 30 d", d.RetentionDedupe)
+	}
+}
+
+// loadWithWriteBudget runs Load with the three required settings and whatever
+// write-budget environment the caller added. It exists because every S12
+// assertion is about one knob, and the required settings are the same each time.
+func loadWithWriteBudget(t *testing.T) (Config, error) {
+	t.Helper()
+	t.Setenv("PIGEON_DATABASE_URL", "postgres://pigeon_app:pw@localhost/pigeon?sslmode=disable")
+	t.Setenv("PIGEON_INSTANCE_ADMIN_PASSWORD", "correct-horse-battery")
+	t.Setenv("PIGEON_HEADERS_KEY", testHeadersKey)
+	// D-1's buffered mode wants Redis; the sync mode is the escape hatch, and
+	// these tests are not about the attempt buffer.
+	t.Setenv("PIGEON_ATTEMPT_LOG_MODE", AttemptLogSync)
+	return Load()
+}
+
+// TestLoadWriteBudgetDefaults is FR-818's shipped shape: the depth follows the
+// pool, the writer pool is fixed at two (FR-816), and admission waits NFR-1's
+// rated publish p99.
+func TestLoadWriteBudgetDefaults(t *testing.T) {
+	c, err := loadWithWriteBudget(t)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.WriteQueueDepth != 0 {
+		t.Fatalf("WriteQueueDepth = %d, want 0 (follow PIGEON_DB_MAX_CONNS)", c.WriteQueueDepth)
+	}
+	if c.DBMaxConns != 40 {
+		t.Fatalf("DBMaxConns = %d, want the measured-good 40 (S10's load test: pool 10 serialized a publish for 10.2 s, pool 40 took 86 ms)", c.DBMaxConns)
+	}
+	if c.WriteQueueWorkers != DefaultWriteQueueWorkers {
+		t.Fatalf("WriteQueueWorkers = %d, want %d (FR-816)", c.WriteQueueWorkers, DefaultWriteQueueWorkers)
+	}
+	if c.IngestAdmitTimeout != DefaultIngestAdmitTimeout {
+		t.Fatalf("IngestAdmitTimeout = %s, want %s (NFR-1's rated publish p99)", c.IngestAdmitTimeout, DefaultIngestAdmitTimeout)
+	}
+}
+
+// TestLoadClampsWriteQueueDepth is the clamp an operator meets rather than a
+// refusal: a budget below two serialises every write in the process, and one
+// wider than the pool is a longer queue in front of the same connections - the
+// parking A-11 removed.
+func TestLoadClampsWriteQueueDepth(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		depth    string
+		pool     string
+		expected int
+	}{
+		{"named", "16", "40", 16},
+		{"below two", "1", "40", minWriteQueueDepth},
+		{"negative", "-5", "40", minWriteQueueDepth},
+		{"wider than the pool", "1000", "10", 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PIGEON_WRITE_QUEUE_DEPTH", tc.depth)
+			t.Setenv("PIGEON_DB_MAX_CONNS", tc.pool)
+			c, err := loadWithWriteBudget(t)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if c.WriteQueueDepth != tc.expected {
+				t.Fatalf("WriteQueueDepth = %d, want %d (requested %s, pool %s)", c.WriteQueueDepth, tc.expected, tc.depth, tc.pool)
+			}
+		})
+	}
+}
+
+// TestLoadRefusesAnUnusableWriteBudget is OPS-7 applied to the two knobs that
+// decide whether the budget works at all: a writer pool of zero has nobody to
+// write the batch, and an admission deadline outside (0, 1 s] is either no
+// deadline at all or a request parked far past NFR-1's rated p99.
+func TestLoadRefusesAnUnusableWriteBudget(t *testing.T) {
+	for name, env := range map[string][2]string{
+		"no writers":   {"PIGEON_WRITE_QUEUE_WORKERS", "0"},
+		"no deadline":  {"PIGEON_INGEST_ADMIT_TIMEOUT", "0s"},
+		"too long":     {"PIGEON_INGEST_ADMIT_TIMEOUT", "2s"},
+		"not a number": {"PIGEON_WRITE_QUEUE_WORKERS", "two"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(env[0], env[1])
+			if _, err := loadWithWriteBudget(t); err == nil {
+				t.Fatalf("Load accepted %s=%s", env[0], env[1])
+			} else if !errors.Is(err, ErrUnsafeConfig) {
+				t.Fatalf("error %v is not ErrUnsafeConfig", err)
+			}
+		})
+	}
+}
+
+// TestLoadReadsTheAdmitTimeout is the positive half: a shorter deadline is a
+// configuration, so an operator can tune how long a publish waits for the budget.
+func TestLoadReadsTheAdmitTimeout(t *testing.T) {
+	t.Setenv("PIGEON_INGEST_ADMIT_TIMEOUT", "250ms")
+	t.Setenv("PIGEON_WRITE_QUEUE_WORKERS", "4")
+	c, err := loadWithWriteBudget(t)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.IngestAdmitTimeout != 250*time.Millisecond || c.WriteQueueWorkers != 4 {
+		t.Fatalf("write budget not read from the environment: %+v", c)
+	}
+}
+
+// TestWriteBudgetDefaultsMatchTheQueue keeps the two descriptions of one resource
+// from drifting. internal/config owns the knob an operator reads in .env.example;
+// internal/writeq owns the numbers the budget actually runs with. They are the
+// same values, so a change to one that misses the other is a failing test rather
+// than a deployment that behaves differently from its documentation.
+func TestWriteBudgetDefaultsMatchTheQueue(t *testing.T) {
+	d := defaults()
+	if d.WriteQueueWorkers != writeq.DefaultWorkers {
+		t.Fatalf("PIGEON_WRITE_QUEUE_WORKERS default %d != writeq.DefaultWorkers %d", d.WriteQueueWorkers, writeq.DefaultWorkers)
+	}
+	if d.IngestAdmitTimeout != writeq.DefaultAdmitTimeout {
+		t.Fatalf("PIGEON_INGEST_ADMIT_TIMEOUT default %s != writeq.DefaultAdmitTimeout %s", d.IngestAdmitTimeout, writeq.DefaultAdmitTimeout)
+	}
+	if MinFlushBatch != writeq.DefaultPending {
+		t.Fatalf("FR-815's floor %d != the write budget's accumulation buffer %d", MinFlushBatch, writeq.DefaultPending)
+	}
+}
+
+// TestDefaultPoolFitsTheOPS8Budget is the arithmetic S12 changed a default with.
+// The pool ceiling moved 10 -> 40 because pool 10 was measured to serialise a
+// publish for 10.2 s; 40 has to stay inside OPS-8's budget at the replica counts
+// the reference class is deployed at, and the point of the third case is that it
+// does NOT at four - which is why docs/topology.md has to say so rather than let
+// an operator discover it at boot.
+func TestDefaultPoolFitsTheOPS8Budget(t *testing.T) {
+	d := defaults()
+	const postgresDefaultMaxConnections = 100
+	for _, replicas := range []int32{1, 2} {
+		budget := ConnectionBudget(replicas, d.DBMaxConns, d.DBReservedConns)
+		if budget > postgresDefaultMaxConnections {
+			t.Fatalf("%d replicas x %d pool + %d reserved = %d > %d: the shipped default does not fit the reference deployment",
+				replicas, d.DBMaxConns, d.DBReservedConns, budget, postgresDefaultMaxConnections)
+		}
+	}
+	if budget := ConnectionBudget(4, d.DBMaxConns, d.DBReservedConns); budget <= postgresDefaultMaxConnections {
+		t.Fatalf("4 replicas x %d pool + %d reserved = %d now fits %d; docs/topology.md states it does not, so one of the two is wrong",
+			d.DBMaxConns, d.DBReservedConns, budget, postgresDefaultMaxConnections)
 	}
 }

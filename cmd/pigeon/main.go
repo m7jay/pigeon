@@ -32,6 +32,7 @@ import (
 	"github.com/m7jay/pigeon/internal/relay"
 	"github.com/m7jay/pigeon/internal/retention"
 	"github.com/m7jay/pigeon/internal/store"
+	"github.com/m7jay/pigeon/internal/writeq"
 )
 
 // version is stamped by the build: -ldflags "-X main.version=$(git describe)".
@@ -95,7 +96,31 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	st := store.New(pool, store.WithAttemptBodyCap(cfg.DeliveryMaxBodyBytes), store.WithHeadersKey(headersKey))
+
+	// coreMetrics is the process's counter set: FR-508's non-delivery counters
+	// (advanced by the relay as events fan out), S6's delivery, attempt and
+	// log-gate counters, and S8's partition-drop and shed counts (SB-6), all
+	// exposed at GET /metrics.
+	coreMetrics := metrics.New()
+
+	// S12/FR-818: this process's bounded write budget (SPEC.md A-11). ONE budget,
+	// shared: the store submits its batched control-state writes to it, and the
+	// HTTP layer admits ingest against the same instance, so "full" means this
+	// machine's write capacity rather than one subsystem's queue. It replaces the
+	// ingest path's unbounded wait on pgxpool.Acquire - the parking S10 measured
+	// as zero 429s and a p99 growing from 3,593.4 ms to 4,281.6 ms - with an
+	// admission deadline and a shed.
+	writes := store.NewWriteQueue(pool, writeq.Options{
+		Depth:        cfg.WriteQueueDepth,
+		Pool:         int(cfg.DBMaxConns),
+		Workers:      cfg.WriteQueueWorkers,
+		AdmitTimeout: cfg.IngestAdmitTimeout,
+		Metrics:      coreMetrics,
+		Logger:       log,
+		Parent:       ctx,
+	})
+
+	st := store.New(pool, store.WithAttemptBodyCap(cfg.DeliveryMaxBodyBytes), store.WithHeadersKey(headersKey), store.WithWriteQueue(writes))
 
 	if cfg.MigrationsOn {
 		// Migrations run as the role that owns the schema, because CREATE TABLE
@@ -123,12 +148,6 @@ func run() error {
 	if created {
 		log.Warn("instance admin created from PIGEON_INSTANCE_ADMIN_PASSWORD; rotate it after first login (FR-101)")
 	}
-
-	// coreMetrics is the process's counter set: FR-508's non-delivery counters
-	// (advanced by the relay as events fan out), S6's delivery, attempt and
-	// log-gate counters, and S8's partition-drop and shed counts (SB-6), all
-	// exposed at GET /metrics.
-	coreMetrics := metrics.New()
 
 	// S8: the storage budget. The manager is the single place the disk budget is
 	// applied: the sweeper drives RunOnce under its leadership lease (D-7), and
@@ -169,6 +188,10 @@ func run() error {
 		Metrics: coreMetrics,
 		// SB-6/SB-7: GET /v1/meta/usage and the publish 429 gate.
 		Retention: rm,
+		// FR-818: the same write budget the store's control-state writes draw on,
+		// so ingest admission and worker writes are one bounded resource rather
+		// than two queues that cannot see each other.
+		Writes: writes,
 		// FR-206: last_used_at is an evidence write and runs off the request path,
 		// inside the middleware that authenticated the key.
 		TouchKey:         st.TouchKey,
@@ -423,6 +446,14 @@ func run() error {
 			log.Warn("shutdown grace elapsed before the attempt buffer drained")
 		}
 	}
+
+	// FR-818's drain (D-3): the write budget's writer pool writes out what it has
+	// already buffered before the process exits, and it runs last for the same
+	// reason the flusher does - by now the workers and the HTTP server have
+	// stopped, so nothing new is arriving while those control-state rows commit.
+	// A completion the worker was told had happened is therefore not lost to the
+	// restart.
+	st.Close()
 
 	log.Info("stopped cleanly")
 	return nil

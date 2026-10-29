@@ -44,6 +44,32 @@ const (
 	AttemptLogSync     = "sync"
 )
 
+// S12's two bounds on the write budget (FR-818, SPEC.md A-11).
+const (
+	// minWriteQueueDepth is the smallest named PIGEON_WRITE_QUEUE_DEPTH. One slot
+	// serialises every write in the process behind whoever holds it and zero would
+	// admit nothing, so an explicit value at or below 1 is clamped up to this
+	// rather than refused - it is a budget, not a mode, and the default (follow
+	// the pool) is the value operators are expected to leave alone.
+	minWriteQueueDepth = 2
+	// maxIngestAdmitTimeout is OPS-7's ceiling on PIGEON_INGEST_ADMIT_TIMEOUT.
+	// FR-818's admission deadline exists so a publisher is told "come back" rather
+	// than made to wait, and NFR-1 rates publish at a 100 ms p99: a deadline past
+	// 1 s would keep the request inside the handler long past the latency the
+	// platform promises, which is the parking A-11 removed, one order of
+	// magnitude smaller. Above it is a refusal, not a clamp, because a value that
+	// large means the operator meant to disable the shed and OPS-7 wants that
+	// said out loud.
+	maxIngestAdmitTimeout = time.Second
+	// DefaultWriteQueueWorkers and DefaultIngestAdmitTimeout are the shipped
+	// values of PIGEON_WRITE_QUEUE_WORKERS and PIGEON_INGEST_ADMIT_TIMEOUT. They
+	// are exported so main and the tests name the same numbers the defaults do,
+	// and a test asserts they match writeq's own defaults (they are the same
+	// resource described in two packages).
+	DefaultWriteQueueWorkers  = 2
+	DefaultIngestAdmitTimeout = 100 * time.Millisecond
+)
+
 // Config is the whole runtime configuration. There are no flags and no config
 // files: environment only, per OPS-3.
 type Config struct {
@@ -61,10 +87,19 @@ type Config struct {
 	// configuration where the two are the same role.
 	DatabaseURL        string // PIGEON_DATABASE_URL
 	MigrateDatabaseURL string // PIGEON_MIGRATE_DATABASE_URL
-	DBMaxConns         int32  // PIGEON_DB_MAX_CONNS
-	RedisURL           string // PIGEON_REDIS_URL
-	MigrationsOn       bool   // PIGEON_MIGRATIONS_ON_BOOT (OPS-9: exactly one migrator)
-	MigrateWaitDL      time.Duration
+	// DBMaxConns is the pool ceiling, and since S12 it is also the default width
+	// of FR-818's write budget (PIGEON_WRITE_QUEUE_DEPTH=0 follows it), because
+	// the slot that holds a connection and the budget that admits one are the
+	// same resource. The default moved 10 -> 40 with S12: 10 was measured to
+	// serialize a single publish for 10.2 s against 40 concurrent publishers on
+	// the 2 vCPU reference box, and 40 measured 86 ms (t_b5272d2d, docs/load-test.md).
+	// It stays OPS-8-safe at 1 and 2 replicas against a default Postgres
+	// (1 x 40 + 5 = 45 <= 100; 2 x 40 + 5 = 85 <= 100) and does NOT at 4, which
+	// docs/topology.md states with the arithmetic.
+	DBMaxConns    int32  // PIGEON_DB_MAX_CONNS (default 40)
+	RedisURL      string // PIGEON_REDIS_URL
+	MigrationsOn  bool   // PIGEON_MIGRATIONS_ON_BOOT (OPS-9: exactly one migrator)
+	MigrateWaitDL time.Duration
 
 	// Identity
 	InstanceAdminPassword string // PIGEON_INSTANCE_ADMIN_PASSWORD
@@ -120,6 +155,14 @@ type Config struct {
 	SweeperLockURL           string        // PIGEON_SWEEPER_LOCK_URL (defaults to DatabaseURL)
 	SweeperLockWait          time.Duration // PIGEON_SWEEPER_LOCK_WAIT (how long to compete before logging "standing by"; the replica keeps competing)
 
+	// Write budget (S12, FR-818 amended by SPEC.md A-11). One bounded write
+	// budget per process, shared by ingest and every control-state writer: ingest
+	// is admitted within IngestAdmitTimeout or shed with 429, and the writer pool
+	// is fixed at boot rather than growing a goroutine per event (FR-816).
+	WriteQueueDepth    int           // PIGEON_WRITE_QUEUE_DEPTH (0 = follow PIGEON_DB_MAX_CONNS; clamped to 2..DBMaxConns)
+	WriteQueueWorkers  int           // PIGEON_WRITE_QUEUE_WORKERS (the fixed batch-writer pool, >= 1)
+	IngestAdmitTimeout time.Duration // PIGEON_INGEST_ADMIT_TIMEOUT (NFR-1's rated publish p99; > 0 and <= 1 s)
+
 	// Attempt evidence buffering (S6). D-1: attempts are buffered in Redis and
 	// never in worker process memory; D-2: the mode is configurable; FR-812/815:
 	// the flusher writes them in batches of at least 2,000 rows per transaction
@@ -163,7 +206,7 @@ func defaults() Config {
 		HTTPAddr:                  ":8080",
 		ShutdownGrace:             20 * time.Second,
 		ReadHeaderLimit:           10 * time.Second,
-		DBMaxConns:                10,
+		DBMaxConns:                40,
 		MigrationsOn:              true,
 		MigrateWaitDL:             30 * time.Second,
 		SessionTTL:                12 * time.Hour,
@@ -193,6 +236,13 @@ func defaults() Config {
 		DeliveryPollInterval:      time.Second,
 		SweeperInterval:           5 * time.Second,
 		SweeperLockWait:           60 * time.Second,
+		// S12's write budget (FR-818, SPEC.md A-11). The depth follows the pool
+		// (0 means "use PIGEON_DB_MAX_CONNS"), the writer pool is the fixed two
+		// FR-816 asks for, and admission waits NFR-1's rated publish p99 - the
+		// arithmetic for all three is in .env.example and docs/topology.md.
+		WriteQueueDepth:    0,
+		WriteQueueWorkers:  DefaultWriteQueueWorkers,
+		IngestAdmitTimeout: DefaultIngestAdmitTimeout,
 		// S6's defaults: buffered evidence (D-1), 2,000-row transactions
 		// (FR-815), a 1 s flush cadence (the §6 window), and the SB-5 retention
 		// windows. SuccessLogRPS is LOG-2's bound.
@@ -310,6 +360,16 @@ func Load() (Config, error) {
 	if c.SweeperLockWait, err = envDuration("PIGEON_SWEEPER_LOCK_WAIT", c.SweeperLockWait); err != nil {
 		return Config{}, err
 	}
+	// S12's write budget (FR-818, SPEC.md A-11).
+	if c.WriteQueueDepth, err = envInt("PIGEON_WRITE_QUEUE_DEPTH", c.WriteQueueDepth); err != nil {
+		return Config{}, err
+	}
+	if c.WriteQueueWorkers, err = envInt("PIGEON_WRITE_QUEUE_WORKERS", c.WriteQueueWorkers); err != nil {
+		return Config{}, err
+	}
+	if c.IngestAdmitTimeout, err = envDuration("PIGEON_INGEST_ADMIT_TIMEOUT", c.IngestAdmitTimeout); err != nil {
+		return Config{}, err
+	}
 	c.AttemptLogMode = strings.ToLower(strings.TrimSpace(env("PIGEON_ATTEMPT_LOG_MODE", c.AttemptLogMode)))
 	if c.AttemptFlushBatch, err = envInt("PIGEON_ATTEMPT_FLUSH_BATCH", c.AttemptFlushBatch); err != nil {
 		return Config{}, err
@@ -346,6 +406,19 @@ func Load() (Config, error) {
 	// the durability contract already states, so it is clamped like the others.
 	if c.AttemptFlushInterval > maxFlushInterval {
 		c.AttemptFlushInterval = maxFlushInterval
+	}
+	// S12's write budget: an unnamed depth follows the pool (0), and a named one
+	// is clamped into [2, PIGEON_DB_MAX_CONNS]. Both ends are deliberate rather
+	// than refusals - see minWriteQueueDepth - and the pool end matters because a
+	// budget wider than the pool it admits onto is a longer queue in front of the
+	// same connections, which is the parking A-11 removed.
+	if c.WriteQueueDepth != 0 {
+		if c.WriteQueueDepth < minWriteQueueDepth {
+			c.WriteQueueDepth = minWriteQueueDepth
+		}
+		if c.WriteQueueDepth > int(c.DBMaxConns) {
+			c.WriteQueueDepth = int(c.DBMaxConns)
+		}
 	}
 	// LOG-2 bounds per-success lines above 100/s. The floor is one line per
 	// second, not zero: an operator still needs a liveness signal, and the
@@ -426,6 +499,16 @@ func (c Config) Validate() error {
 	}
 	if c.DBMaxConns < 2 {
 		problems = append(problems, "PIGEON_DB_MAX_CONNS must be >= 2")
+	}
+	// FR-818 (SPEC.md A-11): the write budget's refusals. The depth is clamped by
+	// Load (see minWriteQueueDepth) and so is not checked here; these two decide
+	// whether the budget can do its job at all, so they are refusals.
+	if c.WriteQueueWorkers < 1 {
+		problems = append(problems, "PIGEON_WRITE_QUEUE_WORKERS must be >= 1 (FR-816's batch-writer pool: 0 leaves the write budget with no writer, so every control-state write would wait forever)")
+	}
+	if c.IngestAdmitTimeout <= 0 || c.IngestAdmitTimeout > maxIngestAdmitTimeout {
+		problems = append(problems, fmt.Sprintf(
+			"PIGEON_INGEST_ADMIT_TIMEOUT must be > 0 and <= %s (FR-818: ingest is admitted within NFR-1's rated publish p99 or shed with 429, so the deadline cannot be disabled)", maxIngestAdmitTimeout))
 	}
 	if c.SessionTTL <= 0 {
 		problems = append(problems, "PIGEON_SESSION_TTL must be positive")

@@ -19,8 +19,8 @@ The core **checks this at boot** against the server's real `max_connections` and
 refuses to start when it does not fit:
 
 ```
-pigeon: unsafe configuration: OPS-8 connection budget: 4 replicas x 10 pool + 5
-reserved = 45 > max_connections 44. Lower PIGEON_DB_MAX_CONNS, lower
+pigeon: unsafe configuration: OPS-8 connection budget: 4 replicas x 40 pool + 5
+reserved = 165 > max_connections 100. Lower PIGEON_DB_MAX_CONNS, lower
 PIGEON_CORE_REPLICAS, or put pgbouncer in front of Postgres
 ```
 
@@ -28,11 +28,38 @@ A replica that starts anyway and then steals another replica's connections is an
 outage nobody can attribute, which is why this is a startup refusal (the same
 class as OPS-7) rather than a warning.
 
+## What the pool bounds, now that it is a write budget (S12, FR-818)
+
+`PIGEON_DB_MAX_CONNS` is not an ingest queue and never was: it bounds **concurrent
+database writes**, and since S12 the write budget's width follows it
+(`PIGEON_WRITE_QUEUE_DEPTH=0`, the default, means "follow the pool"). One slot of
+the budget is held for one database write - one publish transaction on the ingest
+path, one batch transaction on the control-state path - so the pool and the budget
+are two names for the same ceiling, and counting them separately would count the
+same connection twice.
+
+That is why the shipped default moved 10 to 40 in S12. Pool 10 with 40 concurrent
+publishers was measured to serialise a single publish for **10.2 s**; pool 40
+measured **86 ms** on the same 2 vCPU box (`docs/load-test.md`). A ceiling that
+low is not a knob an operator is expected to find, it is a defect: before S12 the
+publish path took a pool connection with no deadline, so past that ceiling the
+instance **parked** rather than shedding, and a 30-minute run at 250 events/s
+recorded zero 429s with a p99 that grew from 3,593.4 ms to 4,281.6 ms.
+
+The same arithmetic at the new default, against a default Postgres
+(`max_connections=100`, reserved 5):
+
+| Replicas | Budget | Fits `max_connections`? |
+|---|---|---|
+| 1 | `1 × 40 + 5 = 45` | yes |
+| 2 | `2 × 40 + 5 = 85` | yes |
+| 4 | `4 × 40 + 5 = 165` | **no** - the boot refusal above fires; use pgbouncer, or lower `PIGEON_DB_MAX_CONNS` for that deployment |
+
 ## One replica
 
 ```
-core (1) ──► Postgres        PIGEON_CORE_REPLICAS=1, PIGEON_DB_MAX_CONNS=10
-             max_connections ≥ 15 (10 + 5 reserved, Postgres' own default is 100)
+core (1) ──► Postgres        PIGEON_CORE_REPLICAS=1, PIGEON_DB_MAX_CONNS=40
+             max_connections ≥ 45 (40 + 5 reserved, Postgres' own default is 100)
 ```
 
 This is the reference deployment in `compose.yaml`. No pooler.
@@ -45,7 +72,7 @@ connection count against Postgres directly:
 
 ```
 core × N ──► pgbouncer ──► Postgres        PIGEON_CORE_REPLICAS=N
-                                          PIGEON_DB_MAX_CONNS=10 (per replica,
+                                          PIGEON_DB_MAX_CONNS=40 (per replica,
                                           against pgbouncer... see below)
 ```
 
