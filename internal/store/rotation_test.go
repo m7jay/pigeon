@@ -55,7 +55,7 @@ func TestRotateKeepsThePreviousSecretForTheOverlap(t *testing.T) {
 		t.Fatalf("FanOutEvent: %v", err)
 	}
 
-	d, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour)
+	d, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour, AttemptClassAny)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestClaimScansAnEndpointThatHasNeverRotated(t *testing.T) {
 		t.Fatalf("clear lease: %v", err)
 	}
 
-	d, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour)
+	d, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour, AttemptClassAny)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}

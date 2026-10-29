@@ -603,7 +603,7 @@ func TestFaultKilledWorkerLeavesARecoverableLease(t *testing.T) {
 		t.Fatal("the sweeper re-queued nothing; a lapsed lease must be recovered (D-6)")
 	}
 
-	d, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour)
+	d, got, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour, store.AttemptClassAny)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
