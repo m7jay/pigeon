@@ -107,6 +107,23 @@ type Config struct {
 	SessionTTL            time.Duration
 	SelfRegistration      bool // PIGEON_SELF_REGISTRATION (FR-102: default off)
 
+	// FR-111's password reset (S9a). The window is short and the transport is the
+	// deployment's: v1.0 ships no mailer, so the token goes to the core's notifier
+	// seam, which logs it only when the operator opts in - a reset link in a
+	// shared log is a credential in a shared log.
+	PasswordResetTTL       time.Duration // PIGEON_PASSWORD_RESET_TTL (default 1h)
+	PasswordResetLogTokens bool          // PIGEON_PASSWORD_RESET_LOG_TOKENS (default off)
+
+	// FR-106's optional OIDC login (S9a). The API server needs only the issuer and
+	// the client id, because it VERIFIES an id_token the portal obtained; the
+	// client secret and the redirect URI belong to the portal (the relying party)
+	// and are read there, so the core process never holds the value that lets a
+	// caller speak for the portal at the issuer. Both empty means the feature is
+	// off, which is the default: an instance that configures no IdP has no OIDC
+	// control on either portal.
+	OIDCIssuer   string // PIGEON_OIDC_ISSUER
+	OIDCClientID string // PIGEON_OIDC_CLIENT_ID
+
 	// Rate limits (FR-207). In-process per replica; see SPEC.md's S1 notes.
 	RateLimitPerKeyRPS        float64 // PIGEON_RATE_LIMIT_PER_KEY_RPS
 	RateLimitPerKeyBurst      int     // PIGEON_RATE_LIMIT_PER_KEY_BURST
@@ -219,6 +236,7 @@ func defaults() Config {
 		MigrationsOn:              true,
 		MigrateWaitDL:             30 * time.Second,
 		SessionTTL:                12 * time.Hour,
+		PasswordResetTTL:          time.Hour,
 		LogLevel:                  slog.LevelInfo,
 		LogJSON:                   true,
 		InstanceAdminPassword:     "",
@@ -293,6 +311,14 @@ func Load() (Config, error) {
 	if c.SelfRegistration, err = envBool("PIGEON_SELF_REGISTRATION", c.SelfRegistration); err != nil {
 		return Config{}, err
 	}
+	if c.PasswordResetTTL, err = envDuration("PIGEON_PASSWORD_RESET_TTL", c.PasswordResetTTL); err != nil {
+		return Config{}, err
+	}
+	if c.PasswordResetLogTokens, err = envBool("PIGEON_PASSWORD_RESET_LOG_TOKENS", c.PasswordResetLogTokens); err != nil {
+		return Config{}, err
+	}
+	c.OIDCIssuer = env("PIGEON_OIDC_ISSUER", "")
+	c.OIDCClientID = env("PIGEON_OIDC_CLIENT_ID", "")
 	if c.RateLimitPerKeyRPS, err = envFloat("PIGEON_RATE_LIMIT_PER_KEY_RPS", c.RateLimitPerKeyRPS); err != nil {
 		return Config{}, err
 	}
@@ -524,6 +550,15 @@ func (c Config) Validate() error {
 	}
 	if c.SessionTTL <= 0 {
 		problems = append(problems, "PIGEON_SESSION_TTL must be positive")
+	}
+	if c.PasswordResetTTL <= 0 {
+		problems = append(problems, "PIGEON_PASSWORD_RESET_TTL must be positive (a reset window of zero or less would mint tokens that are already dead)")
+	}
+	// A half-configured OIDC login would silently disable the feature the operator
+	// thinks they enabled: verification needs the issuer to find the keys and the
+	// client id to check the audience, so one without the other is a refusal.
+	if (c.OIDCIssuer == "") != (c.OIDCClientID == "") {
+		problems = append(problems, "PIGEON_OIDC_ISSUER and PIGEON_OIDC_CLIENT_ID must be set together (FR-106: the API verifies an id_token against the issuer's keys and its own client id; one without the other cannot verify anything)")
 	}
 	if c.CoreReplicas < 1 {
 		problems = append(problems, "PIGEON_CORE_REPLICAS must be >= 1 (OPS-8 counts every replica's pool)")
