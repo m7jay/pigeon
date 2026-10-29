@@ -288,14 +288,20 @@ func New(o Options) *Queue {
 // Depth is the resolved write budget: how many database writes may be in flight.
 func (q *Queue) Depth() int { return q.depth }
 
+// hold wraps a slot already taken from the budget in an idempotent release, so a
+// caller that releases twice cannot widen the budget.
+func (q *Queue) hold() Release {
+	var once sync.Once
+	return func() { once.Do(func() { <-q.slots }) }
+}
+
 // Acquire takes a slot of the budget for one database write the caller runs
 // itself (the publish path's transaction is the one such caller). It blocks until
 // a slot is free or ctx ends, and never fails on fullness.
 func (q *Queue) Acquire(ctx context.Context) (Release, error) {
 	select {
 	case q.slots <- struct{}{}:
-		var once sync.Once
-		return func() { once.Do(func() { <-q.slots }) }, nil
+		return q.hold(), nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-q.done:
@@ -304,17 +310,32 @@ func (q *Queue) Acquire(ctx context.Context) (Release, error) {
 }
 
 // Admit is FR-818's ingest admission: Acquire with the process's admission
-// deadline. It returns ErrSaturated - not ctx.Err() - when the budget stayed full
-// for the whole deadline, because that is the one outcome the publish path must
-// turn into a 429 rather than an internal error.
+// deadline. It returns ErrSaturated - not ctx.Err() - when the budget is full at
+// the deadline, because that is the one outcome the publish path must turn into a
+// 429 rather than an internal error.
+//
+// A slot that is free at that instant is taken anyway, even though the deadline
+// has passed. The deadline expiring is not by itself evidence that the budget is
+// full: a goroutine that was not scheduled while the deadline passed comes back to
+// a select with two ready cases (its slot send, and the timer that already fired)
+// and Go picks one at random, so a plain timer arm sheds for an EMPTY budget -
+// measured at `InFlight=0 Depth=4` on a starved -race run. A shed therefore means
+// exactly what ErrSaturated claims: the budget stayed full for the whole deadline.
+// That is what keeps a loaded instance distinct from a full one (AC-45: the rated
+// ingest load must see zero 429s, so a shed with the budget empty is the one
+// outcome it may never suffer).
 func (q *Queue) Admit(ctx context.Context) (Release, error) {
 	timer := time.NewTimer(q.admitWait)
 	defer timer.Stop()
 	select {
 	case q.slots <- struct{}{}:
-		var once sync.Once
-		return func() { once.Do(func() { <-q.slots }) }, nil
+		return q.hold(), nil
 	case <-timer.C:
+		select {
+		case q.slots <- struct{}{}:
+			return q.hold(), nil
+		default:
+		}
 		if q.metrics != nil {
 			q.metrics.Inc(metrics.WriteQueueSaturated)
 		}
