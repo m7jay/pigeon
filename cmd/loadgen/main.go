@@ -73,6 +73,15 @@ type config struct {
 	// yet: the measured delivery unit would then be a statement about the drain
 	// speed of the relay rather than about the instance's fan-out.
 	Settle time.Duration
+	// Class is the §8.1 machine class the run declares for the machine under test
+	// (-class). Empty means the run claims none, which leaves AC-30's third clause
+	// ungradeable: see class.go.
+	Class string
+	// GeneratorOnSUT is the §12 protocol fact - whether the generator shared the
+	// machine under test - as auto, yes or no. auto resolves it from -base.
+	GeneratorOnSUT string
+	// Claim is the class claim classPreflight built, carried into the report.
+	Claim *classClaim
 }
 
 func main() {
@@ -86,6 +95,8 @@ func main() {
 		err = cmdRun(os.Args[2:])
 	case "compare":
 		err = cmdCompare(os.Args[2:])
+	case "grade":
+		err = cmdGrade(os.Args[2:])
 	case "seed":
 		err = cmdSeed(os.Args[2:])
 	case "sink":
@@ -106,7 +117,8 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `loadgen - Pigeon load generator (§16 load protocol)
 
-  loadgen run     -base URL -key KEY -event-type NAME -rate N [-subs N] [-db DSN] [-out FILE]
+  loadgen run     -base URL -key KEY -event-type NAME -rate N [-subs N] [-db DSN] [-out FILE] [-class NAME]
+  loadgen grade   -label FILE [-out FILE] [-class NAME]
   loadgen compare -label FILE -label FILE [-label FILE ...]
 
 run flags:
@@ -119,11 +131,23 @@ run flags:
   -warmup          excluded warm-up (default 5m)
   -measure         measured phase (default 30m)
   -evaluate        pass-criteria window at the end of the measurement (default 10m)
-  -subs            subscriptions per event, for the delivery unit (default 1)
+  -subs            subscriptions per event, for the delivery unit (default 1; -class grades at 10, §8.1)
   -db              Postgres DSN for reconciliation; omit to skip it
   -label           name for this run, e.g. "2vCPU-4GB-2replicas"
   -out             write the JSON report here
   -concurrency     in-flight requests (default 64)
+  -class           declare the §8.1 machine class this run claims for the machine under test
+                   (2vCPU-2GB, 2vCPU-4GB, 4vCPU-8GB, 8vCPU-16GB); required for AC-30's third
+                   clause, which "grade" decides
+  -generator-on-sut  auto|yes|no - did the generator share the machine under test? (§12; auto
+                   resolves it from -base)
+
+grade flags:
+  -label           the JSON report "run -class" wrote; the exit status is clause 3's verdict
+  -out             write the verdict JSON here
+  -class           assert the artifact declares this class
+
+"compare" is AC-43's replica-scaling comparison; "grade" is AC-30 clause 3's.
 `)
 }
 
@@ -146,6 +170,8 @@ func cmdRun(args []string) error {
 	fs.IntVar(&c.Concurrency, "concurrency", 64, "in-flight requests")
 	fs.DurationVar(&c.RequestTimeout, "timeout", 10*time.Second, "per-request timeout")
 	fs.DurationVar(&c.Settle, "settle", 60*time.Second, "wait after the last publish before reconciling (relay fan-out is asynchronous)")
+	fs.StringVar(&c.Class, "class", "", "§8.1 machine class this run claims (AC-30 clause 3)")
+	fs.StringVar(&c.GeneratorOnSUT, "generator-on-sut", "auto", "auto|yes|no: did the generator share the machine under test? (§12)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -160,6 +186,18 @@ func cmdRun(args []string) error {
 	}
 	if c.Concurrency <= 0 {
 		return errors.New("-concurrency must be positive")
+	}
+	if c.Class != "" {
+		// A class declaration is a claim that this run grades AC-30's third clause,
+		// so the harness checks what makes that possible before spending the 35
+		// minutes: §8.1's basis, the database the graded units are counted in, and
+		// - when the generator is on the machine under test, so the class is
+		// observable - that the machine carries the class it claims.
+		claim, err := classPreflight(c)
+		if err != nil {
+			return err
+		}
+		c.Claim = claim
 	}
 	rep, err := runLoad(c)
 	if err != nil {
@@ -211,11 +249,24 @@ type reconcile struct {
 	Deliveries   int64   `json:"db_deliveries"`
 	Accepted     int64   `json:"generator_accepted"`
 	DeliveriesPS float64 `json:"deliveries_per_s"`
+	EventsPS     float64 `json:"events_per_s"`
+	WindowS      float64 `json:"window_s"`
 	XactPS       float64 `json:"xact_commit_per_s"`
 	RowsPerXact  float64 `json:"rows_per_xact"`
 	EventsMatch  bool    `json:"events_match"`
 	OutboxMatch  bool    `json:"outbox_match"`
 	Note         string  `json:"note,omitempty"`
+}
+
+// window is one reconciliation window: the interval, the count the generator saw
+// accepted inside it at dispatch time, and (once counted) its length. §16 counts
+// accepted events in the database rather than from the generator's counter, and
+// AC-30's third clause is stated over the graded window alone, so the run window and
+// the graded window are both counted.
+type window struct {
+	From     time.Time
+	To       time.Time
+	Accepted int64
 }
 
 type verdict struct {
@@ -226,11 +277,44 @@ type verdict struct {
 
 type machine struct {
 	Hostname string `json:"hostname"`
-	CPUs     int    `json:"cpus"`
-	MemMiB   int64  `json:"mem_mib"`
-	Kernel   string `json:"kernel"`
-	Go       string `json:"go_version"`
-	DB       string `json:"database,omitempty"`
+	// CPUs is the machine's effective vCPU count: the CPU affinity the process may
+	// actually use, capped by any cgroup quota. Both inputs are recorded, because a
+	// container that has been given two cores of a 32-core host is a 2 vCPU machine
+	// and must not be able to claim a bigger class than it carries.
+	CPUs        int    `json:"cpus"`
+	CPUAffinity int    `json:"cpu_affinity,omitempty"`
+	CPUQuota    string `json:"cpu_quota,omitempty"`
+	// MemMiB is the effective memory: /proc/meminfo, capped by any cgroup limit.
+	MemMiB       int64 `json:"mem_mib"`
+	MemHostMiB   int64 `json:"mem_host_mib,omitempty"`
+	MemCgroupMiB int64 `json:"mem_cgroup_mib,omitempty"`
+	// The disk the harness runs on. A delivery ceiling is a write-path claim, so the
+	// machine block §16 asks for is not complete without it.
+	DiskGiB     float64 `json:"disk_gib,omitempty"`
+	DiskFreeGiB float64 `json:"disk_free_gib,omitempty"`
+	Kernel      string  `json:"kernel"`
+	Go          string  `json:"go_version"`
+	// Revision is the VCS revision the binary was built from, read out of the
+	// binary's own build info rather than taken on trust from a flag.
+	Revision string `json:"revision,omitempty"`
+	// ObservedClass is the §8.1 row this machine itself matches, when it matches
+	// one. Empty means it carries none of them.
+	ObservedClass string `json:"observed_class,omitempty"`
+	DB            string `json:"database,omitempty"`
+}
+
+// runConfig is the generator-side configuration a report carries. It is a named
+// type because the verdicts read it back (windowBlockers, `grade`).
+type runConfig struct {
+	BaseURL     string  `json:"base_url"`
+	EventType   string  `json:"event_type"`
+	TargetRate  float64 `json:"target_rate_events_per_s"`
+	PayloadByte int     `json:"payload_bytes"`
+	Subs        int     `json:"subscriptions_per_event"`
+	WarmupS     float64 `json:"warmup_s"`
+	MeasureS    float64 `json:"measure_s"`
+	EvaluateS   float64 `json:"evaluate_s"`
+	Concurrency int     `json:"concurrency"`
 }
 
 type report struct {
@@ -238,24 +322,22 @@ type report struct {
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at"`
 	Machine   machine   `json:"machine"`
-	Config    struct {
-		BaseURL     string  `json:"base_url"`
-		EventType   string  `json:"event_type"`
-		TargetRate  float64 `json:"target_rate_events_per_s"`
-		PayloadByte int     `json:"payload_bytes"`
-		Subs        int     `json:"subscriptions_per_event"`
-		WarmupS     float64 `json:"warmup_s"`
-		MeasureS    float64 `json:"measure_s"`
-		EvaluateS   float64 `json:"evaluate_s"`
-		Concurrency int     `json:"concurrency"`
-	} `json:"config"`
-	Warmup    phase     `json:"warmup"`
-	Measured  phase     `json:"measured"`
-	Evaluated phase     `json:"evaluated"`
-	FirstEval phase     `json:"first_evaluate_window"`
-	Reconcile reconcile `json:"reconcile"`
-	Verdicts  []verdict `json:"verdicts"`
-	OK        bool      `json:"ok"`
+	// Class is the §8.1 machine class this run declared with -class, absent when it
+	// declared none. AC-30's third clause is not gradeable without it: `grade` says
+	// so rather than comparing a number against a row nobody claimed.
+	Class     *classClaim `json:"class,omitempty"`
+	Config    runConfig   `json:"config"`
+	Warmup    phase       `json:"warmup"`
+	Measured  phase       `json:"measured"`
+	Evaluated phase       `json:"evaluated"`
+	FirstEval phase       `json:"first_evaluate_window"`
+	Reconcile reconcile   `json:"reconcile"`
+	// Graded is the same reconciliation over the graded window alone - the last
+	// -evaluate of the measured phase - which is the window AC-30's third clause
+	// compares against §8.1.
+	Graded   reconcile `json:"graded_reconcile"`
+	Verdicts []verdict `json:"verdicts"`
+	OK       bool      `json:"ok"`
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +349,28 @@ type sample struct {
 	status  int
 	latency time.Duration
 	err     error
+}
+
+// phaseWindows is §12's load protocol laid on a wall clock: the warm-up (excluded
+// from every reported number), the measured phase, the graded window at its end,
+// and the first window of equal length at the same offered rate - which is what
+// "no silent latency growth" is measured against.
+type phaseWindows struct {
+	measureStart   time.Time
+	measureEnd     time.Time
+	gradedStart    time.Time
+	firstWindowEnd time.Time
+}
+
+func newPhaseWindows(now time.Time, warmup, measure, evaluate time.Duration) phaseWindows {
+	start := now.Add(warmup)
+	end := start.Add(measure)
+	return phaseWindows{
+		measureStart:   start,
+		measureEnd:     end,
+		gradedStart:    end.Add(-evaluate),
+		firstWindowEnd: start.Add(evaluate),
+	}
 }
 
 func runLoad(c config) (*report, error) {
@@ -281,6 +385,7 @@ func runLoad(c config) (*report, error) {
 	rep.Config.EvaluateS = c.Evaluate.Seconds()
 	rep.Config.Concurrency = c.Concurrency
 	rep.Machine = describeMachine()
+	rep.Class = c.Claim
 
 	client := &http.Client{
 		Timeout: c.RequestTimeout,
@@ -300,15 +405,25 @@ func runLoad(c config) (*report, error) {
 	defer stop()
 
 	body := buildPayload(c.PayloadBytes)
-	measureStart := time.Now().Add(c.Warmup)
-	measureEnd := measureStart.Add(c.Measure)
-	evalStart := measureEnd.Add(-c.Evaluate)
-	firstEvalEnd := measureStart.Add(c.Evaluate)
+	// §12's windows, in one place and computed from the phase lengths: 5 minutes of
+	// warm-up excluded, the measured phase, and the graded window at its end.
+	win := newPhaseWindows(time.Now(), c.Warmup, c.Measure, c.Evaluate)
+	measureStart, measureEnd := win.measureStart, win.measureEnd
+	evalStart, firstEvalEnd := win.gradedStart, win.firstWindowEnd
 
 	fmt.Printf("loadgen: %s -> %s %s at %.0f events/s (payload %d B, %d sub(s)/event)\n",
 		orUnset(c.Label), c.BaseURL, c.EventType, c.Rate, c.PayloadBytes, c.Subs)
 	fmt.Printf("  warm-up %s (excluded), measure %s, criteria over the last %s\n",
 		c.Warmup, c.Measure, c.Evaluate)
+	if c.Claim != nil {
+		fmt.Printf("  class: %s (%d vCPU / %d GiB) declared for the machine under test, class evidence %s\n",
+			c.Claim.Name, c.Claim.CPUs, c.Claim.MemGiB, c.Claim.Evidence)
+		if c.Claim.Note != "" {
+			fmt.Printf("  note: %s\n", c.Claim.Note)
+		}
+		fmt.Printf("  AC-30 clause 3 (the ceiling against §8.1's row) is graded from the artifact: loadgen grade -label %s\n",
+			orUnset(c.Out))
+	}
 	if c.DB == "" {
 		fmt.Println("  reconciliation: SKIPPED (no -db); the accepted count will not be checked against the database")
 	}
@@ -323,6 +438,18 @@ func runLoad(c config) (*report, error) {
 	interval := time.Duration(float64(time.Second) / c.Rate)
 	if interval <= 0 {
 		interval = time.Nanosecond
+	}
+
+	// §12 wants FR-815's batching sampled from pg_stat_database.xact_commit, and the
+	// counter has to bracket the run: the baseline is taken here, before the first
+	// publish. Taking it only around the reconciliation query - which runs after the
+	// load has stopped - measures the milliseconds between two reads and the
+	// instance's background sweeper. Found on card `t_0bf3effa`: a run reported 0.0
+	// xact/s at 0.00 rows/transaction while the counter had advanced by thousands.
+	xactBase, xactErr := xactCommits(ctx, c.DB)
+	if xactErr != nil && c.DB != "" {
+		fmt.Printf("  commit counter baseline unavailable (%s); FR-815's rows/transaction will not be measured\n",
+			redactErr(xactErr))
 	}
 
 	start := time.Now()
@@ -426,7 +553,15 @@ loop:
 	// that the two sides of the comparison describe the same set of requests, so a
 	// difference means something (a lost response, a rolled-back accept, or a
 	// dropped row) instead of being boundary noise.
-	rep.Reconcile = reconcileDB(ctx, c, warmupS.acceptedCount()+measuredS.acceptedCount(), start, time.Now())
+	//
+	// The graded window is reconciled separately, and the same edge argument is why
+	// its two sides are reported rather than equated: AC-30's third clause compares
+	// the database's counts over the last 10 minutes against §8.1's row, and the
+	// generator's own tally over the same window is carried as a cross-check.
+	rep.Reconcile, rep.Graded = reconcileDB(ctx, c,
+		window{From: start, To: time.Now(), Accepted: warmupS.acceptedCount() + measuredS.acceptedCount()},
+		window{From: evalStart, To: measureEnd, Accepted: evalS.acceptedCount()},
+		xactBase, xactErr == nil)
 	rep.Verdicts = judge(rep, c)
 	rep.OK = allPassed(rep)
 	return rep, nil
