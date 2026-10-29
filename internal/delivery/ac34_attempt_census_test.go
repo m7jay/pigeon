@@ -120,14 +120,31 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 	service.Store(int64(comparativeService))
 
 	var counter inFlightCounter
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// torn counts handlers whose client went away before the service time was up
+	// (a delivery timeout tore the attempt down). They are reported, not counted
+	// as concurrency: see the handler.
+	var torn atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The receiver holds each request for a fixed service time, so the number
 		// of handlers running at once IS the number of attempts the endpoint is
-		// serving at once. (Blocking until the test releases the handler instead
-		// would keep counting after a client timeout tore a request down, and would
-		// then be measuring the test rather than the cap.)
+		// serving at once. A handler whose client has gone away stops counting,
+		// though: a delivery timeout can tear an attempt down while its handler is
+		// still inside the sleep, and a torn-down attempt is no longer a slot the
+		// endpoint is holding. Counting it made a starved box look like it had
+		// exceeded the cap - one local run at load average 15 measured peak
+		// in-flight 13 and 20 against a cap of 10, while the same content in CI
+		// measured exactly 10 on both legs and every other bound held in both. The
+		// attribution is testable rather than assumed: if live attempts really
+		// exceeded the cap, the torn count logged below would be 0 and the
+		// assertion would still fire.
 		counter.enter()
-		time.Sleep(time.Duration(service.Load()))
+		select {
+		case <-time.After(time.Duration(service.Load())):
+		case <-r.Context().Done():
+			torn.Add(1)
+			counter.leave()
+			return
+		}
 		counter.leave()
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -142,6 +159,7 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 		t.Helper()
 		service.Store(int64(serviceTime))
 		counter.reset()
+		torn.Store(0)
 
 		// Enqueue the WHOLE backlog before the worker starts. Publishing while it
 		// drains would measure the arrival rate rather than the cap: the due set
@@ -240,7 +258,7 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 		return figures{
-			backlog: backlog, inFlight: peak, goroutines: maxGoroutines,
+			backlog: backlog, inFlight: peak, torn: int(torn.Load()), goroutines: maxGoroutines,
 			fds: maxFDs, attempts: attemptsServed, cpuCores: cpuCores, drain: elapsed,
 		}
 	}
@@ -248,12 +266,12 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 	seen := map[int]figures{}
 	record := func(fig figures) {
 		seen[fig.backlog] = fig
-		t.Logf("offered %d deliveries: peak in-flight %d, peak goroutines %d, peak fds %d, attempts served %d, CPU %.2f cores, drained in %s",
-			fig.backlog, fig.inFlight, fig.goroutines, fig.fds, fig.attempts, fig.cpuCores, fig.drain.Round(time.Millisecond))
+		t.Logf("offered %d deliveries: peak in-flight %d (%d attempt(s) torn down by their client), peak goroutines %d, peak fds %d, attempts served %d, CPU %.2f cores, drained in %s",
+			fig.backlog, fig.inFlight, fig.torn, fig.goroutines, fig.fds, fig.attempts, fig.cpuCores, fig.drain.Round(time.Millisecond))
 
 		if fig.inFlight > concurrencyCap {
-			t.Errorf("offered %d: %d attempts in flight for an endpoint capped at %d (FR-1302)",
-				fig.backlog, fig.inFlight, concurrencyCap)
+			t.Errorf("offered %d: %d attempts in flight for an endpoint capped at %d (FR-1302); %d further attempt(s) were torn down by their client and are not counted here",
+				fig.backlog, fig.inFlight, concurrencyCap, fig.torn)
 		}
 		if fig.inFlight < 2 {
 			t.Errorf("offered %d: peak in-flight was %d; the load never overlapped more than one attempt, so this run says nothing about concurrency",
@@ -348,8 +366,8 @@ func TestAttemptFanOutIsBounded(t *testing.T) {
 
 // figures is one leg's census.
 type figures struct {
-	backlog, inFlight, goroutines, fds, attempts int
-	cpuCores                                     float64
+	backlog, inFlight, torn, goroutines, fds, attempts int
+	cpuCores                                           float64
 	// drain is how long the leg took from the first publish's completion (the
 	// sampler's start) to the point the whole backlog had drained.
 	drain time.Duration
