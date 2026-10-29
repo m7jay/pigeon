@@ -137,6 +137,13 @@ over budget, the per-table retention windows and the live partition catalogue; a
 failed disk read keeps the last good figure and sets `read_error`, so an operator is
 never shown a calm number that stopped updating.
 
+A producer reads the same numbers through the producer portal's UI-8 panel, which is
+a thin client of `GET /v1/producer/usage`: the member-visible half of that same
+reading - the volume figure, the percentage, whether it is over budget and the
+retention windows - and deliberately without the partition catalogue, which stays on
+the admin route. The panel renders `read_error` the same way, so a producer sees a
+stale reading as a stale reading rather than a calm gauge.
+
 ## Operational checks
 
 - The drops are visible in `GET /v1/meta/usage` (`dropped_partitions_total`), in

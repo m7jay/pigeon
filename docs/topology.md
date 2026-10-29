@@ -128,8 +128,20 @@ constrained by.
 | API (HTTP handlers) | N, stateless | holds no state between requests; the session and key tables are the truth |
 | delivery workers | N, stateless | leases in Postgres, attempt buffer in Redis (D-1) |
 | relays | N, safe by `SKIP LOCKED` | one row is leased by one relay |
+| producer portal | N, stateless | thin client of the core API: no database, no workers, no state between requests; may be omitted entirely (AC-40) |
+| consumer portal | N, stateless | thin client of the core API: no database, no workers, no state between requests; may be omitted entirely (UI-19, AC-40) |
 | **migrator** | 1 | advisory lock, but only one process should contend: set `PIGEON_MIGRATIONS_ON_BOOT=false` on replicas 2..N |
 | **sweeper** | 1 active | leadership by advisory lock (D-7); every other replica is a standby |
+
+The portals are deployables of their own - three in total with the core (§14) -
+and neither is part of the core process: each holds a connection to the core's
+HTTP API and to nothing else, so neither appears in the connection budget above
+and neither can hold a Postgres connection out of the pool. The producer portal
+(`cmd/producer-portal`, UI-1…UI-11) is producer-facing; the consumer portal
+(`cmd/consumer-portal`, UI-12…UI-19) is consumer-facing; both ship as binaries in
+the one image and start by overriding the container command. Either may be omitted
+or removed entirely (AC-40): the core keeps serving the same API with the same
+server-side scoping, and the audience that had a UI simply has none.
 
 ## Egress addresses (FR-1007)
 
