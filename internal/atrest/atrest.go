@@ -4,7 +4,8 @@
 // supplies as base64 (PIGEON_HEADERS_KEY), a fresh random nonce per value, and a
 // caller-supplied additional-authenticated-data string. The first user is the
 // endpoint custom header values (FR-405, FR-1006); endpoint signing secrets are
-// stored plaintext because they must be usable at sign time, so there was no
+// stored plaintext because the value must be reproduced at sign time and cannot
+// be hashed - a reason against hashing, not against encryption - so there was no
 // earlier primitive to reuse and this one is the pattern the rest of the tree
 // should follow:
 //
