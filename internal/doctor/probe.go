@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"syscall"
 	"time"
 
@@ -92,10 +91,16 @@ func OpenRedis(ctx context.Context, url string) (*RedisProbeImpl, error) {
 	defer cancel()
 	rdb, err := redisconn.Client(url)
 	if err != nil {
-		// redisconn's message quotes the value it refused, and a Redis URL may
-		// carry a password in its userinfo. Doctor's lines redact the URL
-		// (FR-1008), so the reason must not smuggle the raw one past them.
-		return nil, errors.New(strings.ReplaceAll(err.Error(), url, Redact(url)))
+		// The reason is built here, without the value. redisconn's refusal
+		// quotes what it refused and net/url quotes it again, so a value
+		// carrying a literal quote or backslash comes back escaped - and a
+		// value whose shape the parser rejected is exactly the kind that hides
+		// a password in a place the parser did not expect. Redacting by
+		// substitution only catches a spelling it recognises, so the value is
+		// not repeated in any rendering: the check's Observed line already
+		// carries Redact(url) and its Fix line already names PIGEON_REDIS_URL.
+		// (FR-1008.)
+		return nil, errors.New("PIGEON_REDIS_URL could not be parsed as a Redis connection URL (the value is withheld, FR-1008)")
 	}
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
