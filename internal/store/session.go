@@ -110,7 +110,46 @@ func (s *Store) CreateSession(ctx context.Context, in LoginInput, ttl time.Durat
 	if !identity.VerifyPassword(hash, in.Password) {
 		return Session{}, "", ErrNotFound
 	}
+	return s.issueSession(ctx, userID, email, isAdmin, mustChange, in.ProducerSlug, ttl)
+}
 
+// CreateSessionForVerifiedIdentity mints a session for an account whose identity
+// some *other* credential proved - FR-106's optional OIDC login, where the
+// id_token's signature and claims are the proof and there is no password to check
+// here. It exists so the trusted-verifier path and the password path cannot
+// disagree about anything else: which claims the session carries, what a user
+// with no claims gets (nothing), how the token is minted and stored.
+//
+// It deliberately cannot create a user: an unknown address is ErrNotFound, and an
+// account with no producer membership, no admin flag and no consumer binding gets
+// no session, exactly as a password login would (FR-111: an OIDC login is a way to
+// authenticate, never a way to register into a producer).
+func (s *Store) CreateSessionForVerifiedIdentity(ctx context.Context, email string, ttl time.Duration) (Session, string, error) {
+	var (
+		userID     string
+		gotEmail   string
+		isAdmin    bool
+		mustChange bool
+	)
+	err := s.pool.QueryRow(ctx, `
+		select id, email, is_instance_admin, must_change_password
+		  from users where lower(email) = lower($1)`, email,
+	).Scan(&userID, &gotEmail, &isAdmin, &mustChange)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Session{}, "", ErrNotFound
+	}
+	if err != nil {
+		return Session{}, "", fmt.Errorf("load user: %w", err)
+	}
+	return s.issueSession(ctx, userID, gotEmail, isAdmin, mustChange, "", ttl)
+}
+
+// issueSession is the shared tail of both login paths: resolve the claims a user
+// can act with, refuse to mint a session for a user who has none, and record the
+// session. Returning no session here is the requirement (FR-109's "an
+// authenticated identity that can do nothing is a support ticket"), not an
+// oversight, and it is why both entry points go through it.
+func (s *Store) issueSession(ctx context.Context, userID, email string, isAdmin, mustChange bool, producerSlug string, ttl time.Duration) (Session, string, error) {
 	sess := Session{
 		UserID:             userID,
 		Email:              email,
@@ -124,7 +163,7 @@ func (s *Store) CreateSession(ctx context.Context, in LoginInput, ttl time.Durat
 		return Session{}, "", err
 	}
 	if len(memberships) > 0 {
-		m, err := pickMembership(memberships, in.ProducerSlug)
+		m, err := pickMembership(memberships, producerSlug)
 		if err != nil {
 			return Session{}, "", err
 		}

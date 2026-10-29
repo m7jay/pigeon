@@ -50,6 +50,11 @@ type PublishInput struct {
 	ConsumerID     *string
 	ConsumerRef    *string
 	IdempotencyKey string
+	// Test marks the event as a synthetic test (UI-4). It changes nothing about
+	// how the event is validated, fanned out, delivered or retried - the marker
+	// is a column on the row, so a test delivery exercises the production path
+	// and the fact that it was a test survives into the log.
+	Test bool
 }
 
 // PublishedEvent is what a 202 reports back, and the record of what was accepted.
@@ -67,6 +72,10 @@ type PublishedEvent struct {
 	ConsumerRef    string
 	PayloadVersion int
 	Payload        json.RawMessage
+	// IsTest is the marker the publish carried (UI-4). It is read back with the
+	// event, so an idempotent replay answers with the same marker the original
+	// 202 did.
+	IsTest bool
 }
 
 const (
@@ -162,10 +171,10 @@ func (s *Store) PublishEvent(ctx context.Context, sc Scope, in PublishInput) (Pu
 		if _, err := tx.Exec(ctx, `
 			insert into events
 				(id, producer_id, env, event_type, payload_version, routing_mode, event_class,
-				 consumer_id, consumer_ref, occurred_at, payload)
-			values ($1, $2, $3, $4, $5, $6, $7, null, nullif($8, ''), $9, $10)`,
+				 consumer_id, consumer_ref, occurred_at, payload, is_test)
+			values ($1, $2, $3, $4, $5, $6, $7, null, nullif($8, ''), $9, $10, $11)`,
 			eventID, sc.ProducerID, sc.Env, et.Name, et.PayloadVersion, et.RoutingMode, et.EventClass,
-			consumerRef, occurredAt, in.Payload,
+			consumerRef, occurredAt, in.Payload, in.Test,
 		); err != nil {
 			return mapEventInsertError(err)
 		}
@@ -200,6 +209,7 @@ func (s *Store) PublishEvent(ctx context.Context, sc Scope, in PublishInput) (Pu
 			ID: eventID, EventType: et.Name, ProducerID: sc.ProducerID, Env: sc.Env,
 			OccurredAt: occurredAt, RoutingMode: et.RoutingMode, EventClass: et.EventClass,
 			ConsumerRef: consumerRef, PayloadVersion: et.PayloadVersion, Payload: in.Payload,
+			IsTest: in.Test,
 		}
 		return nil
 	})
@@ -387,12 +397,12 @@ func readPublishedEventTx(ctx context.Context, tx pgx.Tx, sc Scope, eventID stri
 func readPublishedEventRow(ctx context.Context, tx pgx.Tx, sc Scope, eventID string, out *PublishedEvent) error {
 	return tx.QueryRow(ctx, `
 		select id, event_type, occurred_at, routing_mode, event_class, coalesce(consumer_ref, ''),
-			payload_version, payload
+			payload_version, payload, is_test
 		from events
 		where producer_id = $1 and env = $2 and id = $3`,
 		sc.ProducerID, sc.Env, eventID,
 	).Scan(&out.ID, &out.EventType, &out.OccurredAt, &out.RoutingMode, &out.EventClass,
-		&out.ConsumerRef, &out.PayloadVersion, &out.Payload)
+		&out.ConsumerRef, &out.PayloadVersion, &out.Payload, &out.IsTest)
 }
 
 func hashIdempotencyKey(key string) []byte {

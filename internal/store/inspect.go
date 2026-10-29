@@ -113,6 +113,10 @@ type DeliverySummary struct {
 	// being held, which is every delivery whose attempt has started.
 	HeldBackSince  *time.Time
 	HeldBackReason *string
+	// IsTest is the marker UI-4 sets on a synthetic test event (0020): it rides
+	// on the delivery row's event, so a producer reading the log can tell a test
+	// delivery from a production one wherever the two appear side by side.
+	IsTest bool
 }
 
 // DurationMs is how long the delivery took: the wait between its first attempt
@@ -216,7 +220,7 @@ func (s *Store) ListDeliveries(ctx context.Context, sc Scope, f DeliveryFilter, 
 			select d.id, d.event_id, e.event_type, d.endpoint_id, d.consumer_id, d.status,
 			       d.attempts, d.first_attempt_at, d.delivered_at, d.created_at,
 			       d.non_delivery_reason, d.replay_of_delivery_id,
-			       d.held_back_since, d.held_back_reason
+			       d.held_back_since, d.held_back_reason, e.is_test
 			from deliveries d
 			join events e on e.id = d.event_id
 			where d.producer_id = $1 and d.env = $2
@@ -240,7 +244,7 @@ func (s *Store) ListDeliveries(ctx context.Context, sc Scope, f DeliveryFilter, 
 			if err := rows.Scan(&d.ID, &d.EventID, &d.EventType, &d.EndpointID, &d.ConsumerID,
 				&d.Status, &d.Attempts, &d.FirstAttemptAt, &d.DeliveredAt, &d.CreatedAt,
 				&d.NonDeliveryReason, &d.ReplayOfDeliveryID,
-				&d.HeldBackSince, &d.HeldBackReason); err != nil {
+				&d.HeldBackSince, &d.HeldBackReason, &d.IsTest); err != nil {
 				return err
 			}
 			page.Deliveries = append(page.Deliveries, d)
@@ -272,14 +276,14 @@ func (s *Store) GetDelivery(ctx context.Context, sc Scope, id int64) (DeliveryDe
 			select d.id, d.event_id, e.event_type, d.endpoint_id, d.consumer_id, d.status,
 			       d.attempts, d.first_attempt_at, d.delivered_at, d.created_at,
 			       d.non_delivery_reason, d.replay_of_delivery_id,
-			       d.held_back_since, d.held_back_reason
+			       d.held_back_since, d.held_back_reason, e.is_test
 			from deliveries d
 			join events e on e.id = d.event_id
 			where d.producer_id = $1 and d.env = $2 and d.id = $3`,
 			sc.ProducerID, sc.Env, id).Scan(&d.ID, &d.EventID, &d.EventType, &d.EndpointID,
 			&d.ConsumerID, &d.Status, &d.Attempts, &d.FirstAttemptAt, &d.DeliveredAt,
 			&d.CreatedAt, &d.NonDeliveryReason, &d.ReplayOfDeliveryID,
-			&d.HeldBackSince, &d.HeldBackReason)
+			&d.HeldBackSince, &d.HeldBackReason, &d.IsTest)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -403,7 +407,10 @@ type EventView struct {
 	RoutingState      *string
 	NonDeliveryReason *string
 	Rollup            string
-	Deliveries        []DeliveryDetail
+	// IsTest is UI-4's marker (0020) on the event itself, so the event page the
+	// portal sends a test from can say so when it sends the user to look at it.
+	IsTest     bool
+	Deliveries []DeliveryDetail
 }
 
 // EventView reads one event with every delivery it produced and computes the
@@ -414,12 +421,12 @@ func (s *Store) EventView(ctx context.Context, sc Scope, eventID string) (EventV
 		out.EventID = eventID
 		err := tx.QueryRow(ctx, `
 			select event_type, routing_mode, consumer_id, consumer_ref, payload_version,
-			       occurred_at, created_at, routing_state, non_delivery_reason
+			       occurred_at, created_at, routing_state, non_delivery_reason, is_test
 			from events
 			where producer_id = $1 and env = $2 and id = $3`,
 			sc.ProducerID, sc.Env, eventID).Scan(&out.EventType, &out.RoutingMode,
 			&out.ConsumerID, &out.ConsumerRef, &out.PayloadVersion, &out.OccurredAt,
-			&out.CreatedAt, &out.RoutingState, &out.NonDeliveryReason)
+			&out.CreatedAt, &out.RoutingState, &out.NonDeliveryReason, &out.IsTest)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -451,7 +458,7 @@ func deliveriesForEvent(ctx context.Context, tx pgx.Tx, sc Scope, eventID string
 		select d.id, d.event_id, e.event_type, d.endpoint_id, d.consumer_id, d.status,
 		       d.attempts, d.first_attempt_at, d.delivered_at, d.created_at,
 		       d.non_delivery_reason, d.replay_of_delivery_id,
-		       d.held_back_since, d.held_back_reason
+		       d.held_back_since, d.held_back_reason, e.is_test
 		from deliveries d
 		join events e on e.id = d.event_id
 		where d.producer_id = $1 and d.env = $2 and d.event_id = $3
@@ -467,7 +474,7 @@ func deliveriesForEvent(ctx context.Context, tx pgx.Tx, sc Scope, eventID string
 		if err := rows.Scan(&d.ID, &d.EventID, &d.EventType, &d.EndpointID, &d.ConsumerID,
 			&d.Status, &d.Attempts, &d.FirstAttemptAt, &d.DeliveredAt, &d.CreatedAt,
 			&d.NonDeliveryReason, &d.ReplayOfDeliveryID,
-			&d.HeldBackSince, &d.HeldBackReason); err != nil {
+			&d.HeldBackSince, &d.HeldBackReason, &d.IsTest); err != nil {
 			rows.Close()
 			return nil, err
 		}
