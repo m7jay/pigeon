@@ -20,6 +20,7 @@ import (
 
 	"github.com/m7jay/pigeon/internal/atrest"
 	"github.com/m7jay/pigeon/internal/db"
+	"github.com/m7jay/pigeon/internal/dbtest"
 	"github.com/m7jay/pigeon/internal/identity"
 	"github.com/m7jay/pigeon/internal/ratelimit"
 	"github.com/m7jay/pigeon/internal/store"
@@ -128,8 +129,12 @@ func buildEnv() (*env, error) {
 	if err := resetDatabase(ctx, admin, dsn); err != nil {
 		return nil, err
 	}
-	if err := provisionAppRole(ctx, admin); err != nil {
-		return nil, err
+	// The runtime role is cluster-wide, so another suite on this cluster may be
+	// creating it at the same instant: the shared fixture (internal/dbtest)
+	// treats losing that race as the role now existing, and reports a genuine
+	// CREATEROLE denial as one.
+	if err := dbtest.ProvisionAppRole(ctx, admin, appRole, appPassword); err != nil {
+		return nil, fmt.Errorf("provision %s: %w", appRole, err)
 	}
 
 	appDSN, err := withAppCredentials(dsn)
@@ -216,33 +221,8 @@ func resetDatabase(ctx context.Context, admin *pgxpool.Pool, dsn string) error {
 	return nil
 }
 
-// provisionAppRole creates the non-superuser the server runs as, and grants it
-// table access. Without this the API would connect as a superuser and RLS would
-// never be exercised, which is exactly the failure mode the S0 harness fixed.
-func provisionAppRole(ctx context.Context, admin *pgxpool.Pool) error {
-	_, err := admin.Exec(ctx, `
-		do $$
-		begin
-			if not exists (select 1 from pg_roles where rolname = '`+appRole+`') then
-				create role `+appRole+` login password '`+appPassword+`' nosuperuser nobypassrls;
-			end if;
-		end $$;`)
-	if err != nil {
-		return fmt.Errorf("provision %s: %w", appRole, err)
-	}
-	for _, grant := range []string{
-		`grant usage on schema public to ` + appRole,
-		`grant select, insert, update, delete on all tables in schema public to ` + appRole,
-		`grant usage, select on all sequences in schema public to ` + appRole,
-		`grant execute on all functions in schema public to ` + appRole,
-	} {
-		if _, err := admin.Exec(ctx, grant); err != nil {
-			return fmt.Errorf("grant %q: %w", grant, err)
-		}
-	}
-	return nil
-}
-
+// withAppCredentials rewrites the DSN for the app role's credentials, so the
+// server connects as the non-superuser runtime role rather than the test admin.
 func withAppCredentials(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {

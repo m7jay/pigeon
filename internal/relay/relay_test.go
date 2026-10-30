@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/m7jay/pigeon/internal/db"
+	"github.com/m7jay/pigeon/internal/dbtest"
 	"github.com/m7jay/pigeon/internal/envelope"
 	"github.com/m7jay/pigeon/internal/store"
 )
@@ -55,7 +56,12 @@ func harness(t *testing.T) (*store.Store, *pgxpool.Pool) {
 		t.Fatalf("migrate: %v", err)
 	}
 	resetForRelay(ctx, t, admin)
-	if err := provisionAppRole(ctx, admin); err != nil {
+	// The relay's store runs as the tenant-scoped runtime role, not the
+	// superuser - the same baseline the store harness grants. The role is
+	// cluster-wide, so another suite on this cluster may be creating it at the
+	// same instant; the shared fixture treats losing that race as the role now
+	// existing.
+	if err := dbtest.ProvisionAppRole(ctx, admin, appRole, appPassword); err != nil {
 		t.Fatalf("provision app role: %v", err)
 	}
 	app, err := db.Connect(ctx, withAppCreds(dsn), 5)
@@ -75,38 +81,6 @@ func withAppCreds(dsn string) string {
 	}
 	u.User = url.UserPassword(appRole, appPassword)
 	return u.String()
-}
-
-// provisionAppRole creates the runtime role and grants it the same baseline the
-// store integration harness uses, so the relay's store runs as a tenant-scoped
-// role rather than the superuser.
-func provisionAppRole(ctx context.Context, admin *pgxpool.Pool) error {
-	var exists bool
-	if err := admin.QueryRow(ctx,
-		`select exists(select 1 from pg_roles where rolname = $1)`, appRole).Scan(&exists); err != nil {
-		return err
-	}
-	if !exists {
-		// The role name is a constant, so only the password is a bind param.
-		if _, err := admin.Exec(ctx,
-			`create role `+appRole+` login password $1`, appPassword); err != nil {
-			return err
-		}
-	}
-	_, err := admin.Exec(ctx, `grant usage on schema public to `+appRole)
-	if err != nil {
-		return err
-	}
-	_, err = admin.Exec(ctx, `grant select, insert, update, delete on all tables in schema public to `+appRole)
-	if err != nil {
-		return err
-	}
-	_, err = admin.Exec(ctx, `grant usage, select on all sequences in schema public to `+appRole)
-	if err != nil {
-		return err
-	}
-	_, err = admin.Exec(ctx, `grant execute on all functions in schema public to `+appRole)
-	return err
 }
 
 func parseDSN(dsn string) (*url.URL, error) { return url.Parse(dsn) }

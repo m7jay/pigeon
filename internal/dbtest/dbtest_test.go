@@ -56,8 +56,15 @@ func adminPool(t *testing.T) *pgxpool.Pool {
 func TestProvisionAppRoleToleratesAConcurrentCreator(t *testing.T) {
 	admin := adminPool(t)
 	ctx := context.Background()
-	dropProbeRole(t, admin, raceRole)
-	t.Cleanup(func() { dropProbeRole(t, admin, raceRole) })
+
+	// Each subtest owns the role: a subtest that fails must not leave the role
+	// behind for the next one, whose seed would then report duplicate_object
+	// instead of the thing it is testing.
+	fresh := func(t *testing.T) {
+		t.Helper()
+		dropProbeRole(t, admin, raceRole)
+		t.Cleanup(func() { dropProbeRole(t, admin, raceRole) })
+	}
 
 	// createStmt is the statement under test: the fixture's own, so the test
 	// cannot drift from what the harnesses run.
@@ -70,6 +77,7 @@ func TestProvisionAppRoleToleratesAConcurrentCreator(t *testing.T) {
 	}
 
 	t.Run("the winner committed first", func(t *testing.T) {
+		fresh(t)
 		// The other suite's create landed before ours was planned. This is the
 		// shape that used to reach the store harness's "needs CREATEROLE" skip.
 		if _, err := admin.Exec(ctx, createStmt); err != nil {
@@ -81,10 +89,10 @@ func TestProvisionAppRoleToleratesAConcurrentCreator(t *testing.T) {
 		if err := createRole(ctx, admin, raceRole, probePass); err != nil {
 			t.Fatalf("a create that lost the race to a committed winner must be success, got: %v", err)
 		}
-		dropProbeRole(t, admin, raceRole)
 	})
 
 	t.Run("both creates are in flight at once", func(t *testing.T) {
+		fresh(t)
 		// Two suites booting together are genuinely simultaneous: the winner's
 		// INSERT into pg_authid is still uncommitted when the loser's INSERT
 		// runs, so CreateRole's own "already exists" check misses on both sides
@@ -130,10 +138,10 @@ func TestProvisionAppRoleToleratesAConcurrentCreator(t *testing.T) {
 		if err := <-tolerated; err != nil {
 			t.Fatalf("the create that lost the simultaneous race must be success, got: %v", err)
 		}
-		dropProbeRole(t, admin, raceRole)
 	})
 
 	t.Run("provisioning over an existing role is a no-op", func(t *testing.T) {
+		fresh(t)
 		if _, err := admin.Exec(ctx, createStmt); err != nil {
 			t.Fatalf("seed the role: %v", err)
 		}
@@ -147,7 +155,6 @@ func TestProvisionAppRoleToleratesAConcurrentCreator(t *testing.T) {
 		if !granted {
 			t.Fatalf("ProvisionAppRole reported success without granting %s usage on the schema", raceRole)
 		}
-		dropProbeRole(t, admin, raceRole)
 	})
 }
 
