@@ -28,9 +28,22 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// lockHolderPid returns the backend holding the sweeper leadership lock, or 0
-// when no session holds it. It reads pg_locks directly, so it observes the real
-// lock rather than the sweeper's own bookkeeping.
+// lockHolderPid returns the backend holding the sweeper leadership lock in THIS
+// database, or 0 when no session holds it. It reads pg_locks directly, so it
+// observes the real lock rather than the sweeper's own bookkeeping.
+//
+// The database filter is load-bearing, not decoration. pg_locks is CLUSTER-wide
+// and every pigeon worker on a box shares one Postgres cluster, while the
+// leadership key is a constant: a sweeper test running in another database holds
+// a pg_locks row with the same classid/objid/objsubid. Without the filter two
+// rows match the same key, the order between them is whatever the lock manager's
+// hash scan yields (there is no ORDER BY that could mean anything here), and this
+// test then observes the foreign session - and `pg_terminate_backend` further
+// down would kill it. Measured on the shared cluster while a foreign holder
+// lived: `leadership moved while the holder was alive: <foreign pid> -> <own
+// leader pid>` although the sweeper behaved correctly. Advisory locks are taken
+// per database (the lock tag carries MyDatabaseId), so scoping to this database's
+// oid keeps exactly the rows this test's own replicas produce.
 func lockHolderPid(t *testing.T, admin *pgxpool.Pool) int32 {
 	t.Helper()
 	high, low := advisoryLockParts(sweeperLockID)
@@ -39,7 +52,8 @@ func lockHolderPid(t *testing.T, admin *pgxpool.Pool) int32 {
 		select pid from pg_locks
 		 where locktype = 'advisory'
 		   and classid::bigint = $1 and objid::bigint = $2
-		   and objsubid = 1 and granted`, high, low).Scan(&pid)
+		   and objsubid = 1 and granted
+		   and database = (select oid from pg_database where datname = current_database())`, high, low).Scan(&pid)
 	if err != nil {
 		return 0 // no holder
 	}
