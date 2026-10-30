@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"os"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/m7jay/pigeon/internal/apikey"
 	"github.com/m7jay/pigeon/internal/db"
+	"github.com/m7jay/pigeon/internal/dbtest"
 )
 
 // appRole is the non-superuser the application is meant to run as in production.
@@ -49,31 +51,25 @@ func testPool(t *testing.T) *pgxpool.Pool {
 }
 
 // appPool provisions the non-superuser role (idempotently) and returns a pool
-// connected as it. Skips rather than fails when the connected role may not create
-// roles, so a developer's local database without CREATEROLE is a skip, not a lie.
+// connected as it.
+//
+// The provisioning is shared with the other DB-backed harnesses (internal/dbtest)
+// because a role is cluster-wide: two suites on this cluster can be creating
+// `pigeon_app` at the same moment, and the loser of that race must not be
+// reported as anything - the role exists, which is all this harness needs. A
+// session that genuinely may not create roles (a local database whose owner has
+// no CREATEROLE) still skips rather than fails, so it is a skip, not a lie - and
+// it is no longer indistinguishable from a lost race.
 func appPool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 
-	_, err := admin.Exec(ctx, `
-		do $$
-		begin
-			if not exists (select 1 from pg_roles where rolname = '`+appRole+`') then
-				create role `+appRole+` login password '`+appPassword+`' nosuperuser nobypassrls;
-			end if;
-		end $$;`)
+	err := dbtest.ProvisionAppRole(ctx, admin, appRole, appPassword)
 	if err != nil {
-		t.Skipf("cannot provision %s (needs CREATEROLE, e.g. the CI postgres superuser): %v", appRole, err)
-	}
-	for _, grant := range []string{
-		`grant usage on schema public to ` + appRole,
-		`grant select, insert, update, delete on all tables in schema public to ` + appRole,
-		`grant usage, select on all sequences in schema public to ` + appRole,
-		`grant execute on all functions in schema public to ` + appRole,
-	} {
-		if _, err := admin.Exec(ctx, grant); err != nil {
-			t.Fatalf("grant: %v", err)
+		if errors.Is(err, dbtest.ErrNeedsCreateRole) {
+			t.Skipf("cannot provision %s (needs CREATEROLE, e.g. the CI postgres superuser): %v", appRole, err)
 		}
+		t.Fatalf("provision %s: %v", appRole, err)
 	}
 
 	appDSN, err := withAppCredentials(os.Getenv("PIGEON_TEST_DATABASE_URL"))
