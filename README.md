@@ -11,24 +11,22 @@ host.
 ## Quickstart
 
 `compose.yaml` is the reference deployment (OPS-1): five containers - the core,
-both portals, Postgres and Redis. Go 1.26 is what `go.mod` asks for; the
-walkthrough below needs `curl` and `jq`.
+both portals, Postgres and Redis. Go 1.26 is what `go.mod` asks for. The
+walkthrough below is the flow a person actually performs in a browser at the two
+portals; `curl` appears only for the five steps no portal has a page for, each one
+named where it comes up, and those need `curl` and `jq`.
 
 ```sh
 git clone https://github.com/m7jay/pigeon.git && cd pigeon
 
 # .env.example is the complete list of settings (OPS-3, enforced by
-# `go test ./internal/config`). Copy it and replace the published placeholders -
-# they are published, not secret.
+# `go test ./internal/config`). Copy it and work through the ENV checklist below
+# before you start anything.
 cp .env.example .env
-# The shipped headers key is the one value refused outright at boot, which is why
-# it is generated here rather than by hand (FR-1006):
+# The headers key is the one value that refuses to boot at the shipped
+# placeholder, and the one you should not type by hand (FR-1006):
 sed -i "s|^PIGEON_HEADERS_KEY=.*|PIGEON_HEADERS_KEY=$(openssl rand -base64 32)|" .env
-$EDITOR .env   # POSTGRES_PASSWORD, PIGEON_APP_PASSWORD, PORTAL_SESSION_SECRET,
-               # PIGEON_PRODUCER_PORTAL_SESSION_SECRET - compose has no defaults
-               # for these four and refuses to resolve while any is empty - and
-               # PIGEON_INSTANCE_ADMIN_PASSWORD, which the core refuses at boot
-               # when it is empty or a known-weak default (FR-101, OPS-7).
+$EDITOR .env
 
 make compose-up            # == docker compose up -d --build
 ```
@@ -43,68 +41,140 @@ curl -s localhost:8082/healthz       # consumer portal
 curl -s localhost:8083/healthz       # producer portal
 ```
 
-Bootstrap a tenant and deliver one event. The walkthrough registers a public echo
+Start a tenant and watch one event land. The walkthrough registers a public echo
 service as the receiver, because a live endpoint must be a public `https` URL
 (FR-402) - point it at a receiver of your own for real traffic.
+
+### 1. Create the first producer and its owner (curl)
+
+Neither portal has an admin surface: the producer portal signs producer members in
+and is a thin client of `/v1/producer/*`, the consumer portal is a thin client of
+`/v1/consumer/*`, and `POST /v1/admin/producers` is the instance admin's. So the
+bootstrap is the API.
 
 ```sh
 B=http://localhost:8080
 
-# 1. The bootstrap credential is the instance admin (FR-101): admin@pigeon.local
-#    with PIGEON_INSTANCE_ADMIN_PASSWORD. Its first login must change it.
+# The bootstrap credential is the instance admin (FR-101): admin@pigeon.local
+# with PIGEON_INSTANCE_ADMIN_PASSWORD. Its first login must change it.
 ADMIN=$(curl -s -X POST $B/v1/session -H 'content-type: application/json' \
   -d '{"email":"admin@pigeon.local","password":"<PIGEON_INSTANCE_ADMIN_PASSWORD>"}' | jq -r .token)
 curl -s -o /dev/null -w '%{http_code}\n' -X POST $B/v1/session/password \
   -H "authorization: Bearer $ADMIN" -H 'content-type: application/json' \
   -d '{"old_password":"<PIGEON_INSTANCE_ADMIN_PASSWORD>","new_password":"<a new one>"}'   # 204
+ADMIN=$(curl -s -X POST $B/v1/session -H 'content-type: application/json' \
+  -d '{"email":"admin@pigeon.local","password":"<a new one>"}' | jq -r .token)
 
-# 2. A producer, plus the invitation for its first owner, returned once (FR-102).
+# A producer, plus the invitation for its first owner, returned once (FR-102).
 PROD=$(curl -s -X POST $B/v1/admin/producers -H "authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' \
   -d '{"slug":"acme","name":"Acme","owner_email":"owner@acme.test"}')
 INVITE=$(echo "$PROD" | jq -r .owner_invite.token)
+
+# Redeem it as that owner. Still curl: no route of the producer portal redeems an
+# invitation - the only redeem form in the tree is the consumer portal's /invite,
+# and that one binds the session it mints to a consumer.
 curl -s -X POST $B/v1/invites/accept -H 'content-type: application/json' \
   -d "{\"token\":\"$INVITE\",\"password\":\"<owner password>\"}"
+```
 
-# 3. Sign in as that owner. Producer routes carry the plane in ?env=test|live:
-#    the planes are separate data, not a filter (FR-103).
+### 2. Sign in at the producer portal, and switch to Live
+
+Open `http://localhost:8083` and sign in as `owner@acme.test`. The portal opens in
+the plane `PIGEON_PRODUCER_PORTAL_ENV` names (`test` at the shipped default), and
+the nav carries the plane buttons - click **Live**, because that is where the rest
+of this walkthrough creates data. The planes are separate data, not a filter
+(FR-103), and every producer call carries the plane explicitly.
+
+The **Get started** page (`/onboarding`) is UI-1's checklist. Each step's state is
+read back from the API, so the checklist cannot disagree with the platform.
+
+### 3. Register the event type
+
+On **Get started**, "Step 2: register an event type": name `acme.created`, routing
+mode `consumer`, payload schema `{"type":"object"}` (an empty schema box registers
+exactly that). A new type is publicly subscribable by default, which is what lets
+a consumer's user subscribe to it (UI-14).
+
+### 4. Register the consumer and invite its owner
+
+**Consumers** -> "Create the consumer": reference `acme`, name `Acme Signals`.
+Open the consumer and use **Invite someone by email** for `ops@acme-consumer.test`.
+The invitation token is rendered once on that page - v1.0 ships no mailer, so pass
+it on yourself - and an invitation is the only way in (FR-111: no
+self-registration).
+
+### 5. The consumer owner redeems the invitation
+
+Open `http://localhost:8082/invite`, paste the token and the address it was
+addressed to, and choose a password. That creates the account, binds it to the
+consumer and signs it in.
+
+### 6. Register the endpoint, and copy both secrets now
+
+Consumer portal, **Endpoints**, "Register an endpoint": name `httpbin`, URL
+`https://httpbin.org/post`. It is a public `https` URL because a live endpoint
+must be (FR-402); this form has no internal-endpoint checkbox, so a private or
+loopback receiver needs the producer portal's register form, which has one.
+
+On submit the page shows the endpoint's **signing secret** and its **verification
+token**, and says the secret is shown exactly once and cannot be retrieved again -
+copy both before you navigate away. The signing secret is what a verifier checks
+the `webhook-signature` header with; each endpoint page links **Webhook snippet**,
+which renders a verifier in curl, Go, Node or Python (UI-7).
+
+### 7. Answer the ownership challenge (FR-403)
+
+The same page offers **Verify now**, with the token already in the form: press it
+and the endpoint is verified. If you lose that moment, the endpoint's own page
+carries the standing path - "Verify ownership - paste the verification token that
+was shown once when you registered this endpoint. Until it is answered the
+endpoint receives no live events (FR-403)" - and the producer portal's endpoint
+page carries the same ownership form for an endpoint it can see. Both endpoint
+pages also carry the signing-secret **Rotate** action, behind a confirm.
+
+### 8. Subscribe the endpoint to the event type
+
+Endpoint page -> **Subscriptions** -> choose `acme.created` -> **Subscribe**. The
+choices are the types the producer has left publicly subscribable (UI-14).
+
+### 9. Issue a producer API key and publish with it (curl)
+
+No page of the producer portal issues a key, and none publishes with one. Its
+`/test-event` page is the no-key way to send an event from the UI: it publishes
+with your session and is marked as a test everywhere it appears (UI-4).
+
+```sh
+B=http://localhost:8080
+
 OWNER=$(curl -s -X POST $B/v1/session -H 'content-type: application/json' \
   -d '{"email":"owner@acme.test","password":"<owner password>"}' | jq -r .token)
 
-# 4. An event type, a consumer, and its endpoint, which must answer the ownership
-#    challenge before it may receive live deliveries (FR-403; test is not gated).
-curl -s -X POST "$B/v1/producer/event-types?env=live" -H "authorization: Bearer $OWNER" \
-  -H 'content-type: application/json' \
-  -d '{"name":"acme.created","routing_mode":"consumer","payload_schema":{"type":"object"}}'
-CONSUMER=$(curl -s -X POST "$B/v1/producer/consumers?env=live" -H "authorization: Bearer $OWNER" \
-  -H 'content-type: application/json' -d '{"ref":"acme","name":"Acme"}' | jq -r .id)
-EP=$(curl -s -X POST "$B/v1/producer/consumers/$CONSUMER/endpoints?env=live" \
-  -H "authorization: Bearer $OWNER" -H 'content-type: application/json' \
-  -d '{"name":"httpbin","url":"https://httpbin.org/post"}')
-ENDPOINT=$(echo "$EP" | jq -r .id)
-curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-  "$B/v1/producer/consumers/$CONSUMER/endpoints/$ENDPOINT/verify?env=live" \
-  -H "authorization: Bearer $OWNER" -H 'content-type: application/json' \
-  -d "{\"token\":\"$(echo "$EP" | jq -r .verification_token)\"}"          # 204
-curl -s -X POST "$B/v1/producer/endpoints/$ENDPOINT/subscriptions?env=live" \
-  -H "authorization: Bearer $OWNER" -H 'content-type: application/json' \
-  -d '{"event_type":"acme.created"}'
-
-# 5. A producer API key (FR-201): returned once, hashed at rest, revocable.
+# A producer API key (FR-201): returned once, hashed at rest, revocable.
 KEY=$(curl -s -X POST "$B/v1/producer/keys?env=live" -H "authorization: Bearer $OWNER" \
   -H 'content-type: application/json' -d '{}' | jq -r .key)
 
-# 6. Publish. 202 is the commit: the event and its outbox row are one transaction
-#    (FR-604), and the relay fans out from there.
+# Publish. 202 is the commit: the event and its outbox row are one transaction
+# (FR-604), and the relay fans out from there.
 curl -s -X POST $B/v1/events -H "authorization: Bearer $KEY" \
   -H 'content-type: application/json' \
   -d '{"event_type":"acme.created","consumer_ref":"acme","payload":{"id":"evt_1"}}'
-
-# 7. What happened to it. The relay drains the outbox on a cadence and the worker
-#    polls for due deliveries, so give them a moment.
-sleep 5
-curl -s "$B/v1/producer/deliveries?env=live" -H "authorization: Bearer $OWNER" | jq
 ```
+
+### 10. Watch the delivery land
+
+Back in the browser: the producer portal's **Deliveries** (`/deliveries`, in the
+Live plane) and the consumer portal's **Deliveries** both show the new delivery
+with its status and attempt count - each consumer user sees only its own consumer's
+deliveries (FR-1105). The relay drains the outbox on a cadence and the worker polls
+for due deliveries, so reload after a moment.
+
+The curls above are the five steps with no page to submit: the instance-admin
+bootstrap and `POST /v1/admin/producers` (no admin surface exists in either
+portal), the producer owner's invitation (`POST /v1/invites/accept`), the API key
+(`POST /v1/producer/keys`), and the key-authenticated publish (`POST /v1/events`,
+where the UI's only publish sends a test event with your session). Every other
+step above is a form you submitted in the browser.
 
 ## The shape of the system
 
