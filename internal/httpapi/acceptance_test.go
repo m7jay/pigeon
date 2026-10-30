@@ -688,14 +688,13 @@ func TestAC54ReIssueEndpointChallenge(t *testing.T) {
 	if !strings.HasPrefix(frac.VerificationToken, frac.VerificationHint) || len(frac.VerificationHint) != 8 {
 		t.Fatalf("hint %q is not the first 8 characters of the token", frac.VerificationHint)
 	}
-
 	// The endpoint is subscribed to the event type and the event is published
 	// while the endpoint is still unverified: fan-out records a skip delivery
 	// row with the endpoint-unverified reason (FR-403). The re-issue in the
 	// block above arms the endpoint; it does not re-deliver the window, so the
 	// skip row is expected to survive the re-issue and everything that follows.
 	code, raw = e.do(http.MethodPost,
-		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/subscriptions?env=live",
+		"/v1/producer/endpoints/"+created.ID+"/subscriptions?env=live",
 		tn.OwnerToken, map[string]string{"event_type": tn.EventTypeName})
 	mustStatus(t, code, raw, http.StatusCreated)
 
