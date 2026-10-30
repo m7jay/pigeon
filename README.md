@@ -303,17 +303,23 @@ ceiling next to it. The groups, so you can find the one you want:
 `.env` is in `.gitignore`; `.env.example` holds published placeholders, which are
 not secrets and must not be shipped as if they were.
 
-**Running the suite locally** needs two variables of its own, neither of which is
+**Running the suite locally** has two variables of its own, neither of which is
 in `.env.example` (no deployment process reads them):
 
 - `PIGEON_TEST_DATABASE_URL` - the disposable Postgres the DB-backed packages use.
-  `make test` refuses to run without it, because `internal/httpapi`'s harness
-  refuses to skip (an unset DSN would otherwise red sixty acceptance tests at
-  0.00 s and read like a regression). **Its database name must contain `test` by
-  design**: `internal/httpapi` refuses to truncate any other name and
-  `internal/relay` refuses any other DSN, while `internal/store`, `internal/delivery`,
-  `internal/identity`, `internal/db`, `internal/dbtest` and `internal/faults` migrate and
-  truncate whatever database the DSN names. Point it at a database you are willing to lose.
+  It never has to be exported: left unset, `make test` points the suite at
+  compose.yaml's `test` profile (`127.0.0.1:55432`) and creates the database if it
+  is missing; set it to use a Postgres you already have. Compose itself does need
+  the five values the checklist's first item puts in `.env` (it interpolates the
+  whole file), and on a box with no usable `docker compose`, or without that
+  `.env`, `make test` stops at `test-up` instead of running anything. **Its
+  database name must contain `test` by design**: `internal/httpapi` refuses to
+  truncate any other name and `internal/relay` refuses any other DSN, while
+  `internal/store`, `internal/delivery`, `internal/identity`, `internal/db` and
+  `internal/faults` migrate and truncate whatever database the DSN names. Point it
+  at a database you are willing to lose. Whatever it names, `internal/httpapi`'s
+  harness refuses to skip: a database that is not reachable reds its sixty
+  acceptance tests at 0.00 s and reads like a regression.
 - `PIGEON_TEST_REDIS_URL` - optional locally: the Redis-backed packages fall back
   to an in-process miniredis. CI sets it from a `redis:7` service container, and
   the job fails on any `--- SKIP`, so a real Redis leg is what CI measures.
@@ -333,7 +339,7 @@ Checklist:
 - [ ] `PIGEON_SELF_REGISTRATION=false` and `PIGEON_PASSWORD_RESET_LOG_TOKENS=false`.
 - [ ] OIDC is either entirely off or entirely configured (issuer and client id together).
 - [ ] Every secret above differs between dev and prod, and none is in git.
-- [ ] On the machine that runs the suite: `PIGEON_TEST_DATABASE_URL` names a database you can lose, and its name contains `test`.
+- [ ] On the machine that runs the suite: `PIGEON_TEST_DATABASE_URL`, if it is set, names a database you can lose, and its name contains `test`.
 
 ## Where the rules live
 
