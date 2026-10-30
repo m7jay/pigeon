@@ -210,6 +210,37 @@ func signedInWith(t *testing.T, h *Handler, method, target string, form url.Valu
 	return rec
 }
 
+// flashOf reads the one-shot flash cookie a handler set on its response, through
+// the portal's own reader (portal.PullFlashCookie) rather than by splitting the
+// cookie's raw bytes.
+//
+// The reader is the point: the assertion belongs to the message the next page
+// renders, not to the codec's wire form. Splitting the raw value made every such
+// test speak the codec's language - the message's bytes were the assertion's own
+// text - which is how the wire form leaked into three unrelated tests and how they
+// broke when the encoding changed; and a truncated message could only be caught
+// there if the asserted substring happened to straddle the byte that was dropped.
+func flashOf(t *testing.T, rec interface {
+	Result() *http.Response
+}) string {
+	t.Helper()
+	for _, c := range rec.Result().Cookies() {
+		if c.Name != flashCookie {
+			continue
+		}
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.AddCookie(c)
+		kind, msg := portal.PullFlashCookie(req, flashCookie)
+		if kind == "" {
+			// Not a flash at all (an older build's value, or a cookie someone
+			// edited): the page would show it as it stands, so this does too.
+			return c.Value
+		}
+		return msg
+	}
+	return ""
+}
+
 // TestNewParsesEveryTemplate proves the embedded template set parses: the shared
 // base, the consumer nav, the htmx fragments and every page. A template syntax
 // error only surfaces at render time, so construction is the earliest place to

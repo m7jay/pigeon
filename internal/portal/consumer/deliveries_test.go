@@ -318,13 +318,9 @@ func TestConsumerReplayShowsTheAPIsBoundWhereTheUserActed(t *testing.T) {
 	if loc := plain.Header().Get("Location"); loc != "/deliveries?status=failed_terminal" {
 		t.Fatalf("plain replay redirected to %q, want the same filtered log", loc)
 	}
-	var flashed string
-	for _, c := range plain.Result().Cookies() {
-		if c.Name == flashCookie {
-			flashed = c.Value
-		}
-	}
-	if !strings.Contains(flashed, "replay is bounded to 1000 deliveries per request") {
+	// The flash is read the way the page reads it: the message, not the cookie's
+	// raw bytes (see flashOf).
+	if flashed := flashOf(t, plain); !strings.Contains(flashed, "replay is bounded to 1000 deliveries per request") {
 		t.Fatalf("the plain post lost the API's refusal: flash = %q", flashed)
 	}
 

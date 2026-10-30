@@ -150,20 +150,3 @@ func TestEndpointDetailShowsTheEmptyState(t *testing.T) {
 		t.Errorf("an endpoint with no custom headers does not say so:\n%s", body)
 	}
 }
-
-// flashOf reads the one-shot flash cookie a handler set on its response.
-func flashOf(t *testing.T, rec interface {
-	Result() *http.Response
-}) string {
-	t.Helper()
-	for _, c := range rec.Result().Cookies() {
-		if c.Name != flashCookie {
-			continue
-		}
-		if i := strings.IndexByte(c.Value, '|'); i >= 0 {
-			return c.Value[i+1:]
-		}
-		return c.Value
-	}
-	return ""
-}
