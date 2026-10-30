@@ -1353,7 +1353,7 @@ Row 11 is A-10, found by the review of S5: three rows of §7.13's fairness half 
 slice and no implementation, and the one that names a budget could not be read without
 contradicting FR-1308. Row 10 was held for A-9 (card `t_af54d465`), the attempt-buffer
 acknowledgement, while that branch was unlanded, so each row keeps the number it was written with;
-A-9 has since landed into row 10, and the heading's count is now eleven.
+A-9 has since landed into row 10, and the heading's count had reached eleven.
 Row 12 is A-11, found by S10's load test: FR-818 was a P0 with no slice, no
 implementation and no shed path - the instance queued on the pgx pool - and AC-30's third clause
 had no harness behind it at all, so the heading's count was twelve at that point - row 13 below takes it to thirteen. A-11 was extended afterwards, by the review of `t_b9850e1b` (card `t_194e6caf`): FR-703 still read as a per-event transaction boundary for the mechanism A-11 had just given a batched one, so row 12's contract-change cell carries that reading too, and no new row or count is claimed for it. Row 13 is A-12, found by Jay while reviewing the
