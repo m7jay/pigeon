@@ -182,8 +182,12 @@ type usageResponse struct {
 		UsedBytes  int64   `json:"used_bytes"`
 		TotalBytes int64   `json:"total_bytes"`
 		UsedPct    float64 `json:"used_pct"`
-		Source     string  `json:"source"`
-		Path       string  `json:"path"`
+		// Source is where the reading came from and, for a filesystem reading, which
+		// directory was read ("statfs:/var/lib/pigeon"). There is no separate `path`
+		// key in the API's payload (retention.Usage), so nothing here may invent one:
+		// the panel rendered an always-empty row for a field the API never sends
+		// until this was fixed.
+		Source string `json:"source"`
 	} `json:"disk"`
 	MaxDiskPct         int            `json:"max_disk_pct"`
 	OverBudget         bool           `json:"over_budget"`
