@@ -24,12 +24,12 @@ import (
 // single read. The signing secret travels out only to the sign call: it is never
 // logged, stored in an attempt row, or returned by any API (FR-1008).
 type LeasedDelivery struct {
-	DeliveryID    int64
-	EventID       string
-	ProducerID    string
-	Env           string
-	EndpointID    string
-	EndpointURL   string
+	DeliveryID  int64
+	EventID     string
+	ProducerID  string
+	Env         string
+	EndpointID  string
+	EndpointURL string
 	// EndpointInternal is FR-402's escape hatch for this endpoint: the operator's
 	// explicit opt-in to a private, loopback or link-local URL. It comes back
 	// with the claim because FR-1005's request-time SSRF check needs it before an
@@ -39,7 +39,7 @@ type LeasedDelivery struct {
 	// has no tenant at that point - the flag would read as absent and the
 	// endpoint would be treated as public, which makes the hatch inert.
 	EndpointInternal bool
-	SigningSecret string
+	SigningSecret    string
 	// PreviousSigningSecret is the secret this endpoint used before its most
 	// recent rotation, and PreviousSecretExpiresAt is when the 24 h overlap ends
 	// (FR-1004). Both are empty/nil for an endpoint that has never rotated, and
