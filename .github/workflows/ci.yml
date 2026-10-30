@@ -252,6 +252,14 @@ jobs:
           # portals', doctor's, the load harness's - cannot drift out from under it
           # unnoticed, and so the tree that pins the scope rule
           # (TestEnvKnobScanIgnoresOtherTrees) cannot be deleted quietly.
+          # OPS-1's other half (card `t_1505ca1d`): the guard above asks that a
+          # knob this module reads be documented, not that a knob a deployable
+          # reads be forwarded to it - and compose hands a portal an explicit
+          # environment list, so a name missing from that list is a documented
+          # knob the reference deployment ignores. The name below pins that
+          # direction, and with it the binary each locally built service declares
+          # it runs (the image's own entrypoint is the core, so a portal service
+          # that names none is a core container).
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -452,7 +460,8 @@ jobs:
             TestLazyVerifierConstructsWithoutIO \
             TestLazyVerifierDiscoversOnceAndVerifies \
             TestEnvExampleDocumentsEveryKnob \
-            TestEnvKnobScanIgnoresOtherTrees
+            TestEnvKnobScanIgnoresOtherTrees \
+            TestComposeRunsEachDeployableWithItsOwnKnobs
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"

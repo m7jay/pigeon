@@ -20,6 +20,12 @@ import (
 // other string cannot be mistaken for a knob.
 var (
 	envReads = regexp.MustCompile(`\b\w*[Ee]nv\w*\s*\(\s*"([A-Z][A-Z0-9_]*)"`)
+	// The literal default a helper is handed: envOr("NAME", "value"), this
+	// package's env("NAME", "value"). Only a Go string literal is captured - a
+	// default that is a typed value or an expression (envInt("NAME", c.Field),
+	// envDuration("NAME", 5*time.Second)) is not - so a check that needs a
+	// default has to teach this scan the shape rather than guess one.
+	envDefaults = regexp.MustCompile(`\b\w*[Ee]nv\w*\s*\(\s*"([A-Z][A-Z0-9_]*)"\s*,\s*"([^"]*)"`)
 	// compose.yaml's interpolation form: ${NAME}, ${NAME:-default}, ${NAME:?msg}.
 	composeKnobs = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)`)
 	// Any os.Getenv / os.LookupEnv call, whatever its argument: a file that reads
@@ -268,6 +274,15 @@ type knobScan struct {
 	// knobs maps a knob name to the repository-relative file that reads it (the
 	// lexicographically first reader, so the answer does not depend on walk order).
 	knobs map[string]string
+	// readers maps a knob to every file that reads it. knobs is enough to name a
+	// reader in a failure; a check that asks "whose knobs are these?" - the
+	// deployables' or the core's - needs all of them, because one knob can be
+	// read in two commands (PIGEON_CORE_API_URL is read by both portals).
+	readers map[string]map[string]bool
+	// defaults maps a knob to the literal defaults the code hands its helper, so a
+	// deployment that supplies a fallback of its own can be compared with the
+	// value the process would use without it.
+	defaults map[string]map[string]bool
 	// blindSpots are files that read the environment and name no knob at all.
 	blindSpots []string
 	// scanned counts the non-test .go files the walk read.
@@ -279,7 +294,12 @@ type knobScan struct {
 // scanGoKnobs walks root and returns every environment read it can name, by its
 // literal argument, in this module's own non-test Go files.
 func scanGoKnobs(root string) (knobScan, error) {
-	scan := knobScan{knobs: map[string]string{}, walkedTop: map[string]bool{}}
+	scan := knobScan{
+		knobs:     map[string]string{},
+		readers:   map[string]map[string]bool{},
+		defaults:  map[string]map[string]bool{},
+		walkedTop: map[string]bool{},
+	}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -318,6 +338,10 @@ func scanGoKnobs(root string) (knobScan, error) {
 		}
 		for _, m := range matches {
 			record(scan.knobs, m[1], rel)
+			add(scan.readers, m[1], rel)
+		}
+		for _, m := range envDefaults.FindAllStringSubmatch(code, -1) {
+			add(scan.defaults, m[1], m[2])
 		}
 		return nil
 	})
@@ -327,10 +351,7 @@ func scanGoKnobs(root string) (knobScan, error) {
 // undocumented returns the knobs a scan found that example does not assign, each
 // with the file that reads it, sorted so the failure is stable.
 func undocumented(knobs map[string]string, example string) []string {
-	documented := map[string]bool{}
-	for _, m := range envAssigns.FindAllStringSubmatch(example, -1) {
-		documented[m[1]] = true
-	}
+	documented := documentedNames(example)
 	var missing []string
 	for name := range knobs {
 		if !documented[name] {
@@ -347,6 +368,25 @@ func record(knobs map[string]string, name, where string) {
 	if prev, ok := knobs[name]; !ok || where < prev {
 		knobs[name] = where
 	}
+}
+
+// add keeps every distinct value a knob was seen with, so an index answers "all
+// of them" and not "the first one the walk reached".
+func add(index map[string]map[string]bool, name, value string) {
+	if index[name] == nil {
+		index[name] = map[string]bool{}
+	}
+	index[name][value] = true
+}
+
+// documentedNames returns the settings .env.example assigns, which is the set of
+// names its header claims is the complete list.
+func documentedNames(example string) map[string]bool {
+	documented := map[string]bool{}
+	for _, m := range envAssigns.FindAllStringSubmatch(example, -1) {
+		documented[m[1]] = true
+	}
+	return documented
 }
 
 // skipDir is the single rule about which directories hold this module's own code.
