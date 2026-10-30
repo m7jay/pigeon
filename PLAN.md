@@ -10,8 +10,11 @@ disagree, the requirements win and this file is wrong.
 2. Test first: the failing test encodes the criterion, not the implementation.
 3. One commit per slice, Conventional Commits, no signing required.
 4. A slice is done when its ACs are green **and** `make vet test` passes against a
-   disposable Postgres - `make test` requires `PIGEON_TEST_DATABASE_URL` and refuses
-   to run without one, because the AC-15/AC-20 harness no longer skips.
+   disposable Postgres - `make test` brings that Postgres up itself: it starts
+   compose.yaml's `test` profile (Postgres and Redis, published on 55432 and 56379),
+   creates the database the DSN names if it is missing, and runs the DB-backed suite,
+   so no exported variable is needed. The AC-15/AC-20 harness still refuses to skip,
+   so the database has to be reachable either way.
 5. Anything learned that changes a requirement goes into `SPEC.md`'s gap list, not
    silently into the code.
 
@@ -300,9 +303,13 @@ Honest limits — the next slices own these:
 
 ## Definition of done for M0
 
-- `make vet test` green, with `PIGEON_TEST_DATABASE_URL` pointing at a disposable
-  Postgres: `make test` requires it and refuses to run without one (a clean checkout
-  has no such DSN, so the target, not the checkout, is the thing that is clean).
+- `make vet test` green against a disposable Postgres. `make test` needs no exported
+  variable: left unset, it starts compose.yaml's `test` profile (Postgres and Redis,
+  published on 55432 and 56379), waits for both containers to be healthy, and creates
+  the database the DSN names if it is missing. It refuses only when it has neither a
+  usable `docker compose` nor both DSNs; a developer with a Postgres and a Redis of
+  their own sets both `PIGEON_TEST_DATABASE_URL` and `PIGEON_TEST_REDIS_URL` and needs
+  no docker.
 - `PIGEON_TEST_DATABASE_URL` set in CI, harness green, AC-20 in the pipeline.
 - `pigeon` refuses to boot with a missing or weak admin password (OPS-7) —
   verified by hand.
