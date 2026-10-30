@@ -9,6 +9,7 @@ require (
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.58.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -25,5 +26,4 @@ require (
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

@@ -4,10 +4,15 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TestMigratorRoleMustDifferFromTheRuntimeRole is OPS-7 applied to the database
@@ -177,6 +182,270 @@ func TestCoreDoesNotDependOnThePortal(t *testing.T) {
 	if !strings.Contains(portal, "core:") {
 		t.Errorf("the consumer-portal service does not depend on the core:\n%s", portal)
 	}
+}
+
+// ---- The shipped deployment's own knobs (OPS-1, OPS-3) ----------------------
+
+// composeDoc is the slice of compose.yaml this check reads. It is parsed as YAML
+// rather than scanned as text: a service's environment is a mapping three levels
+// down, and a healthcheck's `test:`/`interval:` keys read exactly like settings
+// to a line reader.
+type composeDoc struct {
+	Services map[string]composeService `yaml:"services"`
+}
+
+// composeService is one service as far as this check needs it: whether this
+// repository builds it, which of the image's binaries it runs, and the names that
+// binary is handed.
+type composeService struct {
+	Build       composeBuild `yaml:"build"`
+	Entrypoint  yaml.Node    `yaml:"entrypoint"`
+	EnvFile     yaml.Node    `yaml:"env_file"`
+	Environment yaml.Node    `yaml:"environment"`
+}
+
+type composeBuild struct {
+	Context    string `yaml:"context"`
+	Dockerfile string `yaml:"dockerfile"`
+}
+
+// composeInterp matches a setting whose whole value is compose's own interpolation
+// of one variable: ${NAME}, ${NAME:-fallback}, ${NAME:?message}.
+var composeInterp = regexp.MustCompile(`^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([-?])(.*))?\}$`)
+
+// TestComposeRunsEachDeployableWithItsOwnKnobs is OPS-1 and OPS-3 on the shipped
+// deployment, in the direction TestEnvExampleDocumentsEveryKnob does not cover:
+// that check requires a knob this module reads to be documented, and this one
+// requires a knob a deployable reads to be *forwarded to that deployable*.
+//
+// The core is handed .env wholesale (`env_file: .env`), so every name in it
+// reaches the process and there is nothing to check. A portal is handed an
+// explicit environment list instead, and compose only ever gives a container the
+// variables that list names: a knob the portal's code reads and the list omits
+// never reaches the process, which is what made PORTAL_SESSION_COOKIE_NAME,
+// PIGEON_PORTAL_ADDR, PIGEON_PRODUCER_PORTAL_ADDR and
+// PIGEON_PRODUCER_PORTAL_COOKIE_NAME inert under this deployment while
+// .env.example documented all four as the operator's interface.
+//
+// Three decisions make the check decidable without a table to maintain:
+//
+//   - Only services this repository builds are checked (they have a `build:`
+//     block). postgres and redis are published images; they run no binary of this
+//     module, so they carry no knob of ours.
+//   - Which binary a service runs is read from its own `entrypoint`, and a
+//     service that names none is refused rather than assumed: the image's own
+//     ENTRYPOINT is the core (Dockerfile), so a portal service that says nothing
+//     is a core container - which is the second defect this test found, and the
+//     reason the forwarding check could not be anchored on the service name.
+//   - The knobs of that binary are those read by every package it links
+//     (localImportsOf), not just its cmd/ directory: a knob a deployable reads in
+//     a shared package - both portals' PORTAL_BRAND_*, from internal/portalui - is
+//     still a knob the deployable reads.
+//
+// It also reads the list the other way, for the fallback compose supplies when
+// .env is silent, because "forward it at the code's default" is what the ADDR
+// knobs need: an empty fallback means the code's own default applies (envOr and
+// this package's helpers both read empty as unset), and a non-empty one has to BE
+// the code's default - otherwise the deployment hands the process a value the
+// operator never chose and a run outside compose never gets.
+//
+// What it deliberately does not claim: a setting .env.example documents that only
+// a wrapper outside compose reads (the load harness, `make run-portal`) needs no
+// forwarding - an operator's own tooling is not a defect - and a knob read through
+// a computed name is invisible here exactly as it is in the sibling check.
+func TestComposeRunsEachDeployableWithItsOwnKnobs(t *testing.T) {
+	const root = "../.."
+	var doc composeDoc
+	if err := yaml.Unmarshal([]byte(readSibling(t, filepath.Join(root, "compose.yaml"))), &doc); err != nil {
+		t.Fatalf("parse compose.yaml as YAML: %v", err)
+	}
+	if len(doc.Services) == 0 {
+		t.Fatal("compose.yaml declares no services")
+	}
+
+	scan, err := scanGoKnobs(root)
+	if err != nil {
+		t.Fatalf("scan %s: %v", root, err)
+	}
+	// The canary for the scan, as in the sibling check: an empty or tiny left side
+	// would make every service green for the wrong reason.
+	if len(scan.readers) < 60 {
+		t.Fatalf("the scan named only %d knobs, which cannot be right - the walk is broken, not compose.yaml", len(scan.readers))
+	}
+	module := modulePath(t, root)
+	documented := documentedNames(readSibling(t, filepath.Join(root, ".env.example")))
+
+	names := make([]string, 0, len(doc.Services))
+	for name := range doc.Services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	built := 0
+	for _, name := range names {
+		svc := doc.Services[name]
+		if svc.Build.Context == "" && svc.Build.Dockerfile == "" {
+			continue
+		}
+		built++
+
+		entrypoint := scalarsOf(t, "compose.yaml service "+name+" entrypoint", svc.Entrypoint)
+		if len(entrypoint) == 0 {
+			t.Errorf("compose.yaml's %s service overrides no entrypoint, so the container runs the image's own - /pigeon, "+
+				"the core - whatever the service is called. Name the binary it runs (`entrypoint: [\"/pigeon\"]`, "+
+				"`[\"/producer-portal\"]`, `[\"/consumer-portal\"]`): this check reads that line to decide whose knobs the "+
+				"service has to carry, and a portal container running the core carries none of the portal's", name)
+			continue
+		}
+		cmdDir := path.Join("cmd", filepath.Base(entrypoint[0]))
+		if info, err := os.Stat(filepath.Join(root, cmdDir)); err != nil || !info.IsDir() {
+			t.Errorf("compose.yaml's %s service runs %s, which is not a package this module builds (no %s/ directory)",
+				name, entrypoint[0], cmdDir)
+			continue
+		}
+
+		dirs := map[string]bool{}
+		for _, pkg := range localImportsOf(t, root, module, module+"/"+cmdDir) {
+			dirs[strings.TrimPrefix(strings.TrimPrefix(pkg, module), "/")] = true
+		}
+		type wanted struct{ knob, reader string }
+		var want []wanted
+		for knob, readers := range scan.readers {
+			var inBinary []string
+			for reader := range readers {
+				if dirs[path.Dir(reader)] {
+					inBinary = append(inBinary, reader)
+				}
+			}
+			if len(inBinary) > 0 {
+				sort.Strings(inBinary)
+				want = append(want, wanted{knob, inBinary[0]})
+			}
+		}
+		sort.Slice(want, func(i, j int) bool { return want[i].knob < want[j].knob })
+		if len(want) == 0 {
+			t.Errorf("compose.yaml's %s service runs %s, and no package it links reads a knob this scan can name: either "+
+				"those packages read the environment through computed names (the blind spot the sibling check reports) or "+
+				"the import walk did not reach them", name, entrypoint[0])
+			continue
+		}
+
+		// What the container is handed. A service given an env_file is handed
+		// whatever that file names: the file is the operator's and is not in the
+		// repository, so the names it can carry are the ones .env.example assigns -
+		// the file its own header tells the operator to copy to .env.
+		env := envOf(t, "compose.yaml service "+name+" environment", svc.Environment)
+		carried := map[string]bool{}
+		for knob := range env {
+			carried[knob] = true
+		}
+		if len(scalarsOf(t, "compose.yaml service "+name+" env_file", svc.EnvFile)) > 0 {
+			for knob := range documented {
+				carried[knob] = true
+			}
+		}
+
+		for _, w := range want {
+			if !carried[w.knob] {
+				t.Errorf("compose.yaml's %s service does not forward %s, which %s reads: only this list reaches a portal "+
+					"container (.env does not), so the knob is documented in .env.example and inert under this deployment "+
+					"(OPS-1, OPS-3)", name, w.knob, w.reader)
+			}
+		}
+
+		knobs := make([]string, 0, len(env))
+		for knob := range env {
+			knobs = append(knobs, knob)
+		}
+		sort.Strings(knobs)
+		for _, knob := range knobs {
+			m := composeInterp.FindStringSubmatch(env[knob])
+			if m == nil || m[2] != "-" || m[3] == "" {
+				// Not an interpolation, a required one (:?), or an empty fallback -
+				// and empty means "the code's own default applies", not "compose
+				// chose a value".
+				continue
+			}
+			if scan.defaults[knob][m[3]] {
+				continue
+			}
+			if len(scan.defaults[knob]) == 0 {
+				t.Errorf("compose.yaml's %s service falls back to %s=%s, and no code in this module defaults that knob "+
+					"to a literal this scan can see: either give the process the same default, or forward ${%s:-} and let "+
+					"the code decide", name, knob, m[3], knob)
+				continue
+			}
+			t.Errorf("compose.yaml's %s service falls back to %s=%s, but the code's own default is %s: the deployment "+
+				"would hand the process a value the operator never chose and a run outside compose does not get",
+				name, knob, m[3], strings.Join(sortedOf(scan.defaults[knob]), " or "))
+		}
+	}
+	if built == 0 {
+		t.Error("compose.yaml builds no service from this repository, so this check verified nothing")
+	}
+}
+
+// scalarsOf returns the strings a compose field holds, whether it is written as
+// one scalar (`env_file: .env`) or as a list (`entrypoint: ["/pigeon"]`). An
+// absent field is an empty list, not an error.
+func scalarsOf(t *testing.T, what string, n yaml.Node) []string {
+	t.Helper()
+	switch n.Kind {
+	case 0:
+		return nil
+	case yaml.ScalarNode:
+		return []string{n.Value}
+	case yaml.SequenceNode:
+		var out []string
+		for _, item := range n.Content {
+			if item.Kind != yaml.ScalarNode {
+				t.Fatalf("%s: expected strings, found a nested structure", what)
+			}
+			out = append(out, item.Value)
+		}
+		return out
+	default:
+		t.Fatalf("%s: expected a string or a list of strings", what)
+		return nil
+	}
+}
+
+// envOf returns a service's environment as name -> value, in either of compose's
+// two shapes: a mapping (`NAME: value`) or a list of `NAME=value` entries.
+func envOf(t *testing.T, what string, n yaml.Node) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	switch n.Kind {
+	case 0:
+		return out
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			out[n.Content[i].Value] = n.Content[i+1].Value
+		}
+		return out
+	case yaml.SequenceNode:
+		for _, item := range n.Content {
+			knob, value, ok := strings.Cut(item.Value, "=")
+			if !ok {
+				t.Fatalf("%s: %q is neither NAME=value nor a mapping entry", what, item.Value)
+			}
+			out[knob] = value
+		}
+		return out
+	default:
+		t.Fatalf("%s: expected a mapping or a list of NAME=value strings", what)
+		return out
+	}
+}
+
+// sortedOf returns the keys of a set in a stable order.
+func sortedOf(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // modulePath reads the module path from go.mod.
