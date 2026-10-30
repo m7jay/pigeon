@@ -449,6 +449,55 @@ func TestEndpointVerifyAsksForTheChallenge(t *testing.T) {
 	}
 }
 
+// TestEndpointReIssueShowsTheTokenOnce is the portal leg of FR-409/AC-54: the
+// "Re-issue the verification token" control renders behind a confirm only on an
+// unverified endpoint, and the re-issued token is shown once, in the same one-
+// shot notice the creation flow uses (the token, a copy warning and a Verify
+// now button). A verified endpoint is not offered the control at all.
+func TestEndpointReIssueShowsTheTokenOnce(t *testing.T) {
+	core := newFakeCore(t)
+	seedEndpointsPage(t, core, false)
+	h := testHandlerAt(t, core.srv.URL)
+
+	body := signedIn(t, h, http.MethodGet, "/endpoints/end1", nil).Body.String()
+	if !strings.Contains(body, "Re-issue the verification token") {
+		t.Fatalf("an unverified endpoint does not offer the re-issue control:\n%s", body)
+	}
+	if strings.Contains(body, "verification_token (re-issued)") {
+		t.Fatalf("the re-issued token notice renders before a re-issue:\n%s", body)
+	}
+
+	// The re-issue answers 201 with the creation response's own field names
+	// (verification_token, verification_hint), so the handler renders the page
+	// from that response: the new token appears once, with its hint and a
+	// Verify now button.
+	core.on(http.MethodPost, "/v1/consumer/endpoints/end1/challenge",
+		`{"verification_token":"vrf_0123456789ab","verification_hint":"vrf_0123"}`,
+		http.StatusCreated)
+	rec := signedIn(t, h, http.MethodPost, "/endpoints/end1/challenge", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-issue: status = %d, want 200 (render from the API response): %s", rec.Code, rec.Body)
+	}
+	body = rec.Body.String()
+	if !strings.Contains(body, "Verification token (re-issued)") {
+		t.Fatalf("the re-issued token notice does not render:\n%s", body)
+	}
+	if !strings.Contains(body, "Verify now") {
+		t.Fatalf("the re-issued notice does not offer Verify now:\n%s", body)
+	}
+	if !strings.Contains(body, "vrf_0123456789ab") || !strings.Contains(body, "vrf_0123") {
+		t.Fatalf("the re-issued token or its hint does not show once:\n%s", body)
+	}
+
+	// A verified endpoint is not offered the control.
+	verified := newFakeCore(t)
+	seedEndpointsPage(t, verified, true)
+	h2 := testHandlerAt(t, verified.srv.URL)
+	if b := signedIn(t, h2, http.MethodGet, "/endpoints/end1", nil).Body.String(); strings.Contains(b, "Re-issue the verification token") {
+		t.Fatalf("a verified endpoint offers the re-issue control:\n%s", b)
+	}
+}
+
 // TestEndpointEditPostsThePatch is UI-13's edit as the browser drives it: the
 // portal turns the form into the API's PATCH and sends every edited field, so the
 // same edit from a script gets the same answer. The notification email is one of
