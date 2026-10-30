@@ -139,9 +139,11 @@ HTTP API and to nothing else, so neither appears in the connection budget above
 and neither can hold a Postgres connection out of the pool. The producer portal
 (`cmd/producer-portal`, UI-1…UI-11) is producer-facing; the consumer portal
 (`cmd/consumer-portal`, UI-12…UI-19) is consumer-facing; both ship as binaries in
-the one image and start by overriding the container command. Either may be omitted
-or removed entirely (AC-40): the core keeps serving the same API with the same
-server-side scoping, and the audience that had a UI simply has none.
+the one image and start by overriding the container's entrypoint: `compose.yaml`
+names the binary each service runs, and the image's own entrypoint is the core.
+Either may be omitted or removed entirely (AC-40): the core keeps serving the
+same API with the same server-side scoping, and the audience that had a UI
+simply has none.
 
 ## Egress addresses (FR-1007)
 

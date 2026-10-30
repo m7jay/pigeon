@@ -6,6 +6,20 @@
 # scoping, and whoever had a UI simply has none. The image builds all three
 # binaries (§14, AC-40), so a deployment starts the containers it wants and this
 # file brings up all five.
+#
+# Two rules this file keeps, both checked by `go test ./internal/config`:
+#
+#   - Every service built from this repository names the binary it runs. The
+#     image's own ENTRYPOINT is the core, so a portal container that does not
+#     override it runs the core, whatever the service is called.
+#   - The core is handed .env wholesale (`env_file`) and a portal is not: each
+#     portal lists the names its own code reads. That is deliberately noisier
+#     than giving the portals `env_file: .env` too - it keeps visible which knobs
+#     a deployable actually carries, and it keeps core-only settings (the
+#     database URLs, the pool arithmetic, the retention windows) out of a
+#     container that has no reader for them. The cost is that a name a portal
+#     reads and this list omits is a knob .env.example documents and the
+#     deployment ignores, which is what the check refuses.
 
 name: pigeon
 
@@ -63,6 +77,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # The core is the image's own ENTRYPOINT, so this line changes nothing the
+    # image did not already decide; it is here because every service this
+    # repository builds says which of the image's three binaries it runs, and the
+    # knob check in internal/config reads it to decide whose settings this is.
+    entrypoint: ["/pigeon"]
     restart: unless-stopped
     env_file: .env
     environment:
@@ -99,8 +118,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # The portal binary, not the core: the image's ENTRYPOINT is `/pigeon` and a
+    # container that does not override it runs the core (Dockerfile).
+    entrypoint: ["/producer-portal"]
     restart: unless-stopped
     environment:
+      # Everything this deployable reads, and nothing else: unlike the core it
+      # does not get .env (env_file), so a knob missing from this list never
+      # reaches the process and .env.example documenting it is a lie. The names
+      # and this list are kept in step by `go test ./internal/config`.
       # The base URL of the core API on the compose network. The portal never
       # touches Postgres or Redis: it is a stateless proxy of the core, holds no
       # database and runs no workers.
@@ -108,6 +134,15 @@ services:
       # Encrypts the producer session cookie (AES-256-GCM, internal/portal). Must
       # be set and kept stable across restarts; changing it logs every user out.
       PIGEON_PRODUCER_PORTAL_SESSION_SECRET: ${PIGEON_PRODUCER_PORTAL_SESSION_SECRET:?PIGEON_PRODUCER_PORTAL_SESSION_SECRET must be set}
+      # The listen address and the session cookie's name, both at the code's own
+      # default (cmd/producer-portal's envOr) so an unset value behaves exactly
+      # like a run outside compose. The address has to match the `ports:` mapping
+      # below, which publishes :8083: move this without moving that and the
+      # container serves nothing on the port the host reaches, while its
+      # healthcheck - which asks the process on the address it read from here -
+      # still passes.
+      PIGEON_PRODUCER_PORTAL_ADDR: ${PIGEON_PRODUCER_PORTAL_ADDR:-:8083}
+      PIGEON_PRODUCER_PORTAL_COOKIE_NAME: ${PIGEON_PRODUCER_PORTAL_COOKIE_NAME:-producer_session}
       # Producer branding the producer portal carries (UI-17). All optional: an
       # unset value falls back to a neutral wordmark with no Pigeon branding.
       PORTAL_BRAND_NAME: ${PORTAL_BRAND_NAME:-}
@@ -151,14 +186,25 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # The portal binary, not the core: the image's ENTRYPOINT is `/pigeon` and a
+    # container that does not override it runs the core (Dockerfile).
+    entrypoint: ["/consumer-portal"]
     restart: unless-stopped
     environment:
+      # This deployable's own knobs, listed rather than handed .env - the same
+      # rule and the same reason as the producer portal above.
       # The base URL of the core API on the compose network. The portal never
       # touches Postgres or Redis: it is a stateless proxy of the core.
       PIGEON_CORE_API_URL: http://core:8080
       # Encrypts the consumer session cookie (AES-256-GCM, internal/portal). Must
       # be set and kept stable across restarts; changing it logs every user out.
       PORTAL_SESSION_SECRET: ${PORTAL_SESSION_SECRET:?PORTAL_SESSION_SECRET must be set}
+      # The listen address and the session cookie's name, both at the code's own
+      # default (cmd/consumer-portal's envOr). The address has to match the
+      # `ports:` mapping below, which publishes :8082 - see the producer portal's
+      # note above for what a mismatch costs.
+      PIGEON_PORTAL_ADDR: ${PIGEON_PORTAL_ADDR:-:8082}
+      PORTAL_SESSION_COOKIE_NAME: ${PORTAL_SESSION_COOKIE_NAME:-consumer_session}
       # Producer branding the consumer portal carries (UI-17). All optional: an
       # unset value falls back to a neutral wordmark with no Pigeon branding.
       PORTAL_BRAND_NAME: ${PORTAL_BRAND_NAME:-}
