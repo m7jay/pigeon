@@ -268,8 +268,8 @@ type endpointRow struct {
 	Verified          bool
 	NotificationEmail string
 	FailureStreak     int
-		LastStatus        string
-		LastDeliveryAt    string
+	LastStatus        string
+	LastDeliveryAt    string
 	// RotatedSecret and RotatedOverlap carry UI-6's one-time response: the new
 	// secret is shown where the rotation happened, with the window the API
 	// reported, so the page can explain the overlap with the API's own number.
@@ -287,7 +287,7 @@ type endpointRow struct {
 	// re-issue handler sets them from the API's response.
 	ReissuedToken string
 	ReissuedHint  string
-	}
+}
 
 type consumerRow struct {
 	ID          string

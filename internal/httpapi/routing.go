@@ -140,19 +140,19 @@ type endpointCreatedJSON struct {
 	endpointJSON
 	SigningSecret     string `json:"signing_secret"`
 	SigningSecretHint string `json:"signing_secret_hint"`
-		VerificationToken string `json:"verification_token"`
-		VerificationHint  string `json:"verification_hint"`
-	}
+	VerificationToken string `json:"verification_token"`
+	VerificationHint  string `json:"verification_hint"`
+}
 
-	// endpointReissuedJSON is the 201 body of an ownership-challenge re-issue (FR-409,
-	// A-12): the new token and its safe-to-display prefix, named exactly as the
-	// creation response. Each call mints a new value, so the route is not idempotent.
-	type endpointReissuedJSON struct {
-		VerificationToken string `json:"verification_token"`
-		VerificationHint  string `json:"verification_hint"`
-	}
+// endpointReissuedJSON is the 201 body of an ownership-challenge re-issue (FR-409,
+// A-12): the new token and its safe-to-display prefix, named exactly as the
+// creation response. Each call mints a new value, so the route is not idempotent.
+type endpointReissuedJSON struct {
+	VerificationToken string `json:"verification_token"`
+	VerificationHint  string `json:"verification_hint"`
+}
 
-	func (s *Server) handleListEndpoints(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListEndpoints(w http.ResponseWriter, r *http.Request) {
 	sc, err := s.memberScope(r)
 	if err != nil {
 		s.scopeError(w, r, err)

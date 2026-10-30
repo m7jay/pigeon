@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/m7jay/pigeon/internal/store"
 )
 
 // memberPassword is used for every invited human in the suite. Invitations set
@@ -630,31 +632,31 @@ func TestTestAndLivePlanesAreSeparate(t *testing.T) {
 	if got := errorCode(t, raw); got != "env_required" {
 		t.Fatalf("error code = %q, want env_required", got)
 	}
-		code, raw = e.do(http.MethodGet, "/v1/producer/consumers?env=staging", tn.OwnerToken, nil)
-		mustStatus(t, code, raw, http.StatusBadRequest)
-		if got := errorCode(t, raw); got != "invalid_env" {
-			t.Fatalf("error code = %q, want invalid_env", got)
-		}
-
-		// A key is scoped to one environment and cannot address the other.
-		code, raw = e.do(http.MethodGet, "/v1/whoami", tn.KeyPlain, nil)
-		mustStatus(t, code, raw, http.StatusOK)
-		if who := decode[struct {
-			Env string `json:"env"`
-		}](t, raw); who.Env != "live" {
-			t.Fatalf("key env = %q, want live", who.Env)
-		}
+	code, raw = e.do(http.MethodGet, "/v1/producer/consumers?env=staging", tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusBadRequest)
+	if got := errorCode(t, raw); got != "invalid_env" {
+		t.Fatalf("error code = %q, want invalid_env", got)
 	}
 
-	// TestAC54ReIssueEndpointChallenge is AC-54's acceptance test, asserted at the
-	// acceptance layer: a member re-issues the ownership challenge for an endpoint
-	// that has not yet been verified. Each call mints a fresh token and hint and
-	// answers 201 with the creation response's own field names. The fresh token is
-	// the only value that verifies; the registration token is retired. A foreign,
-	// unknown or deleted id is 404 (AC-39); a verified endpoint is 409. No read
-	// route returns the token or its hash, and an unverified endpoint keeps its
-	// not_delivered:endpoint_unverified delivery row.
-	func TestAC54ReIssueEndpointChallenge(t *testing.T) {
+	// A key is scoped to one environment and cannot address the other.
+	code, raw = e.do(http.MethodGet, "/v1/whoami", tn.KeyPlain, nil)
+	mustStatus(t, code, raw, http.StatusOK)
+	if who := decode[struct {
+		Env string `json:"env"`
+	}](t, raw); who.Env != "live" {
+		t.Fatalf("key env = %q, want live", who.Env)
+	}
+}
+
+// TestAC54ReIssueEndpointChallenge is AC-54's acceptance test, asserted at the
+// acceptance layer: a member re-issues the ownership challenge for an endpoint
+// that has not yet been verified. Each call mints a fresh token and hint and
+// answers 201 with the creation response's own field names. The fresh token is
+// the only value that verifies; the registration token is retired. A foreign,
+// unknown or deleted id is 404 (AC-39); a verified endpoint is 409. No read
+// route returns the token or its hash, and an unverified endpoint keeps its
+// not_delivered:endpoint_unverified delivery row.
+func TestAC54ReIssueEndpointChallenge(t *testing.T) {
 	e := setup(t)
 	tn := e.seedTenant(t, "ac54-reissue")
 	seedCrossProducerEventType(t, e, tn)
@@ -685,6 +687,27 @@ func TestTestAndLivePlanesAreSeparate(t *testing.T) {
 	}
 	if !strings.HasPrefix(frac.VerificationToken, frac.VerificationHint) || len(frac.VerificationHint) != 8 {
 		t.Fatalf("hint %q is not the first 8 characters of the token", frac.VerificationHint)
+	}
+
+	// The endpoint is subscribed to the event type and the event is published
+	// while the endpoint is still unverified: fan-out records a skip delivery
+	// row with the endpoint-unverified reason (FR-403). The re-issue in the
+	// block above arms the endpoint; it does not re-deliver the window, so the
+	// skip row is expected to survive the re-issue and everything that follows.
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/subscriptions?env=live",
+		tn.OwnerToken, map[string]string{"event_type": tn.EventTypeName})
+	mustStatus(t, code, raw, http.StatusCreated)
+
+	code, raw = e.do(http.MethodPost, "/v1/events", tn.KeyPlain, map[string]any{
+		"event_type":   tn.EventTypeName,
+		"consumer_ref": tn.ConsumerRef,
+		"payload":      map[string]any{"note": "reissue-window"},
+	})
+	mustStatus(t, code, raw, http.StatusAccepted)
+	evt := decode[publishResponse](t, raw)
+	if evt.ID == "" {
+		t.Fatalf("publish returned no event id: %s", raw)
 	}
 
 	// The endpoint is still unverified: verified_at is untouched by the reissue.
@@ -768,6 +791,23 @@ func TestTestAndLivePlanesAreSeparate(t *testing.T) {
 		t.Fatalf("read route returns a challenge token: %s", raw)
 	}
 
+	// A delivery row recorded while the endpoint was unverified survives the
+	// re-issue: the re-issue arms the endpoint, it does not re-deliver the
+	// window. The skip row is terminal (status 'skipped'), so nothing re-
+	// delivered the event and nothing has touched it since.
+	var skipRows int
+	if err := e.admin.QueryRow(context.Background(),
+		`select count(*) from deliveries
+		where event_id = $1 and endpoint_id = $2 and producer_id = $3 and env = $4
+		  and consumer_id = $5 and status = 'skipped'
+		  and non_delivery_reason = 'not_delivered:endpoint_unverified'`,
+		evt.ID, created.ID, tn.ID, store.EnvLive, tn.ConsumerID).Scan(&skipRows); err != nil {
+		t.Fatalf("read delivery rows: %v", err)
+	}
+	if skipRows != 1 {
+		t.Fatalf("expected one not_delivered:endpoint_unverified skip row after the re-issue, got %d", skipRows)
+	}
+
 	// The instance admin has no such route: the re-issue route lives on the
 	// member and consumer planes, never on the admin surface.
 	code, raw = e.do(http.MethodPost,
@@ -776,5 +816,3 @@ func TestTestAndLivePlanesAreSeparate(t *testing.T) {
 		t.Fatalf("instance admin should not have a challenge re-issue route: %d", code)
 	}
 }
-
-

@@ -194,9 +194,9 @@ func (s *Server) routes() []route {
 		{http.MethodPatch, "/v1/consumer/endpoints/{endpointID}", kindConsumer, s.handleConsumerPatchEndpoint},
 		{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/rotate", kindConsumer, s.handleConsumerRotateEndpointSecret},
 		{http.MethodDelete, "/v1/consumer/endpoints/{endpointID}", kindConsumer, s.handleConsumerDeleteEndpoint},
-				{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/verify", kindConsumer, s.handleConsumerVerifyEndpoint},
-				{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/challenge", kindConsumer, s.handleConsumerReissueEndpointChallenge},
-				{http.MethodGet, "/v1/consumer/endpoints/{endpointID}/subscriptions", kindConsumer, s.handleConsumerListSubscriptions},
+		{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/verify", kindConsumer, s.handleConsumerVerifyEndpoint},
+		{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/challenge", kindConsumer, s.handleConsumerReissueEndpointChallenge},
+		{http.MethodGet, "/v1/consumer/endpoints/{endpointID}/subscriptions", kindConsumer, s.handleConsumerListSubscriptions},
 		{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/subscriptions", kindConsumer, s.handleConsumerCreateSubscription},
 		{http.MethodDelete, "/v1/consumer/endpoints/{endpointID}/subscriptions/{eventType}", kindConsumer, s.handleConsumerDeleteSubscription},
 
