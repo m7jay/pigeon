@@ -340,7 +340,7 @@ Checklist:
 | Document | What it is |
 |---|---|
 | [`REQUIREMENTS.md`](REQUIREMENTS.md) | the contract: numbered FR/NFR/OPS/SB/D requirements, and §16's acceptance criteria |
-| [`SPEC.md`](SPEC.md) | how this tree implements them, the decisions taken where the requirements were silent (A-1…A-11), and the gap list |
+| [`SPEC.md`](SPEC.md) | how this tree implements them, the decisions taken where the requirements were silent (A-1…A-12), and the gap list |
 | [`PLAN.md`](PLAN.md) | the slice order, and what each slice turns green |
 | [`docs/worker-git.md`](docs/worker-git.md) | the git, PR, review and merge protocol |
 | [`docs/load-test.md`](docs/load-test.md) | §16's measurement protocol, and what the last run does not prove |
