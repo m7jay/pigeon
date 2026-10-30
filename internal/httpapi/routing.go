@@ -270,6 +270,10 @@ func (s *Server) handleReissueEndpointChallenge(w http.ResponseWriter, r *http.R
 	}
 	challenge, err := s.deps.Data.ReissueEndpointChallenge(r.Context(), sc, r.PathValue("consumerID"), r.PathValue("endpointID"))
 	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeError(w, http.StatusConflict, "already_verified", "this endpoint is already verified; the challenge has been answered")
+			return
+		}
 		s.storeError(w, r, err)
 		return
 	}
