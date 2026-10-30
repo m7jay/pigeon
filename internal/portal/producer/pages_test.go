@@ -23,10 +23,13 @@ const (
 		`"payload_schema":{"type":"object","properties":{"order_id":{"type":"string"}}},"payload_version":2,"enabled":true}`
 )
 
-// mustBeSessionCall asserts one recorded core call is the documented method+path
-// and carried the signed-in session's bearer. The producer id is never named in a
-// member route: it rides in this bearer, so a call with the wrong (or missing)
-// Authorization is a call the portal could not have made on this human's behalf.
+// mustBeSessionCall asserts one recorded core call is the documented method+path,
+// carried the signed-in session's bearer, and named the plane it acts in. The
+// producer id is never named in a member route: it rides in this bearer, so a call
+// with the wrong (or missing) Authorization is a call the portal could not have
+// made on this human's behalf. The plane is not optional either - the core reads
+// it from `?env=` and refuses the call without it - so a call that dropped it must
+// fail here rather than render an error page under a green suite.
 func mustBeSessionCall(t *testing.T, core *fakeCore, method, path string) coreCall {
 	t.Helper()
 	got := core.lastRequest(method, path)
@@ -36,8 +39,8 @@ func mustBeSessionCall(t *testing.T, core *fakeCore, method, path string) coreCa
 	if got.Auth != "Bearer "+portalSessionToken {
 		t.Fatalf("%s %s carried Authorization %q, want the session's bearer - the identity must come from the session, not the request", method, path, got.Auth)
 	}
-	if !strings.Contains(got.URI, "env=test") {
-		t.Fatalf("%s %s did not carry the environment the request acts in: %q", method, path, got.URI)
+	if env := queryValue(t, got.URI, "env"); env != "test" && env != "live" {
+		t.Fatalf("%s %s did not name the plane it acts in (env=%q): the core resolves a member route's scope from `?env=` and answers 400 env_required without it", method, path, env)
 	}
 	return got
 }
@@ -391,16 +394,18 @@ func TestRetentionPanelSaysItCannotTellRatherThanZero(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET /usage status = %d, want 200; body: %s", rec.Code, rec.Body.String())
 		}
-		// The usage route is a producer member route; the bearer carries the scope.
-		got := core.lastRequest(http.MethodGet, "/v1/producer/usage")
+		// The usage route is a producer member route: the bearer carries the scope
+		// (the producer) and `?env=` names the plane, exactly as on every other
+		// member call. Dropping the parameter is not a cosmetic bug - the core
+		// answers 400 env_required and this panel would show that refusal instead
+		// of SB-6's reading - so it is asserted, not assumed.
+		got := mustBeSessionCall(t, core, http.MethodGet, "/v1/producer/usage")
 		if got.Path != "/v1/producer/usage" {
 			t.Fatalf("the usage page never asked the API (calls: %v)", core.calls())
 		}
-		if got.Auth != "Bearer "+portalSessionToken {
-			t.Fatalf("/v1/producer/usage carried Authorization %q, want the session's bearer", got.Auth)
-		}
 		body := rec.Body.String()
 		mustContain(t, "usage page", body, "cannot tell how full the disk is", "retention telemetry is not configured")
+		mustNotContain(t, "usage page", body, "env query parameter is required")
 		// A reading that could not be taken is not a reading of zero: the gauge and
 		// its labels are absent, not drawn at 0%.
 		mustNotContain(t, "usage page", body, "Used (percent)", "Partitions dropped", ">0 bytes<", "0.0%")
@@ -410,7 +415,7 @@ func TestRetentionPanelSaysItCannotTellRatherThanZero(t *testing.T) {
 		core := newFakeCore(t)
 		seedMemberSession(core, "owner")
 		core.on(http.MethodGet, "/v1/producer/usage",
-			`{"disk":{"used_bytes":12000000,"total_bytes":100000000,"used_pct":12.5,"source":"statfs","path":"/var/lib/pigeon"},`+
+			`{"disk":{"used_bytes":12000000,"total_bytes":100000000,"used_pct":12.5,"source":"statfs:/var/lib/pigeon"},`+
 				`"max_disk_pct":80,"over_budget":true,"retention_days":{"deliveries":30,"events":7},`+
 				`"dropped_partitions_total":3,"dedupe_archive_bytes":4096,"checked_at":"2026-01-01T00:00:00Z"}`, http.StatusOK)
 		h := newPortalAt(t, core.srv.URL)
@@ -419,9 +424,20 @@ func TestRetentionPanelSaysItCannotTellRatherThanZero(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET /usage status = %d, want 200; body: %s", rec.Code, rec.Body.String())
 		}
-		mustContain(t, "usage page", rec.Body.String(),
-			"Used (percent)", "12.5", "80", "12000000", "100000000", "deliveries", "30", "3")
-		mustNotContain(t, "usage page", rec.Body.String(), "cannot tell how full the disk is")
+		// The reading rendered here came from a call that named the plane. With the
+		// parameter dropped, the stand-in answers as the core does (400
+		// env_required) and the numbers below never appear.
+		mustBeSessionCall(t, core, http.MethodGet, "/v1/producer/usage")
+		body := rec.Body.String()
+		mustContain(t, "usage page", body,
+			"Used (percent)", "12.5", "80", "12000000", "100000000", "deliveries", "30", "3",
+			// The reading's source is the API's own string, which for a filesystem
+			// reading already names the directory ("statfs:<dir>"): the panel has no
+			// separate path to draw, and a row for one the API never sends would
+			// read "not reported" on every deployment.
+			"statfs:/var/lib/pigeon")
+		mustNotContain(t, "usage page", body,
+			"cannot tell how full the disk is", "env query parameter is required", "<dt>Path</dt>")
 	})
 }
 
@@ -604,7 +620,7 @@ func seedEverything(core *fakeCore) {
 		`"occurred_at":"2026-01-01T00:00:00Z","created_at":"2026-01-01T00:00:00Z","is_test":false},`+
 		`"rollup":"1 delivered, 0 unroutable","deliveries":[]}`, http.StatusOK)
 	core.on(http.MethodGet, "/v1/producer/usage", `{"disk":{"used_bytes":1000,"total_bytes":10000,"used_pct":10,`+
-		`"source":"statfs","path":"/var/lib/pigeon"},"max_disk_pct":80,"retention_days":{},"checked_at":"2026-01-01T00:00:00Z"}`, http.StatusOK)
+		`"source":"statfs:/var/lib/pigeon"},"max_disk_pct":80,"retention_days":{},"checked_at":"2026-01-01T00:00:00Z"}`, http.StatusOK)
 }
 
 // TestEveryFormCarriesTheCSRFToken is FR-1009 by inheritance: the portal sets no
@@ -655,5 +671,71 @@ func TestEveryFormCarriesTheCSRFToken(t *testing.T) {
 	}
 	if core.lastRequest(http.MethodPost, "/v1/session").Path != "" {
 		t.Fatalf("a refused login still reached the core API: %v", core.calls())
+	}
+}
+
+// --- the member-route contract -------------------------------------------
+
+// TestEveryMemberCallThePortalMakesNamesThePlane is the test S9a's UI-8 defect
+// needed. Every member route the portal calls is resolved by the core with
+// memberScope, which takes the producer from the session claim and the plane from
+// `?env=` and answers 400 env_required when the parameter is absent - so a call
+// that drops it is not a cosmetic slip, it is a row that cannot be read in the
+// running portal. The package's tests were blind to the query string (the core
+// stand-in answered any Method+Path), so GET /usage asked for a member route with
+// no plane and every page test stayed green while the panel rendered the API's
+// refusal.
+//
+// Two things close that: the stand-in now answers a plane-less member call the way
+// the core does (400 env_required, fakecore_test.go), and this sweep drives every
+// signed-in page - the same target list the CSRF sweep drives, so a new page joins
+// it - and requires the plane on every member call made along the way. The per-test
+// teardown check in newFakeCore reports it for every other test in the package.
+func TestEveryMemberCallThePortalMakesNamesThePlane(t *testing.T) {
+	core := newFakeCore(t)
+	seedEverything(core)
+	h := newPortalAt(t, core.srv.URL)
+
+	signedTargets := []string{
+		"/onboarding", "/consumers", "/consumers/con_1", "/endpoints/end_1",
+		"/deliveries", "/deliveries/42", "/events/evt_1", "/test-event",
+		"/snippet", "/guide", "/usage", "/account",
+	}
+	for _, target := range signedTargets {
+		rec := signedIn(t, h, http.MethodGet, target, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200; body: %s", target, rec.Code, rec.Body.String())
+		}
+	}
+
+	calls := everyMemberCallNamesThePlane(t, "every signed-in page", core)
+	seen := map[string]bool{}
+	for _, call := range calls {
+		seen[call.Path] = true
+	}
+	// The sweep must actually reach the member surface, and every route it reaches
+	// must be one of the member reads this fixture answers: an assertion over an
+	// empty or lopsided set would pass for the wrong reason. `/account` and
+	// `/snippet`'s GET make no member call, which is why the list below is the
+	// routes the other ten pages read, not the page count.
+	want := []string{
+		"/v1/producer/event-types",
+		"/v1/producer/consumers",
+		"/v1/producer/consumers/con_1/endpoints",
+		"/v1/producer/consumers/con_1/users",
+		"/v1/producer/consumers/con_1/events",
+		"/v1/producer/deliveries",
+		"/v1/producer/deliveries/42",
+		"/v1/producer/events/evt_1",
+		"/v1/producer/usage",
+	}
+	for _, path := range want {
+		if !seen[path] {
+			t.Fatalf("the sweep never drove a page that reads %s, so this test does not cover the member surface (member calls: %v)", path, calls)
+		}
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("the pages read %d distinct member routes, want exactly %d: a route that is not in this test's list is unasserted, and a new member read must be added here (calls: %v)",
+			len(seen), len(want), calls)
 	}
 }
