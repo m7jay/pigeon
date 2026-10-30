@@ -88,9 +88,12 @@ services:
   # The host ports are the product's (5432, 6379) with a 5 in front, because the
   # suite runs on the host rather than on this network - so the test pair must be
   # reachable there - and it has to be able to run beside a stack that is already
-  # publishing 5432/6379. The Makefile defaults to exactly these ports;
-  # PIGEON_TEST_DATABASE_URL and PIGEON_TEST_REDIS_URL point the suite at a
-  # backend of your own instead, and then this profile is not started at all.
+  # publishing 5432/6379. Both are bound to the loopback address: this is a
+  # scratch superuser with a published password, and the only client either of
+  # them has is the suite on this host. The Makefile writes exactly these ports
+  # into its default DSNs; PIGEON_TEST_DATABASE_URL and PIGEON_TEST_REDIS_URL
+  # point the suite at a backend of your own instead, and then this profile is
+  # not started at all.
   postgres-test:
     image: postgres:16-alpine
     profiles: ["test"]
@@ -106,7 +109,7 @@ services:
       # ever runs on a machine whose database is already there.
       POSTGRES_DB: postgres
     ports:
-      - "55432:5432"
+      - "127.0.0.1:55432:5432"
     # tmpfs, not the product's pgdata volume: a test database is thrown away with
     # the container, and `make test-down` must not be able to leave a half-used one
     # behind for the next run to inherit.
@@ -122,7 +125,7 @@ services:
     image: redis:7-alpine
     profiles: ["test"]
     ports:
-      - "56379:6379"
+      - "127.0.0.1:56379:6379"
     # No AOF and no volume: this is the suite's scratch broker. D-5's appendonly
     # requirement is a property of the deployment's Redis above, which ci.yml
     # asserts by name on this file.
