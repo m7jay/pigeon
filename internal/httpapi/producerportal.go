@@ -63,9 +63,11 @@ func (s *Server) handleMemberCreateEventType(w http.ResponseWriter, r *http.Requ
 // portal's session. UI-1's last two steps and UI-4's "send test event" both come
 // through here.
 //
-// The environment is the session's `env` claim (the same one every other member
-// route uses), so a portal session left in `test` cannot publish into `live` by
-// asking.
+// The environment is named by the request (`?env=test|live`), exactly as on every
+// other member route (memberScope, auth.go: the producer from the session claim,
+// the environment from the query). A member session carries no environment claim
+// of its own - that binding is FR-110's consumer one - so the portal chooses the
+// plane per call through its remembered setting and never through a body field.
 func (s *Server) handleMemberPublish(w http.ResponseWriter, r *http.Request) {
 	sc, err := s.memberScope(r)
 	if err != nil {
