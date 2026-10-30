@@ -35,7 +35,10 @@
 //
 // Password authentication remains the default; SPEC.md defers FR-106 to S9, and
 // this package is deliberately inert unless the deployment supplies an issuer.
-// docs/oidc.md is the operator-facing half of the same story.
+// .env.example is the operator-facing half of the same story: its Identity block
+// documents the knobs (PIGEON_OIDC_ISSUER, PIGEON_OIDC_CLIENT_ID, *_SECRET,
+// *_REDIRECT_URL, *_SCOPES) and says which combination enables which half - the
+// relying party below, and the core's verifier.
 //
 // Error handling is sentinel-style: every rejection of a token wraps
 // ErrInvalidToken, so a caller can answer 401 for "this token is not valid" and
