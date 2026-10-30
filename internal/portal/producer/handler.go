@@ -447,37 +447,18 @@ func (h *Handler) renderPublic(w http.ResponseWriter, r *http.Request, status in
 
 const flashCookie = "producer_flash"
 
-// setFlash writes a one-shot message. The parts are percent-encoded because a
-// cookie value is a restricted byte string: net/http silently DROPS bytes it
-// cannot carry (a ';' in a message, or in an opaque token quoted in one), which
-// would show the user a message that is not what the API said. Encoding makes the
-// value legal without changing a byte of what is displayed.
+// setFlash writes a one-shot message. The value's encoding and the cookie's three
+// flags live in internal/portal, shared with the consumer portal: both flashes are
+// the same shape, and keeping one copy is what stops the truncation fix (a cookie
+// value is a restricted byte string, and net/http drops the bytes it cannot carry)
+// from landing in one portal only.
 func (h *Handler) setFlash(w http.ResponseWriter, kind, msg string) {
-	value := url.QueryEscape(kind) + "|" + url.QueryEscape(msg)
-	http.SetCookie(w, &http.Cookie{
-		Name: flashCookie, Value: value, Path: "/", MaxAge: 60,
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
-	})
+	portal.SetFlashCookie(w, flashCookie, kind, msg)
 }
 
+// pullFlash reads the message back: "" when there is none.
 func pullFlash(r *http.Request) (kind, msg string) {
-	c, err := r.Cookie(flashCookie)
-	if err != nil {
-		return "", ""
-	}
-	i := strings.IndexByte(c.Value, '|')
-	if i < 0 {
-		return "", ""
-	}
-	k, err := url.QueryUnescape(c.Value[:i])
-	if err != nil {
-		k = c.Value[:i]
-	}
-	m, err := url.QueryUnescape(c.Value[i+1:])
-	if err != nil {
-		m = c.Value[i+1:]
-	}
-	return k, m
+	return portal.PullFlashCookie(r, flashCookie)
 }
 
 // isLocalPath reports whether p is a same-site absolute path. It backs the

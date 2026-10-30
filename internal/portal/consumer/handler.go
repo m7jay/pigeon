@@ -13,7 +13,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/m7jay/pigeon/internal/portal"
@@ -248,29 +247,21 @@ func (h *Handler) clearTokenCookie(w http.ResponseWriter) {
 // flash is a one-shot message carried across a redirect in a short-lived cookie.
 const flashCookie = "pigeon_flash"
 
-// setFlash writes the one-shot message cookie. AC-49 does not exempt it: a
-// one-shot cookie is still a cookie a portal emits, so it carries all three
-// flags. SameSite is Lax rather than Strict because the flash legitimately
-// arrives on the redirect the user just made - Strict would drop it on the first
-// cross-site navigation and the message would silently disappear.
+// setFlash writes the one-shot message cookie. The value's encoding, the three
+// AC-49 flags and the read side live in internal/portal, shared with the producer
+// portal: its copy of this cookie was fixed for the truncation an unencoded value
+// suffers (net/http silently drops the bytes a cookie value cannot carry, so a
+// message containing ';' arrived mangled) and the consumer's copy kept the bug.
+// SameSite is Lax rather than Strict because the flash legitimately arrives on the
+// redirect the user just made - Strict would drop it on the first cross-site
+// navigation and the message would silently disappear.
 func (h *Handler) setFlash(w http.ResponseWriter, kind, msg string) {
-	val := kind + "|" + msg
-	http.SetCookie(w, &http.Cookie{
-		Name: flashCookie, Value: val, Path: "/", MaxAge: 60,
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
-	})
+	portal.SetFlashCookie(w, flashCookie, kind, msg)
 }
 
+// pullFlash reads the message back: "" when there is none.
 func pullFlash(r *http.Request) (kind, msg string) {
-	c, err := r.Cookie(flashCookie)
-	if err != nil {
-		return "", ""
-	}
-	i := strings.IndexByte(c.Value, '|')
-	if i < 0 {
-		return "", ""
-	}
-	return c.Value[:i], c.Value[i+1:]
+	return portal.PullFlashCookie(r, flashCookie)
 }
 
 // coreReq issues a core API request with the caller's session token.
