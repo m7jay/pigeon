@@ -716,7 +716,8 @@ func TestGradeExitStatusIsTheVerdict(t *testing.T) {
 	green := filepath.Join(dir, "green.json")
 	writeArtifact(t, green, classArtifact(t, "2vCPU-4GB", 150000, 1500000, false))
 
-	out, err := exec.Command(bin, "grade", "-label", green, "-class", "2 vCPU / 4 GB").CombinedOutput()
+	verd := filepath.Join(dir, "green-verdict.json")
+	out, err := exec.Command(bin, "grade", "-label", green, "-out", verd, "-class", "2 vCPU / 4 GB").CombinedOutput()
 	if err != nil {
 		t.Fatalf("grade on a run on its row exited %v\n%s", err, out)
 	}
@@ -724,6 +725,31 @@ func TestGradeExitStatusIsTheVerdict(t *testing.T) {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("the verdict output does not contain %q:\n%s", want, out)
 		}
+	}
+
+	// The verdict names the machine it decided against, and it is not the machine
+	// block: the block is the generator's box on every §12 run (here "generator",
+	// 2 vCPU / 7.75 GiB), and reading that as the machine being graded is the defect
+	// the review found. The verdict has to carry both, apart.
+	var v struct {
+		Machine          machine  `json:"machine"`
+		MachineUnderTest *machine `json:"machine_under_test"`
+	}
+	b, err := os.ReadFile(verd)
+	if err != nil {
+		t.Fatalf("read the verdict JSON: %v", err)
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		t.Fatalf("parse the verdict JSON: %v", err)
+	}
+	if v.MachineUnderTest == nil {
+		t.Fatalf("the verdict records no machine under test:\n%s", b)
+	}
+	if v.MachineUnderTest.Hostname != "sut" || v.MachineUnderTest.CPUs != 2 || v.MachineUnderTest.Source != machineDeclared {
+		t.Errorf("the verdict's machine under test is %s, want the declared machine the class was checked against", v.MachineUnderTest.describe())
+	}
+	if v.Machine.Hostname == v.MachineUnderTest.Hostname {
+		t.Errorf("the verdict's machine block and machine under test are the same machine (%s)", v.Machine.Hostname)
 	}
 
 	miss := filepath.Join(dir, "miss.json")
