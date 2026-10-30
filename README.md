@@ -120,8 +120,10 @@ loopback receiver needs the producer portal's register form, which has one.
 On submit the page shows the endpoint's **signing secret** and its **verification
 token**, and says the secret is shown exactly once and cannot be retrieved again -
 copy both before you navigate away. The signing secret is what a verifier checks
-the `webhook-signature` header with; each endpoint page links **Webhook snippet**,
-which renders a verifier in curl, Go, Node or Python (UI-7).
+the `webhook-signature` header with, and this endpoint's page links **Webhook
+snippet**, which renders a verifier in curl, Go, Node or Python (UI-7) - the
+producer portal's endpoint page offers the same thing as "Build a verification
+snippet for this secret".
 
 ### 7. Answer the ownership challenge (FR-403)
 
@@ -301,8 +303,8 @@ in `.env.example` (no deployment process reads them):
   0.00 s and read like a regression). **Its database name must contain `test` by
   design**: `internal/httpapi` refuses to truncate any other name and
   `internal/relay` refuses any other DSN, while `internal/store`, `internal/delivery`,
-  `internal/identity`, `internal/db` and `internal/faults` migrate and truncate
-  whatever database the DSN names. Point it at a database you are willing to lose.
+  `internal/identity`, `internal/db`, `internal/dbtest` and `internal/faults` migrate and
+  truncate whatever database the DSN names. Point it at a database you are willing to lose.
 - `PIGEON_TEST_REDIS_URL` - optional locally: the Redis-backed packages fall back
   to an in-process miniredis. CI sets it from a `redis:7` service container, and
   the job fails on any `--- SKIP`, so a real Redis leg is what CI measures.
