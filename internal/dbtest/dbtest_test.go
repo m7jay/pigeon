@@ -132,6 +132,9 @@ func TestProvisionAppRoleToleratesAConcurrentCreator(t *testing.T) {
 
 		rawErr := <-raw
 		t.Logf("the simultaneous create reported %q (SQLSTATE %s)", rawErr, codeOf(rawErr))
+		if code := codeOf(rawErr); code != "42710" && code != "23505" {
+			t.Fatalf("the simultaneous create reported SQLSTATE %s (%v); the two shapes this race produces are 42710 and 23505, so a third one means the tolerance is incomplete", code, rawErr)
+		}
 		if !isCreateRace(rawErr) {
 			t.Fatalf("isCreateRace does not recognise %v; the loser of a simultaneous create is not tolerated", rawErr)
 		}
