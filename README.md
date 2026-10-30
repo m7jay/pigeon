@@ -214,10 +214,24 @@ Not landed, and not to be read as green:
 
 - Conventional Commits, one slice per PR, branched from the default branch
   (`feat/m0-skeleton`) - never from another slice's branch.
-- `make vet test` before pushing, with `PIGEON_TEST_DATABASE_URL` pointing at a
-  disposable Postgres: `make test` runs the DB-backed suite and refuses to run
-  without that DSN (its `-p 1` is CI's, for the same reason). `make test-integration`
-  is the same target under its older name.
+- `make vet test` before pushing. `make test` needs no exported variables and no
+  second terminal: it starts compose.yaml's `test` profile (Postgres and Redis,
+  published on 55432 and 56379), waits for both containers to be healthy, creates
+  the database the DSN names if it is missing, and runs the DB-backed suite (`-p 1`
+  is CI's, for the same reason).
+
+  ```sh
+  make test       # start the test containers, create the test database, run the suite
+  make test-env   # the same setup without the suite
+  make test-down  # stop the test containers again
+  ```
+
+  With a Postgres and a Redis of your own - service containers, another compose
+  project, a server in the next room - set both DSNs instead and nothing needs
+  docker: `PIGEON_TEST_DATABASE_URL=postgres://user@host:5432/pigeon_test?sslmode=disable
+  PIGEON_TEST_REDIS_URL=redis://host:6379/0 make test`. The database's name must
+  contain `test` (`internal/httpapi` and `internal/relay` refuse any other name),
+  and `make test-integration` is the same target under its older name.
 - CI (`.github/workflows/ci.yml`) runs the `test` job on `ubuntu-24.04` with
   Postgres 16 and Redis 7 service containers:
   `go test -count=1 -race -p 1 -v -timeout 25m ./...`. A `--- SKIP` fails the job,
