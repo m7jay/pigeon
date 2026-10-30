@@ -15,7 +15,11 @@ LDFLAGS    := -s -w -X main.version=$(VERSION)
 #
 # The ports are the product stack's own (5432, 6379) with a 5 in front, so the
 # test pair runs beside a `docker compose up` of the product instead of competing
-# with it for a host port.
+# with it for a host port. They are written literally, here and in compose.yaml,
+# and deliberately not as knobs: a port the Makefile moved without moving the
+# published one builds a DSN for a port nothing serves, and a `${NAME}` a
+# test-only service interpolates is a setting `.env.example` owes the operator
+# (internal/config's OPS-3 guard).
 #
 # A developer who already has a Postgres and a Redis - service containers,
 # another compose project, a server in the next room - sets *both* DSNs and
@@ -28,9 +32,9 @@ LDFLAGS    := -s -w -X main.version=$(VERSION)
 # the half that is unset, and only that half, and uses the DSN you gave for the
 # other. So a developer whose own Postgres already listens on the port the test
 # profile publishes is fine - set that DSN and compose starts only redis-test.
-TEST_DB_NAME    ?= pigeon_test
-TEST_PG_PORT    ?= 55432
-TEST_REDIS_PORT ?= 56379
+# The database name is a knob because nothing else has to agree on it: it travels
+# in the DSN, and `create-test-db` creates exactly that name.
+TEST_DB_NAME ?= pigeon_test
 
 # The DSNs are the developer's where they set them and the test profile's where
 # they did not. make reads them from the environment itself, so nothing has to be
@@ -38,8 +42,8 @@ TEST_REDIS_PORT ?= 56379
 PIGEON_TEST_DATABASE_URL ?=
 PIGEON_TEST_REDIS_URL    ?=
 
-COMPOSE_TEST_DATABASE_URL ?= postgres://pigeon_test:pigeon_test@127.0.0.1:$(TEST_PG_PORT)/$(TEST_DB_NAME)?sslmode=disable
-COMPOSE_TEST_REDIS_URL    ?= redis://127.0.0.1:$(TEST_REDIS_PORT)/0
+COMPOSE_TEST_DATABASE_URL ?= postgres://pigeon_test:pigeon_test@127.0.0.1:55432/$(TEST_DB_NAME)?sslmode=disable
+COMPOSE_TEST_REDIS_URL    ?= redis://127.0.0.1:56379/0
 
 TEST_DATABASE_URL := $(if $(strip $(PIGEON_TEST_DATABASE_URL)),$(PIGEON_TEST_DATABASE_URL),$(COMPOSE_TEST_DATABASE_URL))
 TEST_REDIS_URL    := $(if $(strip $(PIGEON_TEST_REDIS_URL)),$(PIGEON_TEST_REDIS_URL),$(COMPOSE_TEST_REDIS_URL))
@@ -89,6 +93,11 @@ test: test-env
 	@export PIGEON_TEST_DATABASE_URL='$(TEST_DATABASE_URL)'; \
 	 export PIGEON_TEST_REDIS_URL='$(TEST_REDIS_URL)'; \
 	 go test -count=1 -p 1 ./...
+
+# The same DB-backed suite under its older name, so notes that name it keep
+# working. It is exactly `test`, setup and all: neither name needs an exported
+# DSN, and both start the test containers when it is left unset.
+test-integration: test
 
 # The test backend without the suite: start what is missing, wait for it, create
 # the database if it is not there. A target of its own so a developer iterating on
