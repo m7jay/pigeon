@@ -128,21 +128,48 @@ func TestPublishShedsWith429WhenTheWritePathIsSaturated(t *testing.T) {
 }
 
 // TestPublishLatencyIsBoundedUnderSaturation is AC-4, which is AC-30's "no silent
-// latency growth" clause as a deterministic in-process test rather than a load
-// run: under saturation every response is a 202 within the admission deadline or
-// a 429, and the worst latency observed is the deadline - never the unbounded
-// wait on the pool that S10 measured as 10.2 s at pool 10 and as a p99 growing
-// from 3,593.4 ms to 4,281.6 ms over a 30-minute run.
+// latency growth" clause as a deterministic in-process test rather than a load run.
+//
+// The criterion is the recorded admission DECISION and its accounting, not an
+// elapsed time. For the whole saturated phase this test holds every slot of the
+// budget itself and releases none until phase 2, so a publish that answered 202
+// there could only have waited for a slot the test had not freed - the parking on
+// the pgx pool S10 measured as 10.2 s at pool 10, and as a p99 growing from
+// 3,593.4 ms to 4,281.6 ms over a 30-minute run. So while the budget is full every
+// response must be 429 `over_capacity` with Retry-After: 1, the shed counter must
+// advance by exactly one per shed, a shed must write neither row, and the budget
+// must still report every slot held; once the slots are freed every response must
+// be 202 and commit BOTH rows (FR-604), with the shed counter frozen and no slot
+// left in flight. A path that parked instead of deciding cannot satisfy that, and
+// nothing here depends on how fast (or how busy) the box is.
+//
+// This replaced an elapsed bound (100 ms admission deadline + 200 ms of slack) that
+// measured the box rather than the mechanism: on a 2 vCPU host sharing a second
+// full `-race` suite it reddened with `a admitted publish took 377.477348ms, past
+// the 100ms admission deadline (+200ms)` on a tree whose httpapi/writeq files were
+// byte-identical to the ones CI ran green in 0.45 s (runs 40955358597,
+// 40963661270), while the same test in isolation passed at 74.8 ms. The pair that
+// settled it (card t_2dbef0fb, 24 fresh-process runs per side, one load window, one
+// 2 vCPU box): the old bound 18 red / 24; the criterion below 0 red / 24 - and 17 of
+// those 24 runs logged a leg over the old 300 ms ceiling (worst 1387.5 ms), so on
+// that box the old bound's verdict came from throughput, not from the mechanism.
+// Widening the constant was not an option (§12: a timing flake becomes a state
+// assertion, never a looser threshold); the latencies are still measured and logged
+// below as diagnostics - a reading of the box, never a pass/fail criterion.
+//
+// Not repeatable in place, like every test in this package: setup() provisions ONE
+// shared env per process (`sharedOnce`) and the fixtures use fixed slugs, so a
+// second invocation of this name in the same process re-seeds `wq-latency` into the
+// rows the first left behind and fails inside `seedTenant` with
+// `409 ... "that resource already exists"`. One invocation per fresh database is
+// the supported shape for internal/httpapi; that red is a property of the harness,
+// not of the criterion below.
 func TestPublishLatencyIsBoundedUnderSaturation(t *testing.T) {
 	e := setup(t)
 	tn := e.seedTenant(t, "wq-latency")
 	createType(t, e, tn, "payment.succeeded")
 
 	const admit = 100 * time.Millisecond
-	// A slow box adds scheduling overhead to a timer that was set for `admit`; the
-	// bound below still separates "waited its deadline" from "parked on the pool",
-	// which is two orders of magnitude apart in the measurement this exists for.
-	const epsilon = 200 * time.Millisecond
 
 	m := metrics.New()
 	q := store.NewWriteQueue(e.app, writeq.Options{
@@ -151,49 +178,86 @@ func TestPublishLatencyIsBoundedUnderSaturation(t *testing.T) {
 	t.Cleanup(q.Close)
 	re := e.withWriteBudget(t, q, m)
 
-	post := func() (int, time.Duration) {
+	// The client's timeout is a liveness guard, NOT a latency criterion: the
+	// admission deadline is asserted through the decision (a 429 while the budget is
+	// full), and this exists only so that a path which never decides fails with a
+	// message in seconds instead of hanging the package until Go's aggregate
+	// -timeout. It is 300x the deadline and fires only when no decision is returned
+	// at all, which is why it cannot red on a merely busy box the way the bound it
+	// replaces did.
+	client := &http.Client{Timeout: 30 * time.Second}
+	post := func() (code int, raw []byte, retryAfter string, took time.Duration) {
 		t.Helper()
-		raw, err := json.Marshal(map[string]any{
+		body, err := json.Marshal(map[string]any{
 			"event_type": "payment.succeeded",
 			"payload":    map[string]any{"amount": 1},
 		})
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
-		req, err := http.NewRequest(http.MethodPost, re.srv.URL+"/v1/events", bytes.NewReader(raw))
+		req, err := http.NewRequest(http.MethodPost, re.srv.URL+"/v1/events", bytes.NewReader(body))
 		if err != nil {
 			t.Fatalf("new request: %v", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+tn.KeyPlain)
 		req.Header.Set("Content-Type", "application/json")
 		start := time.Now()
-		resp, err := re.srv.Client().Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
-			t.Fatalf("publish: %v", err)
+			t.Fatalf("a publish on a saturated write path returned no decision: %v (every response must be 202 or 429, never a park on the pool)", err)
 		}
 		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return resp.StatusCode, time.Since(start)
+		raw, err = io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		return resp.StatusCode, raw, resp.Header.Get("Retry-After"), time.Since(start)
 	}
 
-	// Phase 1: every slot held, so a publish can only be shed.
+	// Phase 1: the whole budget is held for the entire phase, and only phase 2
+	// releases it - so the only decision this path may record is "shed".
+	full := q.Stats().Depth
 	var held []writeq.Release
-	for i := 0; i < 2; i++ {
+	for i := 0; i < full; i++ {
 		rel, err := q.Acquire(ctx())
 		if err != nil {
 			t.Fatalf("Acquire: %v", err)
 		}
 		held = append(held, rel)
 	}
-	type observed struct {
-		code    int
-		latency time.Duration
-		phase   string
+	eventsBefore, outboxBefore := countEvents(t, re, tn.ID), countOutbox(t, re, tn.ID)
+
+	const saturated = 3
+	var maxShed time.Duration
+	for i := 0; i < saturated; i++ {
+		code, raw, retryAfter, took := post()
+		if took > maxShed {
+			maxShed = took
+		}
+		if code != http.StatusTooManyRequests {
+			t.Fatalf("saturated publish %d answered %d, want 429: with every slot of the budget already held, a shed is the only decision this path may record - serving it is the parking on the pool FR-818 removes; body: %s", i+1, code, raw)
+		}
+		if got := errorCode(t, raw); got != "over_capacity" {
+			t.Fatalf("saturated publish %d answered code %q, want over_capacity: a full write budget is neither disk pressure (over_budget) nor a rate limit (rate_limited); body: %s", i+1, got, raw)
+		}
+		if retryAfter != "1" {
+			t.Fatalf("saturated publish %d carries Retry-After %q, want \"1\": write pressure clears in the time a transaction takes", i+1, retryAfter)
+		}
 	}
-	var results []observed
-	for i := 0; i < 3; i++ {
-		code, d := post()
-		results = append(results, observed{code, d, "saturated"})
+	// The budget is still full after every decision, so no publish was admitted
+	// behind the test's back and no slot leaked; the sheds above are the budget's
+	// state and nothing else.
+	if got := q.Stats().InFlight; got != full {
+		t.Fatalf("the budget reports %d slot(s) in flight after %d sheds with %d held, want %d: a shed publish took a slot", got, saturated, full, full)
+	}
+	if got := m.ShedCount(); got != saturated {
+		t.Fatalf("shed counter = %d after %d saturated publishes, want %d: the recorded decision and its accounting must agree", got, saturated, saturated)
+	}
+	if n := countEvents(t, re, tn.ID); n != eventsBefore {
+		t.Fatalf("events = %d, want %d: a shed publish must not write (FR-818)", n, eventsBefore)
+	}
+	if n := countOutbox(t, re, tn.ID); n != outboxBefore {
+		t.Fatalf("outbox = %d, want %d: a shed publish must not write (FR-604/FR-818)", n, outboxBefore)
 	}
 
 	// Phase 2: the budget frees and the same request is served, so the test also
@@ -201,44 +265,38 @@ func TestPublishLatencyIsBoundedUnderSaturation(t *testing.T) {
 	for _, rel := range held {
 		rel()
 	}
-	for i := 0; i < 2; i++ {
-		code, d := post()
-		results = append(results, observed{code, d, "admitted"})
+	const admitted = 2
+	var maxAdmitted time.Duration
+	for i := 0; i < admitted; i++ {
+		code, raw, _, took := post()
+		if took > maxAdmitted {
+			maxAdmitted = took
+		}
+		mustStatus(t, code, raw, http.StatusAccepted)
+	}
+	if n := countEvents(t, re, tn.ID); n != eventsBefore+admitted {
+		t.Fatalf("events = %d, want %d: every admitted publish has its event row", n, eventsBefore+admitted)
+	}
+	if n := countOutbox(t, re, tn.ID); n != outboxBefore+admitted {
+		t.Fatalf("outbox = %d, want %d: every admitted publish has its outbox row (FR-604)", n, outboxBefore+admitted)
+	}
+	if got := m.ShedCount(); got != saturated {
+		t.Fatalf("shed counter = %d after %d admitted publishes, want %d: admission must not shed", got, admitted, saturated)
+	}
+	// The handler releases its slot on the way out (`defer release()`), which is
+	// after it wrote the response the client has already read - so wait (bounded)
+	// for a post-condition that is guaranteed to arrive rather than racing it. That
+	// is a bounded wait for a state, not a tolerance on how long a write takes.
+	released := time.Now().Add(30 * time.Second)
+	for q.Stats().InFlight != 0 {
+		if time.Now().After(released) {
+			t.Fatalf("the budget still reports %d slot(s) in flight after every admitted publish returned: an admitted publish leaked its slot", q.Stats().InFlight)
+		}
+		time.Sleep(time.Millisecond)
 	}
 
-	var maxAdmitted, maxShed time.Duration
-	admitted, shed := 0, 0
-	for _, r := range results {
-		switch r.code {
-		case http.StatusAccepted:
-			admitted++
-			if r.latency > maxAdmitted {
-				maxAdmitted = r.latency
-			}
-		case http.StatusTooManyRequests:
-			shed++
-			if r.latency > maxShed {
-				maxShed = r.latency
-			}
-		default:
-			t.Fatalf("a publish under saturation answered %d; every response must be 202 or 429", r.code)
-		}
-		if r.latency > admit+epsilon {
-			t.Fatalf("a %s publish took %s, past the %s admission deadline (+%s): this is the silent latency growth FR-818 exists to remove",
-				r.phase, r.latency, admit, epsilon)
-		}
-	}
-	if shed == 0 {
-		t.Fatal("a saturated write path shed nothing: the budget is not refusing ingest")
-	}
-	if admitted == 0 {
-		t.Fatal("nothing was admitted once the budget freed: the shed is not a budget state, it is a broken path")
-	}
-	if got := m.ShedCount(); int64(got) != int64(shed) {
-		t.Fatalf("shed counter = %d, want %d", got, shed)
-	}
-	t.Logf("publish latency under a %s admission deadline: max admitted %s, max shed %s (%d admitted, %d shed)",
-		admit, maxAdmitted, maxShed, admitted, shed)
+	t.Logf("publish decisions under a %s admission deadline: %d shed (max %s), %d admitted (max %s) - diagnostics of the box; the criterion is the decisions and their accounting",
+		admit, saturated, maxShed, admitted, maxAdmitted)
 }
 
 // TestDiskGateTakesPrecedenceOverWritePressure keeps the two 429 codes
