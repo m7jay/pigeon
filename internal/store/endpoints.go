@@ -325,24 +325,6 @@ func (s *Store) DeleteEndpoint(ctx context.Context, sc Scope, endpointID string)
 	return err
 }
 
-// EndpointIsInternal reports whether an endpoint is flagged internal (FR-402).
-//
-// It exists for FR-1005's request-time check: the delivery worker may only dial a
-// private or loopback address for an endpoint the operator has explicitly opted
-// in, and the claim path does not carry the flag. The worker caches the answer per
-// endpoint, so this is one query per endpoint per process, not one per delivery.
-func (s *Store) EndpointIsInternal(ctx context.Context, endpointID string) (bool, error) {
-	var internal bool
-	err := s.pool.QueryRow(ctx, `select internal from endpoints where id = $1`, endpointID).Scan(&internal)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, ErrNotFound
-	}
-	if err != nil {
-		return false, fmt.Errorf("read endpoint internal flag: %w", err)
-	}
-	return internal, nil
-}
-
 // VerifyEndpoint answers the ownership challenge (FR-403). A correct token for a
 // non-deleted endpoint stamps verified_at; from then it may receive live events.
 // A wrong token is ErrInvalid (422); an unknown endpoint is ErrNotFound. It never

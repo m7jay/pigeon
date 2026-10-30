@@ -251,12 +251,6 @@ type Worker struct {
 	// holder identifies this process in the concurrency set, so a release frees
 	// only its own slot.
 	holder string
-
-	// internalFlags caches FR-402's per-endpoint escape hatch for FR-1005's
-	// request-time check. The claim path does not carry it, and a query per
-	// attempt would sit on the delivery hot path for a value that changes only
-	// when an operator changes it.
-	internalFlags *endpointInternalCache
 }
 
 // attemptLane is one attempt-class lane (FR-1303): the class it claims and the
@@ -383,8 +377,6 @@ func New(st *store.Store, opts Options) *Worker {
 		notifier: opts.Notifier,
 		lanes:    newLanes(opts.Concurrency, opts.RetryConcurrency),
 		holder:   holderName(),
-
-		internalFlags: newEndpointInternalCache(),
 	}
 	// FR-1303: a configured retry allowance above C-1 is clamped rather than
 	// refused (the result still leaves the first-attempt lane a slot), and an
@@ -814,7 +806,14 @@ func (w *Worker) handle(ctx context.Context, d store.LeasedDelivery) {
 	}
 	// Per-attempt timeout (FR-819), derived from ctx so it is also cancelled on
 	// shutdown, bounding the attempt in both time and goroutine lifetime.
-	allowPrivate := w.endpointAllowsPrivate(ctx, d.EndpointID)
+	//
+	// FR-1005 at request time judges the address with FR-402's flag as the claim
+	// returned it (0022): the attempt dials private addresses only for the
+	// endpoint the operator opted in at the moment this row was claimed, and no
+	// second read can disagree with the row being attempted. The transport the
+	// attempt dials through is built for that same decision (clientFor), so the
+	// pre-flight check and the dial hook never judge one attempt differently.
+	allowPrivate := d.EndpointInternal
 	attemptCtx, cancel := context.WithTimeout(ctx, w.timeoutFor(d))
 	var res attemptResult
 	if refusal, blocked := ssrfRefusal(d, allowPrivate); blocked {
