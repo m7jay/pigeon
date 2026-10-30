@@ -894,7 +894,11 @@ func (h *Handler) guide(w http.ResponseWriter, r *http.Request, sess memberSessi
 // member half of the usage surface).
 func (h *Handler) usage(w http.ResponseWriter, r *http.Request, sess memberSession) {
 	view := usageView{Env: h.env(r)}
-	resp, err := h.coreReq(r, http.MethodGet, "/v1/producer/usage", nil)
+	// The plane travels in the query string, like every other member call this
+	// portal makes: memberScope (internal/httpapi/auth.go) reads it from `?env=`
+	// and answers 400 env_required without it, so a call that omits it renders
+	// the API's refusal instead of the reading.
+	resp, err := h.coreReq(r, http.MethodGet, h.envPath(r, "/v1/producer/usage"), nil)
 	switch {
 	case err != nil:
 		view.Error = "The pressure reading could not be fetched: the API could not be reached."

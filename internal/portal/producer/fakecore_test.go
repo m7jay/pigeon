@@ -83,16 +83,96 @@ func newFakeCore(t *testing.T) *fakeCore {
 		})
 		h := f.handlers[key]
 		f.mu.Unlock()
+		// The stand-in mirrors the core's member-scope contract instead of being
+		// more permissive than it: a member route resolves its plane from `?env=`
+		// (memberScope, internal/httpapi/auth.go:239-255) and answers 400 without
+		// it. A fake that answered anyway is exactly how a page could render the
+		// API's data here while the running portal rendered an error.
+		if isPlaneScopedMemberPath(r.URL.Path) {
+			switch env := r.URL.Query().Get("env"); {
+			case env == "":
+				writeJSONError(w, http.StatusBadRequest, "env_required",
+					"the env query parameter is required: test or live")
+				return
+			case env != "test" && env != "live":
+				writeJSONError(w, http.StatusBadRequest, "invalid_env", "env must be test or live")
+				return
+			}
+		}
 		if h == nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"no such resource"}}`))
+			writeJSONError(w, http.StatusNotFound, "not_found", "no such resource")
 			return
 		}
 		h(w, r)
 	}))
 	t.Cleanup(f.srv.Close)
+	// The claim the two checks above exist to make: every test that drives this
+	// stand-in is checked for the plane on teardown, so a new page or a new call
+	// site cannot be added to the blind spot this package had (S9a's UI-8 asked a
+	// member route with no `?env=` while every page test stayed green).
+	t.Cleanup(func() { everyMemberCallNamesThePlane(t, "core stand-in", f) })
 	return f
+}
+
+// producerPlaneFreeRoutes are the producer routes that resolve a producer-wide
+// scope rather than a plane and so take no `?env=`: members and member
+// invitations (producerScope, internal/httpapi/auth.go:257-267). The portal calls
+// none of them today; naming them is what keeps the rule below exact instead of
+// "every /v1/producer/ path needs an env".
+var producerPlaneFreeRoutes = []string{"/v1/producer/members", "/v1/producer/invites"}
+
+// isPlaneScopedMemberPath reports whether path is a member route whose scope the
+// core resolves with memberScope: the producer and the user come from the session
+// claim and the environment from `?env=test|live`, so a call that omits it is
+// answered 400 env_required rather than with data.
+func isPlaneScopedMemberPath(path string) bool {
+	if !strings.HasPrefix(path, "/v1/producer/") {
+		return false
+	}
+	for _, free := range producerPlaneFreeRoutes {
+		if path == free || strings.HasPrefix(path, free+"/") {
+			return false
+		}
+	}
+	return true
+}
+
+// everyMemberCallNamesThePlane requires the environment query parameter on every
+// member call the portal made, and returns the calls it inspected so a caller can
+// assert it actually covered the member surface. It is advisory (t.Errorf, not
+// t.Fatalf) because it also runs from a test's teardown.
+func everyMemberCallNamesThePlane(t *testing.T, label string, core *fakeCore) []coreCall {
+	t.Helper()
+	var member []coreCall
+	for _, call := range core.all() {
+		if !isPlaneScopedMemberPath(call.Path) {
+			continue
+		}
+		member = append(member, call)
+		if env := queryValue(t, call.URI, "env"); env != "test" && env != "live" {
+			t.Errorf("%s: %s %s carried env=%q, want test or live - the core takes a member route's plane from `?env=` (memberScope) and answers 400 env_required without it",
+				label, call.Method, call.URI, env)
+		}
+	}
+	return member
+}
+
+// queryValue pulls one query parameter out of a recorded request URI.
+func queryValue(t *testing.T, uri, key string) string {
+	t.Helper()
+	u, err := url.Parse(uri)
+	if err != nil {
+		t.Fatalf("recorded request URI %q does not parse: %v", uri, err)
+	}
+	return u.Query().Get(key)
+}
+
+// writeJSONError answers exactly as the core does, so a test can assert on the
+// error the API would have produced.
+func writeJSONError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(`{"error":{"code":"` + code + `","message":"` + message + `"}}`))
 }
 
 // on registers one canned answer: a status and a JSON body.
