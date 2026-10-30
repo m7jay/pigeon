@@ -356,9 +356,10 @@ with signing, leases, retries and the sweeper, the attempt buffer and flusher,
 replay and the inspect API, partitioning and retention by disk, both portals, the
 hardening work (SSRF at three points, secret rotation, `doctor`), the bounded write
 budget, and the delivery lanes and holds. The slice table in `PLAN.md` runs S0 to
-S12 (with S9a for the producer portal) and every one of them has landed; its State
-column is stale, though - it still shows a dash for S2 and later - so read the
-tree, not the column.
+S13 (with S9a for the producer portal): S0 to S12 have landed, and S13 - the
+challenge re-issue (FR-409, `SPEC.md` A-12) - has not. Its State column is stale
+for the slices that have landed, though - it still shows a dash for S2 through
+S12, while S13's dash is accurate - so read the tree, not the column.
 
 Not landed, and not to be read as green:
 
