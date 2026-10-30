@@ -1,0 +1,93 @@
+{{define "content"}}
+<h1>{{.Data.Name}}</h1>
+<div class="card">
+  <dl class="kv">
+    <dt>ID</dt><dd class="mono">{{.Data.ID}}</dd>
+    <dt>URL</dt><dd class="mono">{{.Data.URL}}</dd>
+    <dt>Status</dt><dd>{{template "badge" .Data.Status}}</dd>
+    <dt>Verified</dt><dd>{{if .Data.Verified}}{{template "badge" "active"}}{{else}}{{template "badge" "unverified"}}{{end}}</dd>
+    <dt>Notification email</dt><dd>{{if .Data.NotificationEmail}}{{.Data.NotificationEmail}}{{else}}<span class="muted">not set</span>{{end}}</dd>
+    <dt>Custom headers</dt>
+    <dd>
+      {{if .Data.CustomHeaders}}
+      <dl class="kv">
+        {{range .Data.CustomHeaders}}<dt class="mono">{{.Name}}</dt><dd class="mono">{{.Value}}</dd>{{end}}
+      </dl>
+      <span class="muted">Values are encrypted at rest and never shown again (FR-1006). To change them, register a new endpoint: headers are set at registration.</span>
+      {{else}}<span class="muted">none configured</span>{{end}}
+    </dd>
+    <dt>Created</dt><dd>{{.Data.CreatedAt}}</dd>
+  </dl>
+  <div class="row-actions" style="margin-top:0.75rem">
+    <form method="post" action="/endpoints/{{.Data.ID}}/{{if .Data.Paused}}resume{{else}}pause{{end}}">
+      {{template "csrf_field" .}}
+      <button class="btn btn-sm btn-secondary" type="submit">{{if .Data.Paused}}Resume{{else}}Pause{{end}}</button>
+    </form>
+    <form method="post" action="/endpoints/{{.Data.ID}}/delete" onsubmit="return confirm('Delete this endpoint? It will stop receiving events.')">
+      {{template "csrf_field" .}}
+      <button class="btn btn-sm btn-danger" type="submit">Delete</button>
+    </form>
+    <a class="btn btn-sm btn-secondary" href="/snippet?endpoint={{.Data.ID}}">Webhook snippet</a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Edit this endpoint</h2>
+  <p class="page-sub">Rename it, move it to another URL, or set the address failure notifications go to (UI-13). A new URL is checked against the same rules as registration.</p>
+  <form method="post" action="/endpoints/{{.Data.ID}}/edit">
+    {{template "csrf_field" .}}
+    <div class="form-row"><label for="name">Name</label><input id="name" type="text" name="name" value="{{.Data.Name}}" required></div>
+    <div class="form-row"><label for="url">URL</label><input id="url" type="url" name="url" value="{{.Data.URL}}" required></div>
+    <div class="form-row"><label for="notification_email">Notification email</label><input id="notification_email" type="email" name="notification_email" value="{{.Data.NotificationEmail}}" placeholder="you@example.com"><span class="muted">Leave empty to clear it.</span></div>
+    <button class="btn btn-sm" type="submit">Save changes</button>
+  </form>
+</div>
+
+{{if not .Data.Verified}}
+<div class="card">
+  <h2>Verify ownership</h2>
+  <p class="page-sub">Paste the verification token that was shown once when you registered this endpoint. Until it is answered the endpoint receives no live events (FR-403).</p>
+  <form method="post" action="/endpoints/{{.Data.ID}}/verify" class="inline">
+    {{template "csrf_field" .}}
+    <input type="text" name="token" placeholder="vrf_..." required style="width:auto;max-width:24rem">
+    <button class="btn btn-sm" type="submit">Verify endpoint</button>
+  </form>
+</div>
+{{end}}
+
+<div class="card">
+  <h2>Signing secret</h2>
+  {{if .Data.RotatedSecret}}
+  <p class="page-sub">This is your endpoint's new signing secret, shown once. Copy it into your verifier now - the API never returns it again.</p>
+  <pre class="snippet">{{.Data.RotatedSecret}}</pre>
+  {{else}}
+  <p class="page-sub">Each endpoint signs with its own secret (UI-13). Rotating mints a new one and retires the old one, so update your verifier before the next delivery.</p>
+  {{end}}
+  <form method="post" action="/endpoints/{{.Data.ID}}/rotate" onsubmit="return confirm('Rotate the signing secret? Your verifier must be updated with the new secret.')">
+    {{template "csrf_field" .}}
+    <button class="btn btn-sm btn-secondary" type="submit">Rotate signing secret</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Subscriptions</h2>
+  {{if .Data.AvailableTypes}}
+  <p class="page-sub">Choose which event types deliver to this endpoint (UI-14). These are the types the producer has made publicly subscribable.</p>
+  {{/* htmx swaps the refreshed panel in place; without htmx the plain post still
+       works, because the handler answers a non-htmx post with a 303 back to this
+       page. A fragment answered to a plain post would navigate the browser to a
+       document with no layout and no htmx, whose own controls are then inert. */}}
+  <form method="post" action="/endpoints/{{.Data.ID}}/subscriptions" class="inline"
+        hx-post="/endpoints/{{.Data.ID}}/subscriptions" hx-target="#subs-list" hx-swap="outerHTML">
+    {{template "csrf_field" .}}
+    <select name="event_type" required style="width:auto;max-width:24rem">
+      {{range .Data.AvailableTypes}}<option value="{{.}}">{{.}}</option>{{end}}
+    </select>
+    <button class="btn btn-sm" type="submit">Subscribe</button>
+  </form>
+  {{else}}
+  <p class="empty">The producer has no event types open to public subscription right now. Ask the producer to make a type publicly subscribable, then reload this page.</p>
+  {{end}}
+  <div style="margin-top:0.75rem">{{template "frag:subs/list" .Data.Subs}}</div>
+</div>
+{{end}}

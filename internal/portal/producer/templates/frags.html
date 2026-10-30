@@ -1,0 +1,38 @@
+{{/* Producer fragments: rendered without the page layout. Each reads the same
+     view models the content templates use.
+
+     frag:replay/panel is UI-5's confirmation panel. Its data is the panel view
+     paired with the page's csrf token, i.e. a value carrying .Replay (a
+     producer.replayView: Selection, Key, Confirmed, Matched, Rate, Message,
+     Error, Hidden) and .CSRFToken - the deliveries page builds it with the
+     `dict` helper, because producer.deliveriesView has no CSRFToken field of its
+     own and a form without the token is refused by the portal's middleware.
+     Both steps are plain forms first and htmx swaps second: without the script
+     the confirm step answers the log page with the confirmation in place, and
+     the commit step answers a 303 back to the log. A panel carrying only hx-*
+     attributes would fall back to a GET of the current URL and silently do
+     nothing.
+
+     The swap id (#replay-panel) sits on the container the deliveries page wraps
+     this fragment in, and nowhere else: htmx replaces the element carrying the
+     id (hx-swap="outerHTML"), so one container goes out and one comes in. */}}
+{{define "frag:replay/panel"}}
+{{$r := .Replay}}
+{{if $r.Error}}<p class="flash flash-error">The replay was refused: {{$r.Error}}</p>{{end}}
+{{if $r.Message}}<p class="flash flash-success">{{$r.Message}}</p>{{end}}
+{{if $r.Confirmed}}
+<p class="page-sub">The API matched <strong>{{$r.Matched}}</strong> {{if eq $r.Matched 1}}delivery{{else}}deliveries{{end}} for {{$r.Selection}} and would release them at <strong>{{$r.Rate}}/s</strong> per endpoint. Nothing has been created yet - committing is the step that writes.</p>
+<form method="post" action="/deliveries/replay" hx-post="/deliveries/replay" hx-target="#replay-panel" hx-swap="outerHTML">
+  {{template "csrf_field" .}}
+  {{range $r.Hidden}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">{{end}}
+  <button class="btn btn-sm" type="submit">Replay {{$r.Matched}} {{if eq $r.Matched 1}}delivery{{else}}deliveries{{end}}</button>
+</form>
+{{else}}
+<p class="page-sub">Replaying {{$r.Selection}} creates new deliveries linked to the ones they came from; it never changes the history you already have (FR-1106). The API's own bound applies (FR-1107), and the count and rate below are the API's answer, not a portal-side limit.</p>
+<form method="post" action="/deliveries/replay/confirm" hx-post="/deliveries/replay/confirm" hx-target="#replay-panel" hx-swap="outerHTML">
+  {{template "csrf_field" .}}
+  {{range $r.Hidden}}<input type="hidden" name="{{.Name}}" value="{{.Value}}">{{end}}
+  <button class="btn btn-sm" type="submit">Review this replay</button>
+</form>
+{{end}}
+{{end}}

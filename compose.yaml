@@ -1,9 +1,25 @@
 # Pigeon — reference deployment (OPS-1, §2.1).
 #
 # Five containers on one modest host: core, producer portal, consumer portal,
-# Postgres, Redis. The portals are separate deployables (§14) and arrive in M2a
-# and M2b; until then this file brings up the three that exist, so `compose up`
-# is always a working command rather than an aspirational one.
+# Postgres, Redis. The portals are separate deployables (§14, M2a and M2b) that
+# may each be omitted (AC-40): the core keeps serving both APIs with the same
+# scoping, and whoever had a UI simply has none. The image builds all three
+# binaries (§14, AC-40), so a deployment starts the containers it wants and this
+# file brings up all five.
+#
+# Two rules this file keeps, both checked by `go test ./internal/config`:
+#
+#   - Every service built from this repository names the binary it runs. The
+#     image's own ENTRYPOINT is the core, so a portal container that does not
+#     override it runs the core, whatever the service is called.
+#   - The core is handed .env wholesale (`env_file`) and a portal is not: each
+#     portal lists the names its own code reads. That is deliberately noisier
+#     than giving the portals `env_file: .env` too - it keeps visible which knobs
+#     a deployable actually carries, and it keeps core-only settings (the
+#     database URLs, the pool arithmetic, the retention windows) out of a
+#     container that has no reader for them. The cost is that a name a portal
+#     reads and this list omits is a knob .env.example documents and the
+#     deployment ignores, which is what the check refuses.
 
 name: pigeon
 
@@ -12,9 +28,18 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: pigeon
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pigeon}
+      # The bootstrap role owns the database and everything the migrations create.
+      # It is the *migrator*, not the application: PostgreSQL exempts a table owner
+      # from row-level security, so a process serving requests on this connection
+      # would have no tenant isolation at all. The runtime role (pigeon_app) is
+      # created unprivileged by deploy/postgres/01-roles.sql before the core starts.
+      POSTGRES_USER: pigeon_migrator
+      # No default: a deployment supplies its own database credentials, and compose
+      # refuses to start without them.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       POSTGRES_DB: pigeon
+      # Password for the runtime role. Rotate it like any other credential.
+      PIGEON_APP_PASSWORD: ${PIGEON_APP_PASSWORD:?PIGEON_APP_PASSWORD must be set}
     command:
       # OPS-8: the pool budget is documented arithmetic, so the server must
       # accept it. 100 leaves room for 4 replicas × 10 + reserved.
@@ -27,8 +52,9 @@ services:
       - effective_cache_size=1536MB
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres/01-roles.sql:/docker-entrypoint-initdb.d/01-roles.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pigeon -d pigeon"]
+      test: ["CMD-SHELL", "pg_isready -U pigeon_migrator -d pigeon"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -51,11 +77,26 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # The core is the image's own ENTRYPOINT, so this line changes nothing the
+    # image did not already decide; it is here because every service this
+    # repository builds says which of the image's three binaries it runs, and the
+    # knob check in internal/config reads it to decide whose settings this is.
+    entrypoint: ["/pigeon"]
     restart: unless-stopped
     env_file: .env
     environment:
-      PIGEON_DATABASE_URL: postgres://pigeon:${POSTGRES_PASSWORD:-pigeon}@postgres:5432/pigeon?sslmode=disable
+      # Two URLs, two roles, on purpose (docs/topology.md, "Database roles"):
+      #   PIGEON_DATABASE_URL         — serves requests; unprivileged, so RLS applies
+      #   PIGEON_MIGRATE_DATABASE_URL — owns the schema; used only by the migration
+      #                                 path at boot
+      PIGEON_DATABASE_URL: postgres://pigeon_app:${PIGEON_APP_PASSWORD:?PIGEON_APP_PASSWORD must be set}@postgres:5432/pigeon?sslmode=disable
+      PIGEON_MIGRATE_DATABASE_URL: postgres://pigeon_migrator:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/pigeon?sslmode=disable
       PIGEON_REDIS_URL: redis://redis:6379/0
+      # FR-1006: the at-rest key for endpoint custom header values. No default on
+      # purpose, like the two passwords above: `docker compose up` refuses to
+      # start until a real 32-byte base64 key is supplied (`openssl rand -base64
+      # 32`), so a deployment cannot ship the placeholder from .env.example.
+      PIGEON_HEADERS_KEY: ${PIGEON_HEADERS_KEY:?PIGEON_HEADERS_KEY must be set to 32 bytes of base64 (openssl rand -base64 32)}
     ports:
       - "8080:8080"
     depends_on:
@@ -69,8 +110,119 @@ services:
       timeout: 3s
       retries: 5
 
-  # producer-portal:   # M2a — UI-1…UI-11
-  # consumer-portal:   # M2b — UI-12…UI-19
+  # The producer portal (M2a, UI-1…UI-11). A separate, independently themeable
+  # deployable that is a thin client of the core API. It may be removed entirely:
+  # the core keeps serving the producer API with the same scoping, and producer
+  # members simply have no UI (AC-40).
+  producer-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # The portal binary, not the core: the image's ENTRYPOINT is `/pigeon` and a
+    # container that does not override it runs the core (Dockerfile).
+    entrypoint: ["/producer-portal"]
+    restart: unless-stopped
+    environment:
+      # Everything this deployable reads, and nothing else: unlike the core it
+      # does not get .env (env_file), so a knob missing from this list never
+      # reaches the process and .env.example documenting it is a lie. The names
+      # and this list are kept in step by `go test ./internal/config`.
+      # The base URL of the core API on the compose network. The portal never
+      # touches Postgres or Redis: it is a stateless proxy of the core, holds no
+      # database and runs no workers.
+      PIGEON_CORE_API_URL: http://core:8080
+      # Encrypts the producer session cookie (AES-256-GCM, internal/portal). Must
+      # be set and kept stable across restarts; changing it logs every user out.
+      PIGEON_PRODUCER_PORTAL_SESSION_SECRET: ${PIGEON_PRODUCER_PORTAL_SESSION_SECRET:?PIGEON_PRODUCER_PORTAL_SESSION_SECRET must be set}
+      # The listen address and the session cookie's name, both at the code's own
+      # default (cmd/producer-portal's envOr) so an unset value behaves exactly
+      # like a run outside compose. The address has to match the `ports:` mapping
+      # below, which publishes :8083: move this without moving that and the
+      # container serves nothing on the port the host reaches, while its
+      # healthcheck - which asks the process on the address it read from here -
+      # still passes.
+      PIGEON_PRODUCER_PORTAL_ADDR: ${PIGEON_PRODUCER_PORTAL_ADDR:-:8083}
+      PIGEON_PRODUCER_PORTAL_COOKIE_NAME: ${PIGEON_PRODUCER_PORTAL_COOKIE_NAME:-producer_session}
+      # Producer branding the producer portal carries (UI-17). All optional: an
+      # unset value falls back to a neutral wordmark with no Pigeon branding.
+      PORTAL_BRAND_NAME: ${PORTAL_BRAND_NAME:-}
+      PORTAL_BRAND_ACCENT: ${PORTAL_BRAND_ACCENT:-}
+      PORTAL_BRAND_LOGO_URL: ${PORTAL_BRAND_LOGO_URL:-}
+      PORTAL_BRAND_COMPANY: ${PORTAL_BRAND_COMPANY:-}
+      # The plane the portal starts in (test or live). A default, not a decision:
+      # the signed-in human switches planes and every call carries the plane
+      # explicitly (FR-103), so this only decides where a fresh visitor lands.
+      PIGEON_PRODUCER_PORTAL_ENV: ${PIGEON_PRODUCER_PORTAL_ENV:-test}
+      # FR-106's optional OIDC login, all optional together: with no issuer the
+      # portal renders no OIDC control and the core answers 404 for
+      # POST /v1/session/oidc, so an instance without an IdP loses nothing.
+      PIGEON_OIDC_ISSUER: ${PIGEON_OIDC_ISSUER:-}
+      PIGEON_OIDC_CLIENT_ID: ${PIGEON_OIDC_CLIENT_ID:-}
+      # The client secret stays here, in the portal (the relying party), and is
+      # deliberately not passed to the core: the core only verifies the id_token
+      # the portal obtained, so it never holds the value that lets a caller speak
+      # for this portal at the issuer.
+      PIGEON_OIDC_CLIENT_SECRET: ${PIGEON_OIDC_CLIENT_SECRET:-}
+      PIGEON_OIDC_REDIRECT_URL: ${PIGEON_OIDC_REDIRECT_URL:-}
+      PIGEON_OIDC_SCOPES: ${PIGEON_OIDC_SCOPES:-}
+    ports:
+      - "8083:8083"
+    depends_on:
+      core:
+        condition: service_healthy
+    healthcheck:
+      # The image is scratch: no shell, curl or wget, so the binary answers its
+      # own liveness rather than running a shell script (cmd/producer-portal).
+      test: ["CMD", "/producer-portal", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # The consumer portal (M2b, UI-12…UI-19). A separate, independently themeable
+  # deployable that is a thin client of the core API. It may be removed entirely:
+  # the core keeps serving the consumer self-service API with the same scoping,
+  # and consumer users simply have no UI (UI-19, AC-40).
+  consumer-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # The portal binary, not the core: the image's ENTRYPOINT is `/pigeon` and a
+    # container that does not override it runs the core (Dockerfile).
+    entrypoint: ["/consumer-portal"]
+    restart: unless-stopped
+    environment:
+      # This deployable's own knobs, listed rather than handed .env - the same
+      # rule and the same reason as the producer portal above.
+      # The base URL of the core API on the compose network. The portal never
+      # touches Postgres or Redis: it is a stateless proxy of the core.
+      PIGEON_CORE_API_URL: http://core:8080
+      # Encrypts the consumer session cookie (AES-256-GCM, internal/portal). Must
+      # be set and kept stable across restarts; changing it logs every user out.
+      PORTAL_SESSION_SECRET: ${PORTAL_SESSION_SECRET:?PORTAL_SESSION_SECRET must be set}
+      # The listen address and the session cookie's name, both at the code's own
+      # default (cmd/consumer-portal's envOr). The address has to match the
+      # `ports:` mapping below, which publishes :8082 - see the producer portal's
+      # note above for what a mismatch costs.
+      PIGEON_PORTAL_ADDR: ${PIGEON_PORTAL_ADDR:-:8082}
+      PORTAL_SESSION_COOKIE_NAME: ${PORTAL_SESSION_COOKIE_NAME:-consumer_session}
+      # Producer branding the consumer portal carries (UI-17). All optional: an
+      # unset value falls back to a neutral wordmark with no Pigeon branding.
+      PORTAL_BRAND_NAME: ${PORTAL_BRAND_NAME:-}
+      PORTAL_BRAND_ACCENT: ${PORTAL_BRAND_ACCENT:-}
+      PORTAL_BRAND_LOGO_URL: ${PORTAL_BRAND_LOGO_URL:-}
+      PORTAL_BRAND_COMPANY: ${PORTAL_BRAND_COMPANY:-}
+    ports:
+      - "8082:8082"
+    depends_on:
+      core:
+        condition: service_healthy
+    healthcheck:
+      # The image is scratch: no shell, curl or wget, so the binary answers its
+      # own liveness rather than running a shell script (cmd/consumer-portal).
+      test: ["CMD", "/consumer-portal", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
   pgdata:

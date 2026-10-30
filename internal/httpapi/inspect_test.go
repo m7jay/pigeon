@@ -1,0 +1,1369 @@
+package httpapi
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/m7jay/pigeon/internal/store"
+)
+
+// This file is S7's acceptance suite: the delivery list and its cursor
+// (FR-1101), the ordered attempt trail (FR-1102, FR-1103), the event-level
+// rollup and the trail that is never empty (FR-1109, FR-1110, FR-1111), replay
+// (AC-12, AC-13, FR-1106..FR-1108), consumer scoping (FR-1105) and the dedupe
+// answer (FR-903).
+//
+// The fixtures go through the real paths - the API for everything a producer
+// does, the store's fan-out and completion methods for the two things a *worker*
+// does (S3's fan-out and S4's completion) - so a test that passes here is a
+// statement about the API and the SQL, not about a stub.
+
+// --- fixtures -------------------------------------------------------------
+
+// s7Scope is a tenant's live plane, for the store calls that stand in for a
+// worker.
+func s7Scope(tn *tenant) store.Scope {
+	return store.Scope{ProducerID: tn.ID, Env: store.EnvLive}
+}
+
+// seedInspectTenant builds the smallest tenant that can actually receive an
+// event. seedTenant's endpoint is unverified and fan-out skips an unverified
+// live endpoint (FR-403), so this registers a consumer-routed type, verifies the
+// endpoint and subscribes it.
+func (e *env) seedInspectTenant(t *testing.T, slug string) *tenant {
+	t.Helper()
+	tn := e.seedTenant(t, slug)
+	tn.EventTypeName = strings.ReplaceAll(slug, "-", "") + ".order"
+	code, raw := e.do(http.MethodPost, "/v1/event-types", tn.KeyPlain, map[string]any{
+		"name":           tn.EventTypeName,
+		"routing_mode":   "consumer",
+		"payload_schema": map[string]any{"type": "object"},
+	})
+	mustStatus(t, code, raw, http.StatusCreated)
+	e.verifyEndpoint(t, tn, tn.EndpointID, tn.EndpointVerifyToken)
+	return tn
+}
+
+// s7Fixture is one test's slice of S7's shared tenant: its own consumer, its own
+// endpoint subscribed to the tenant's consumer-routed type, and its own events.
+//
+// The tenant is shared because seedTenant is the expensive half of this package's
+// fixtures - it accepts three invitations and logs in four times, seven bcrypt
+// calls - and nine S7 tests each seeding their own tenant added ~150 s to a
+// package that was already the suite's long pole (S7's head, CI run
+// 40586485856). A consumer, an endpoint and a subscription cost no hashing, so
+// isolation comes from those instead - every assertion below is scoped to this
+// test's own consumer or endpoint rather than to "everything the tenant has".
+// The harness now hashes test identities at a cheaper cost (main_test.go), which
+// made those seven calls cheap; the sharing stays because it is free isolation of
+// the tenant itself, and re-cutting nine tests would be a change to the
+// assertions rather than to the harness.
+type s7Fixture struct {
+	Tenant     *tenant
+	Ref        string
+	ConsumerID string
+	EndpointID string
+}
+
+// s7TenantSlug names the one tenant the S7 tests share.
+const s7TenantSlug = "s7-inspect"
+
+// s7Tenant returns the shared tenant, seeding it on first use in this binary.
+func s7Tenant(t *testing.T, e *env) *tenant {
+	t.Helper()
+	if tn, ok := e.tenants[s7TenantSlug]; ok {
+		return tn
+	}
+	return e.seedInspectTenant(t, s7TenantSlug)
+}
+
+// setupS7 returns the shared tenant plus a fresh consumer and endpoint for this
+// test.
+func setupS7(t *testing.T) (*env, *s7Fixture) {
+	t.Helper()
+	e := setup(t)
+	tn := s7Tenant(t, e)
+	slug := refSlug(t.Name())
+	fx := &s7Fixture{Tenant: tn, Ref: "ref-" + slug}
+	code, raw := e.do(http.MethodPost, "/v1/producer/consumers?env=live", tn.OwnerToken,
+		map[string]string{"ref": fx.Ref, "name": "S7 fixture " + slug})
+	mustStatus(t, code, raw, http.StatusCreated)
+	fx.ConsumerID = decode[consumerJSON](t, raw).ID
+	fx.EndpointID = e.newEndpoint(t, tn, fx.ConsumerID, slug, tn.EventTypeName)
+	return e, fx
+}
+
+// refSlug turns a test name into the alphanumeric part a consumer ref takes.
+func refSlug(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// newEndpoint registers an endpoint under a consumer, verifies it and subscribes
+// it to a type, returning its id.
+func (e *env) newEndpoint(t *testing.T, tn *tenant, consumerID, name, eventType string) string {
+	t.Helper()
+	code, raw := e.do(http.MethodPost, "/v1/producer/consumers/"+consumerID+"/endpoints?env=live",
+		tn.OwnerToken, map[string]string{"name": name, "url": "https://8.8.4.4/hook"})
+	mustStatus(t, code, raw, http.StatusCreated)
+	created := decode[endpointCreatedJSON](t, raw)
+	e.verifyEndpointFor(t, tn, consumerID, created.ID, created.VerificationToken, eventType)
+	return created.ID
+}
+
+// deliverFor publishes one event for this fixture's own consumer and fans it out,
+// returning the delivery ids it produced.
+func (e *env) deliverFor(t *testing.T, fx *s7Fixture) []int64 {
+	t.Helper()
+	return e.fanOut(t, fx.Tenant, e.publishFor(t, fx, fx.Ref))
+}
+
+// publishFor publishes one event for the fixture's tenant against a named
+// consumer ref, so a test can aim at a consumer that is not its own (the
+// unroutable case, or a sibling consumer in the FR-1105 test).
+func (e *env) publishFor(t *testing.T, fx *s7Fixture, ref string) string {
+	t.Helper()
+	return e.publishTypedEvent(t, fx.Tenant, fx.Tenant.EventTypeName, ref)
+}
+
+// verifyEndpoint answers the ownership challenge (FR-403) and subscribes the
+// endpoint to the tenant's event type (FR-501), over the API.
+func (e *env) verifyEndpoint(t *testing.T, tn *tenant, endpointID, token string) {
+	t.Helper()
+	e.verifyEndpointFor(t, tn, tn.ConsumerID, endpointID, token, tn.EventTypeName)
+}
+
+// verifyEndpointFor is verifyEndpoint for a named consumer and type, so a fixture
+// can hold several consumers at once (the S7 tests each own one, and the
+// cross-producer tenant keeps a broadcast type for the ingest cases and a
+// consumer-routed one for the delivery cases).
+func (e *env) verifyEndpointFor(t *testing.T, tn *tenant, consumerID, endpointID, token, eventType string) {
+	t.Helper()
+	code, raw := e.do(http.MethodPost,
+		"/v1/producer/consumers/"+consumerID+"/endpoints/"+endpointID+"/verify?env=live",
+		tn.OwnerToken, map[string]string{"token": token})
+	mustStatus(t, code, raw, http.StatusNoContent)
+	code, raw = e.do(http.MethodPost, "/v1/producer/endpoints/"+endpointID+"/subscriptions?env=live",
+		tn.OwnerToken, map[string]string{"event_type": eventType})
+	mustStatus(t, code, raw, http.StatusCreated)
+}
+
+// publishTypedEvent publishes against a named type.
+func (e *env) publishTypedEvent(t *testing.T, tn *tenant, eventType, consumerRef string) string {
+	t.Helper()
+	code, raw := e.do(http.MethodPost, "/v1/events", tn.KeyPlain, map[string]any{
+		"event_type":   eventType,
+		"consumer_ref": consumerRef,
+		"payload":      map[string]any{"note": "s7"},
+	})
+	mustStatus(t, code, raw, http.StatusAccepted)
+	return decode[publishResponse](t, raw).ID
+}
+
+// fanOutRaw runs S3's fan-out and returns the worker's own result, for the
+// fixtures whose point is that fan-out recorded a skip or an event-level reason
+// (FR-509, §7.5a).
+func (e *env) fanOutRaw(t *testing.T, tn *tenant, eventID string) store.FanOutResult {
+	t.Helper()
+	res, err := e.st.FanOutEvent(context.Background(), s7Scope(tn), eventID)
+	if err != nil {
+		t.Fatalf("fan out %s: %v", eventID, err)
+	}
+	return res
+}
+
+// fanOut runs S3's fan-out for one event and returns the delivery ids it
+// created, in id order.
+func (e *env) fanOut(t *testing.T, tn *tenant, eventID string) []int64 {
+	t.Helper()
+	res := e.fanOutRaw(t, tn, eventID)
+	if res.Idle || len(res.Skipped) > 0 || res.EventReason != "" {
+		t.Fatalf("fan-out recorded idle=%v skipped=%v reason=%q; the fixture expects a routable event",
+			res.Idle, res.Skipped, res.EventReason)
+	}
+	rows, err := e.admin.Query(context.Background(),
+		`select id from deliveries where event_id = $1 order by id`, eventID)
+	if err != nil {
+		t.Fatalf("read deliveries of %s: %v", eventID, err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		t.Fatalf("fan-out created no delivery for %s", eventID)
+	}
+	return ids
+}
+
+// deliver is one event fanning out to one delivery for a given consumer, in
+// whatever state the caller asks for next.
+func (e *env) deliver(t *testing.T, fx *s7Fixture) int64 {
+	t.Helper()
+	return e.deliverFor(t, fx)[0]
+}
+
+// completeDelivery runs S4's successful path (FR-811): the four columns on the
+// delivery row and NO attempt row (AC-28), which is exactly the shape FR-1110
+// and AC-32 are about.
+func (e *env) completeDelivery(t *testing.T, id, attempts int64, started, done time.Time) {
+	t.Helper()
+	ok, err := e.st.CompleteDelivery(context.Background(), id, int(attempts), started, done)
+	if err != nil || !ok {
+		t.Fatalf("complete delivery %d: ok=%v err=%v", id, ok, err)
+	}
+}
+
+// failDelivery runs S4's terminal path: one failed attempt row (FR-804) and a
+// delivery left `failed_terminal` (FR-806, the name I-4 gives that state).
+func (e *env) failDelivery(t *testing.T, id int64, status int, attempts int, started time.Time) {
+	t.Helper()
+	for n := 1; n <= attempts; n++ {
+		outcome, class := "retryable", "http_retryable"
+		var next *time.Time
+		if n == attempts {
+			outcome, class = "terminal", "http_terminal"
+		} else {
+			at := started.Add(time.Duration(n) * 30 * time.Second)
+			next = &at
+		}
+		err := e.st.RecordAttempt(context.Background(), store.AttemptRecord{
+			DeliveryID: id, Attempt: n, Outcome: outcome, ErrorClass: class,
+			ResponseStatus: &status, ResponseBody: "boom", DurationMs: 7, NextRetryAt: next,
+		})
+		if err != nil {
+			t.Fatalf("record attempt %d of delivery %d: %v", n, id, err)
+		}
+	}
+	ok, err := e.st.FinalizeDelivery(context.Background(), id, attempts, started)
+	if err != nil || !ok {
+		t.Fatalf("finalize delivery %d: ok=%v err=%v", id, ok, err)
+	}
+}
+
+// countRows is a fixture read as the superuser: the tests assert on what the
+// database holds, not only on what the API said.
+func (e *env) countRows(t *testing.T, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := e.admin.QueryRow(context.Background(), query, args...).Scan(&n); err != nil {
+		t.Fatalf("count (%s): %v", query, err)
+	}
+	return n
+}
+
+// ensurePartition creates the daily partition for a day, the same way fan-out does
+// before it writes a delivery stamped with the event's created_at (SB-1). Under
+// partitioning a row's day is a prerequisite rather than a column value, so a fixture
+// that writes or moves a delivery to an old day has to create that day first - the
+// production path does exactly this (internal/store/fanout.go, EnsurePartitionCached),
+// which is why an event that sat in the outbox for a week still fans out.
+func (e *env) ensurePartition(t *testing.T, table string, day time.Time) {
+	t.Helper()
+	if _, err := e.admin.Exec(context.Background(),
+		`select pigeon_ensure_partition($1, $2::date)`, table, day.UTC().Format("2006-01-02")); err != nil {
+		t.Fatalf("ensure %s partition for %s: %v", table, day.UTC().Format("2006-01-02"), err)
+	}
+}
+
+// bulkDeliveries inserts n delivered deliveries for one tenant and endpoint,
+// each on its own event (the (event_id, endpoint_id) pair is unique), created at
+// the given time.
+//
+// It is SQL rather than fan-out on purpose: AC-13 is a statement about the read
+// path's bound, and building 5,000 pairs through publish + fan-out would measure
+// the ingest path instead. The rows are still real rows in the real tables, so
+// the selection the API bounds is the selection a support engineer would see.
+func (e *env) bulkDeliveries(t *testing.T, tn *tenant, consumerID, endpointID, tag string, n int, createdAt time.Time) {
+	t.Helper()
+	e.ensurePartition(t, "deliveries", createdAt)
+	ctx := context.Background()
+	_, err := e.admin.Exec(ctx, `
+		insert into events (id, producer_id, env, event_type, payload_version, routing_mode,
+		                    event_class, consumer_ref, occurred_at, payload)
+		select $5 || i::text, $1, 'live', $2, 1, 'consumer', 'normal', $3, $4, '{}'::jsonb
+		from generate_series(1, $6::int) i`,
+		tn.ID, tn.EventTypeName, tn.ConsumerRef, createdAt, tag, n)
+	if err != nil {
+		t.Fatalf("bulk events (%s): %v", tag, err)
+	}
+	_, err = e.admin.Exec(ctx, `
+		insert into deliveries (event_id, endpoint_id, producer_id, env, consumer_id, status, created_at)
+		select $5 || i::text, $1, $2, 'live', $3, 'delivered', $4
+		from generate_series(1, $6::int) i`,
+		endpointID, tn.ID, consumerID, createdAt, tag, n)
+	if err != nil {
+		t.Fatalf("bulk deliveries (%s): %v", tag, err)
+	}
+}
+
+// --- wire shapes the tests decode -----------------------------------------
+
+type deliveryListJSON struct {
+	Deliveries []deliveryJSON `json:"deliveries"`
+	NextCursor *int64         `json:"next_cursor"`
+}
+
+type replayJSONBody struct {
+	Matched          int     `json:"matched"`
+	Created          int     `json:"created"`
+	DeliveryIDs      []int64 `json:"delivery_ids"`
+	Repeated         bool    `json:"repeated"`
+	ReleasePerSecond int     `json:"release_per_second"`
+	DryRun           bool    `json:"dry_run"`
+}
+
+type eventViewJSONBody struct {
+	Event      eventJSON      `json:"event"`
+	Rollup     string         `json:"rollup"`
+	Deliveries []deliveryJSON `json:"deliveries"`
+}
+
+type dedupeJSONBody struct {
+	EndpointID      string  `json:"endpoint_id"`
+	EventID         string  `json:"event_id"`
+	Duplicate       bool    `json:"duplicate"`
+	FirstDeliveryID int64   `json:"first_delivery_id"`
+	FirstSeenAt     *string `json:"first_seen_at"`
+	Deliveries      int     `json:"deliveries"`
+}
+
+func (e *env) listDeliveries(t *testing.T, token, query string) deliveryListJSON {
+	t.Helper()
+	code, raw := e.do(http.MethodGet, "/v1/producer/deliveries?env=live"+query, token, nil)
+	mustStatus(t, code, raw, http.StatusOK)
+	return decode[deliveryListJSON](t, raw)
+}
+
+func (e *env) eventView(t *testing.T, token, eventID string) eventViewJSONBody {
+	t.Helper()
+	code, raw := e.do(http.MethodGet, "/v1/producer/events/"+eventID+"?env=live", token, nil)
+	mustStatus(t, code, raw, http.StatusOK)
+	return decode[eventViewJSONBody](t, raw)
+}
+
+// --- FR-1101: the list, its filters and its cursor ------------------------
+
+// TestDeliveryListFiltersAndCursorPagination is FR-1101: filters by endpoint,
+// event type, status and time range, paginated by cursor.
+func TestDeliveryListFiltersAndCursorPagination(t *testing.T) {
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+	// Every read below is scoped to this test's own endpoint: the tenant is
+	// shared with its sibling tests, and this endpoint is this test's alone.
+	mine := "&endpoint_id=" + fx.EndpointID
+
+	delivered := e.deliver(t, fx)
+	e.completeDelivery(t, delivered, 1, time.Now().Add(-2*time.Second), time.Now().Add(-time.Second))
+	failed := e.deliver(t, fx)
+	e.failDelivery(t, failed, 500, 1, time.Now().Add(-time.Second))
+	pending := e.deliver(t, fx)
+
+	all := e.listDeliveries(t, tn.OwnerToken, mine)
+	if len(all.Deliveries) != 3 {
+		t.Fatalf("listed %d deliveries, want 3", len(all.Deliveries))
+	}
+	if all.NextCursor != nil {
+		t.Fatalf("a page shorter than the limit reported next_cursor %v", *all.NextCursor)
+	}
+	if all.Deliveries[0].ID != pending || all.Deliveries[2].ID != delivered {
+		t.Fatalf("list is not newest-first: %d, %d, %d (want %d first, %d last)",
+			all.Deliveries[0].ID, all.Deliveries[1].ID, all.Deliveries[2].ID, pending, delivered)
+	}
+
+	// The cursor walks the whole set exactly once, and the last page says so.
+	seen := map[int64]bool{}
+	cursor := ""
+	for page := 0; page < 5; page++ {
+		got := e.listDeliveries(t, tn.OwnerToken, "&limit=1"+mine+cursor)
+		if len(got.Deliveries) != 1 {
+			t.Fatalf("page %d returned %d rows, want 1", page, len(got.Deliveries))
+		}
+		if seen[got.Deliveries[0].ID] {
+			t.Fatalf("cursor returned delivery %d twice", got.Deliveries[0].ID)
+		}
+		seen[got.Deliveries[0].ID] = true
+		if got.NextCursor == nil {
+			break
+		}
+		cursor = fmt.Sprintf("&cursor=%d", *got.NextCursor)
+	}
+	if len(seen) != 3 {
+		t.Fatalf("the cursor walked %d deliveries, want 3", len(seen))
+	}
+
+	// Status filter.
+	only := e.listDeliveries(t, tn.OwnerToken, "&status=delivered"+mine)
+	if len(only.Deliveries) != 1 || only.Deliveries[0].ID != delivered {
+		t.Fatalf("status=delivered returned %+v, want just delivery %d", only.Deliveries, delivered)
+	}
+	if got := only.Deliveries[0]; got.DurationMs == nil || *got.DurationMs < 1000 {
+		t.Fatalf("a delivered delivery reported duration_ms=%v, want the first-attempt duration", got.DurationMs)
+	}
+
+	// Event type and endpoint filters.
+	if got := e.listDeliveries(t, tn.OwnerToken, "&event_type="+tn.EventTypeName+mine); len(got.Deliveries) != 3 {
+		t.Fatalf("event_type filter returned %d rows, want 3", len(got.Deliveries))
+	}
+	if got := e.listDeliveries(t, tn.OwnerToken, "&event_type=nothing.here"+mine); len(got.Deliveries) != 0 {
+		t.Fatalf("an unrelated event type returned %d rows, want 0", len(got.Deliveries))
+	}
+	if got := e.listDeliveries(t, tn.OwnerToken, "&endpoint_id=ep_does_not_exist"); len(got.Deliveries) != 0 {
+		t.Fatalf("an unknown endpoint returned %d rows, want 0", len(got.Deliveries))
+	}
+	// The list is tenant-wide, so an unfiltered page contains this test's three
+	// among whatever its siblings and the cross-producer fixtures left behind:
+	// tenant isolation itself is the cross-producer suite's assertion, not this
+	// one's.
+	unfiltered := e.listDeliveries(t, tn.OwnerToken, "")
+	if len(unfiltered.Deliveries) < 3 {
+		t.Fatalf("the unfiltered list returned %d rows, want at least this test's 3", len(unfiltered.Deliveries))
+	}
+
+	// Time range. One delivery is aged out of the window by hand, so the filter
+	// is proven to read the column rather than to accept a parameter. Under SB-1's
+	// partitioning a row's day is a prerequisite, not just a column value: moving a
+	// delivery back in time needs that day's partition to exist, exactly as fan-out
+	// creates the partition for the event's day before it writes a delivery.
+	e.ensurePartition(t, "deliveries", time.Now().Add(-30*24*time.Hour))
+	if _, err := e.admin.Exec(context.Background(),
+		`update deliveries set created_at = now() - interval '30 days' where id = $1`, delivered); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	if got := e.listDeliveries(t, tn.OwnerToken, "&from="+since+mine); len(got.Deliveries) != 2 {
+		t.Fatalf("from=1h returned %d rows, want the two recent deliveries", len(got.Deliveries))
+	}
+	until := time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339)
+	if got := e.listDeliveries(t, tn.OwnerToken, "&to="+until+mine); len(got.Deliveries) != 1 || got.Deliveries[0].ID != delivered {
+		t.Fatalf("to=24h ago returned %+v, want just the aged delivery %d", got.Deliveries, delivered)
+	}
+
+	// Malformed parameters are refused rather than guessed at.
+	code, raw := e.do(http.MethodGet, "/v1/producer/deliveries?env=live&cursor=nope", tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusBadRequest)
+	if got := errorCode(t, raw); got != "invalid_cursor" {
+		t.Fatalf("error code = %q, want invalid_cursor", got)
+	}
+	code, raw = e.do(http.MethodGet, "/v1/producer/deliveries?env=live&limit=1000", tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusBadRequest)
+	code, raw = e.do(http.MethodGet, "/v1/producer/deliveries?env=live&from=yesterday", tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusBadRequest)
+	if got := errorCode(t, raw); got != "invalid_time" {
+		t.Fatalf("error code = %q, want invalid_time", got)
+	}
+}
+
+// doListAsConsumer reads the consumer-scoped list (FR-1105, UI-15).
+func (e *env) doListAsConsumer(t *testing.T, consumerToken string) []deliveryJSON {
+	t.Helper()
+	code, raw := e.do(http.MethodGet, "/v1/consumer/deliveries", consumerToken, nil)
+	mustStatus(t, code, raw, http.StatusOK)
+	return decode[deliveryListJSON](t, raw).Deliveries
+}
+
+// --- FR-1102, FR-1103: the ordered attempt trail --------------------------
+
+// TestDeliveryDetailExposesOrderedAttempts is FR-1102 and FR-1103: one delivery
+// with its attempts in order, each carrying number, timestamp, duration, status,
+// truncated body, error class and next retry time.
+func TestDeliveryDetailExposesOrderedAttempts(t *testing.T) {
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+
+	id := e.deliver(t, fx)
+	started := time.Now().Add(-90 * time.Second).UTC().Truncate(time.Millisecond)
+	e.failDelivery(t, id, 503, 2, started)
+
+	code, raw := e.do(http.MethodGet, fmt.Sprintf("/v1/producer/deliveries/%d?env=live", id), tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusOK)
+	detail := decode[deliveryJSON](t, raw)
+
+	// I-4/FR-1201: `failed_terminal` is the terminal status name S5 lands
+	// (0013 migrates the data and replaces the check constraint).
+	if detail.Status != "failed_terminal" || detail.Attempts != 2 {
+		t.Fatalf("detail = status %q attempts %d, want failed_terminal/2", detail.Status, detail.Attempts)
+	}
+	if len(detail.AttemptsRows) != 2 {
+		t.Fatalf("detail returned %d attempt rows, want 2", len(detail.AttemptsRows))
+	}
+	first, second := detail.AttemptsRows[0], detail.AttemptsRows[1]
+	if first.Attempt != 1 || second.Attempt != 2 {
+		t.Fatalf("attempts are not in order: %d then %d", first.Attempt, second.Attempt)
+	}
+	if first.ResponseStatus == nil || *first.ResponseStatus != 503 {
+		t.Fatalf("attempt 1 status = %v, want 503", first.ResponseStatus)
+	}
+	if first.ErrorClass != "http_retryable" || first.Outcome != "retryable" {
+		t.Fatalf("attempt 1 = %s/%s, want http_retryable/retryable", first.ErrorClass, first.Outcome)
+	}
+	if first.NextRetryAt == nil {
+		t.Fatal("a retryable attempt has no next_retry_at (FR-1103)")
+	}
+	if second.ErrorClass != "http_terminal" || second.Outcome != "terminal" {
+		t.Fatalf("attempt 2 = %s/%s, want http_terminal/terminal", second.ErrorClass, second.Outcome)
+	}
+	if second.NextRetryAt != nil {
+		t.Fatalf("the last attempt reported a next retry at %v", *second.NextRetryAt)
+	}
+	if first.ResponseBody == nil || *first.ResponseBody == "" {
+		t.Fatal("attempt has no response body (FR-804/FR-1103)")
+	}
+	// A failed delivery's trail is its rows: nothing is synthesized.
+	if detail.EffectiveAttempt != nil {
+		t.Fatalf("a failed delivery reported a synthesized attempt: %+v", detail.EffectiveAttempt)
+	}
+
+	// FR-804/SB-4: the body is truncated, not stored whole.
+	big := strings.Repeat("x", 5000)
+	err := e.st.RecordAttempt(context.Background(), store.AttemptRecord{
+		DeliveryID: id, Attempt: 3, Outcome: "terminal", ErrorClass: "http_terminal",
+		ResponseStatus: ptr(404), ResponseBody: big, DurationMs: 3,
+	})
+	if err != nil {
+		t.Fatalf("record a large attempt: %v", err)
+	}
+	var stored int
+	if err := e.admin.QueryRow(context.Background(),
+		`select length(response_body) from attempts where delivery_id = $1 and attempt = 3`, id).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 2048 {
+		t.Fatalf("a 5000-byte body was stored as %d bytes, want 2048 (SB-4)", stored)
+	}
+
+	// A foreign id is a miss, whatever its shape (FR-108).
+	code, raw = e.do(http.MethodGet, "/v1/producer/deliveries/99999999?env=live", tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusNotFound)
+	code, raw = e.do(http.MethodGet, "/v1/producer/deliveries/not-a-number?env=live", tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusNotFound)
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// TestDeliveryViewReturnsTheHold is AC-53's view leg (FR-1102, FR-1103, FR-1304):
+// a delivery its endpoint's limits are holding back reads through the delivery view
+// - list and detail - with held_back_since and held_back_reason, a delivery that is
+// not held carries neither (the field exists and is null, so a client can rely on
+// it), and clearing the hold clears the view. The worker's half of AC-53 (the hold
+// it writes, and the attempt it does not run) is
+// TestAC53HoldOnTheEndpointConcurrencyCap in the delivery package.
+func TestDeliveryViewReturnsTheHold(t *testing.T) {
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+	id := e.deliver(t, fx)
+
+	detail := func() deliveryJSON {
+		t.Helper()
+		code, raw := e.do(http.MethodGet, fmt.Sprintf("/v1/producer/deliveries/%d?env=live", id), tn.OwnerToken, nil)
+		mustStatus(t, code, raw, http.StatusOK)
+		return decode[deliveryJSON](t, raw)
+	}
+
+	if d := detail(); d.HeldBackSince != nil || d.HeldBackReason != nil {
+		t.Fatalf("a delivery nothing has held back reports held_back_since=%v held_back_reason=%v, want both null",
+			d.HeldBackSince, d.HeldBackReason)
+	}
+
+	// The hold as the worker records it on the row. It is written here rather than
+	// driven through the limiter so this test is about the VIEW; the hold's own
+	// contract is the delivery package's.
+	heldAt := time.Now().Add(-30 * time.Second).UTC().Truncate(time.Second)
+	if _, err := e.admin.Exec(context.Background(),
+		`update deliveries set held_back_since = $2, held_back_reason = $3 where id = $1`,
+		id, heldAt, "endpoint_concurrency_cap"); err != nil {
+		t.Fatalf("record the hold: %v", err)
+	}
+
+	d := detail()
+	if d.HeldBackSince == nil || *d.HeldBackSince != heldAt.Format(time.RFC3339) {
+		t.Errorf("held_back_since = %v, want %s (FR-1304: since when the endpoint held it)",
+			d.HeldBackSince, heldAt.Format(time.RFC3339))
+	}
+	if d.HeldBackReason == nil || *d.HeldBackReason != "endpoint_concurrency_cap" {
+		t.Errorf("held_back_reason = %v, want endpoint_concurrency_cap (FR-1304: which limit held it)", d.HeldBackReason)
+	}
+
+	// FR-1102's list carries the same pair, so the producer sees the hold where it
+	// looks for deliveries rather than only on the detail page.
+	page := e.listDeliveries(t, tn.OwnerToken, "&status=pending")
+	var listed bool
+	for _, row := range page.Deliveries {
+		if row.ID != id {
+			continue
+		}
+		listed = true
+		if row.HeldBackSince == nil || row.HeldBackReason == nil {
+			t.Errorf("the list reports held_back_since=%v held_back_reason=%v for a held delivery, want both set (FR-1102)",
+				row.HeldBackSince, row.HeldBackReason)
+		}
+	}
+	if !listed {
+		t.Errorf("the held delivery %d is not in the pending list at all", id)
+	}
+
+	// Clearing the hold - what the worker does the moment an attempt starts - clears
+	// the view with it.
+	if err := e.st.ClearDeliveryHold(context.Background(), id); err != nil {
+		t.Fatalf("clear the hold: %v", err)
+	}
+	if d := detail(); d.HeldBackSince != nil || d.HeldBackReason != nil {
+		t.Errorf("after the hold was cleared the view still reports held_back_since=%v held_back_reason=%v (FR-1304)",
+			d.HeldBackSince, d.HeldBackReason)
+	}
+}
+
+// --- AC-32, FR-1109, FR-1110, FR-1111: the event view and the rollup ------
+
+// TestEventRollupStatuses is FR-1109: one event, its fan-out outcome and the
+// rollup, for every one of the five values.
+func TestEventRollupStatuses(t *testing.T) {
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+	// A second endpoint on this test's own consumer, so one event fans out to two
+	// deliveries and the rollup has something to be partially failed about.
+	second := e.newEndpoint(t, tn, fx.ConsumerID, refSlug(t.Name())+"-second", tn.EventTypeName)
+
+	// pending: accepted, fanned out, nothing attempted yet.
+	pendingEvent := e.publishFor(t, fx, fx.Ref)
+	e.fanOut(t, tn, pendingEvent)
+	if got := e.eventView(t, tn.OwnerToken, pendingEvent).Rollup; got != store.RollupPending {
+		t.Fatalf("a fanned-out event rolled up as %q, want %q", got, store.RollupPending)
+	}
+
+	// all_delivered: the state AC-32 opens.
+	okEvent := e.publishFor(t, fx, fx.Ref)
+	affected := e.fanOut(t, tn, okEvent)
+	for _, id := range affected {
+		e.completeDelivery(t, id, 1, time.Now().Add(-time.Second), time.Now())
+	}
+	okView := e.eventView(t, tn.OwnerToken, okEvent)
+	if okView.Rollup != store.RollupAllDelivered {
+		t.Fatalf("delivered event rolled up as %q, want %q", okView.Rollup, store.RollupAllDelivered)
+	}
+	if len(okView.Deliveries) != 2 {
+		t.Fatalf("the event view listed %d deliveries, want 2", len(okView.Deliveries))
+	}
+
+	// failed: fanned out, attempted, terminally failed.
+	failedEvent := e.publishFor(t, fx, fx.Ref)
+	for _, id := range e.fanOut(t, tn, failedEvent) {
+		e.failDelivery(t, id, 500, 1, time.Now().Add(-time.Second))
+	}
+	if got := e.eventView(t, tn.OwnerToken, failedEvent).Rollup; got != store.RollupFailed {
+		t.Fatalf("a wholly failed event rolled up as %q, want %q", got, store.RollupFailed)
+	}
+
+	// partially_failed: two endpoint deliveries, one delivered and one failed.
+	mixedEvent := e.publishFor(t, fx, fx.Ref)
+	mixed := e.fanOut(t, tn, mixedEvent)
+	if len(mixed) != 2 {
+		t.Fatalf("the mixed fixture fanned out to %d deliveries, want 2 (endpoints %s, %s)", len(mixed), fx.EndpointID, second)
+	}
+	e.completeDelivery(t, mixed[0], 1, time.Now().Add(-time.Second), time.Now())
+	e.failDelivery(t, mixed[1], 502, 1, time.Now().Add(-time.Second))
+	if got := e.eventView(t, tn.OwnerToken, mixedEvent).Rollup; got != store.RollupPartiallyFailed {
+		t.Fatalf("a half-delivered event rolled up as %q, want %q", got, store.RollupPartiallyFailed)
+	}
+
+	// unroutable: the consumer_ref matched no consumer (§7.5a, AC-23).
+	unroutableEvent := e.publishFor(t, fx, "ref-nobody-onboarded-this")
+	if reason := e.fanOutRaw(t, tn, unroutableEvent).EventReason; reason != store.ReasonUnroutableNotRegistered {
+		t.Fatalf("fan-out of an unregistered ref recorded %q, want %s", reason, store.ReasonUnroutableNotRegistered)
+	}
+	code, raw := e.do(http.MethodGet, "/v1/producer/events/"+unroutableEvent+"?env=live", tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusOK)
+	badView := decode[eventViewJSONBody](t, raw)
+	if badView.Rollup != store.RollupUnroutable {
+		t.Fatalf("an unroutable event rolled up as %q, want %q", badView.Rollup, store.RollupUnroutable)
+	}
+	if badView.Event.NonDeliveryReason == nil || *badView.Event.NonDeliveryReason != store.ReasonUnroutableNotRegistered {
+		t.Fatalf("the view reported reason %v, want %s", badView.Event.NonDeliveryReason, store.ReasonUnroutableNotRegistered)
+	}
+	if len(badView.Deliveries) != 0 {
+		t.Fatalf("an unroutable event listed %d deliveries, want 0", len(badView.Deliveries))
+	}
+
+	// A foreign event id is a miss (FR-108).
+	code, raw = e.do(http.MethodGet, "/v1/producer/events/evt_nope?env=live", tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusNotFound)
+}
+
+// TestDeliveredFirstAttemptHasNoEmptyTrail is AC-32: open a delivered event, get
+// the rollup, and every delivery shows a status, a timestamp and a duration even
+// though a successful first attempt leaves no attempt row (FR-811) - the API
+// never hands the UI a delivery whose trail is empty and unaccounted for
+// (FR-1110).
+func TestDeliveredFirstAttemptHasNoEmptyTrail(t *testing.T) {
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+
+	eventID := e.publishFor(t, fx, fx.Ref)
+	ids := e.fanOut(t, tn, eventID)
+	started := time.Now().Add(-1500 * time.Millisecond).UTC().Truncate(time.Microsecond)
+	done := time.Now().UTC().Truncate(time.Microsecond)
+	for _, id := range ids {
+		e.completeDelivery(t, id, 1, started, done)
+	}
+
+	view := e.eventView(t, tn.OwnerToken, eventID)
+	if view.Rollup != store.RollupAllDelivered {
+		t.Fatalf("rollup = %q, want %q", view.Rollup, store.RollupAllDelivered)
+	}
+	if len(view.Deliveries) == 0 {
+		t.Fatal("the delivered event listed no deliveries")
+	}
+	for _, d := range view.Deliveries {
+		if d.Status != "delivered" {
+			t.Fatalf("delivery %d is %q, want delivered", d.ID, d.Status)
+		}
+		// AC-28's shape, re-proved here because the trail depends on it.
+		if rows := e.countRows(t, `select count(*) from attempts where delivery_id = $1`, d.ID); rows != 0 {
+			t.Fatalf("a successful first attempt wrote %d attempt rows (FR-811/AC-28)", rows)
+		}
+		if len(d.AttemptsRows) != 0 {
+			t.Fatalf("delivery %d reported %d attempt rows, want none", d.ID, len(d.AttemptsRows))
+		}
+		// FR-1110: status, timestamp and duration, all present.
+		if d.FirstAttemptAt == nil || d.DeliveredAt == nil || d.DurationMs == nil {
+			t.Fatalf("delivery %d has no status/timestamp/duration: first=%v delivered=%v duration=%v",
+				d.ID, d.FirstAttemptAt, d.DeliveredAt, d.DurationMs)
+		}
+		if *d.DurationMs < 1000 {
+			t.Fatalf("delivery %d reported duration_ms=%d for a 1.5 s first attempt", d.ID, *d.DurationMs)
+		}
+		// The trail the UI renders is never empty: either the attempt rows, or
+		// the synthesized effective attempt that stands in for the success.
+		if len(d.AttemptsRows) == 0 && d.EffectiveAttempt == nil {
+			t.Fatalf("delivery %d would render an empty trail (FR-1110)", d.ID)
+		}
+		if d.EffectiveAttempt == nil {
+			t.Fatalf("delivery %d has no effective attempt to render", d.ID)
+		}
+		if !d.EffectiveAttempt.Synthesized || d.EffectiveAttempt.Status != "delivered" {
+			t.Fatalf("effective attempt = %+v, want a synthesized delivered one", d.EffectiveAttempt)
+		}
+		if d.EffectiveAttempt.DurationMs == nil || *d.EffectiveAttempt.DurationMs != *d.DurationMs {
+			t.Fatalf("effective attempt duration = %v, want %v", d.EffectiveAttempt.DurationMs, d.DurationMs)
+		}
+		if d.EffectiveAttempt.Attempt != 1 {
+			t.Fatalf("effective attempt number = %d, want 1", d.EffectiveAttempt.Attempt)
+		}
+	}
+
+	// The detail route says the same thing as the event view (FR-1102 + FR-1110).
+	code, raw := e.do(http.MethodGet, fmt.Sprintf("/v1/producer/deliveries/%d?env=live", ids[0]), tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusOK)
+	detail := decode[deliveryJSON](t, raw)
+	if len(detail.AttemptsRows) != 0 || detail.EffectiveAttempt == nil {
+		t.Fatalf("detail trail = %d rows / effective %v, want 0 rows and an effective attempt",
+			len(detail.AttemptsRows), detail.EffectiveAttempt)
+	}
+
+	// A skipped delivery is the other shape that has no attempt rows: a matched
+	// endpoint that could not take the event. Its trail is the reason, not an
+	// empty list.
+	pausedEvent := e.publishFor(t, fx, fx.Ref)
+	code, raw = e.do(http.MethodPatch, "/v1/producer/consumers/"+fx.ConsumerID+"/endpoints/"+fx.EndpointID+"?env=live",
+		tn.OwnerToken, map[string]bool{"paused": true})
+	mustStatus(t, code, raw, http.StatusOK)
+	if skipped := e.fanOutRaw(t, tn, pausedEvent).Skipped; len(skipped) != 1 {
+		t.Fatalf("fan-out against a paused endpoint skipped %d matches, want 1", len(skipped))
+	}
+	skippedView := e.eventView(t, tn.OwnerToken, pausedEvent)
+	if len(skippedView.Deliveries) != 1 || skippedView.Deliveries[0].Status != "skipped" {
+		t.Fatalf("paused-endpoint event view = %+v, want one skipped delivery", skippedView.Deliveries)
+	}
+	skipped := skippedView.Deliveries[0]
+	if skipped.EffectiveAttempt == nil || skipped.EffectiveAttempt.Outcome != store.ReasonEndpointPaused {
+		t.Fatalf("skipped delivery trail = %+v, want the endoint_paused reason", skipped.EffectiveAttempt)
+	}
+	if skippedView.Rollup != store.RollupFailed {
+		t.Fatalf("an event whose only endpoint was paused rolled up as %q, want %q", skippedView.Rollup, store.RollupFailed)
+	}
+}
+
+// --- AC-12, FR-1106, FR-1107, FR-1108: replay ----------------------------
+
+// TestReplayCreatesNewDeliveriesIdempotently is AC-12 with FR-1106 and FR-1108:
+// replaying twice with one request key produces one set of new deliveries, the
+// deliveries being repaired are never touched, and the trail says which
+// deliveries came from the replay.
+func TestReplayCreatesNewDeliveriesIdempotently(t *testing.T) {
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+
+	brokenA := e.deliver(t, fx)
+	e.failDelivery(t, brokenA, 500, 1, time.Now().Add(-time.Minute))
+	brokenB := e.deliver(t, fx)
+	e.failDelivery(t, brokenB, 503, 1, time.Now().Add(-time.Minute))
+	healthy := e.deliver(t, fx)
+	e.completeDelivery(t, healthy, 1, time.Now().Add(-time.Minute), time.Now().Add(-59*time.Second))
+
+	before := e.deliverySnapshot(t, brokenA, brokenB, healthy)
+	attemptsBefore := e.countRows(t, `select count(*) from attempts`)
+	requestsBefore := e.countRows(t, `select count(*) from replay_requests where producer_id = $1`, tn.ID)
+
+	// The filter is this test's own endpoint: the tenant is shared with its
+	// siblings, and a replay that selected their deliveries would be a bug this
+	// test could not see.
+	body := map[string]any{"status": "failed_terminal", "endpoint_id": fx.EndpointID, "idempotency_key": "ac12-request-key"}
+	code, raw := e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken, body)
+	mustStatus(t, code, raw, http.StatusOK)
+	first := decode[replayJSONBody](t, raw)
+
+	if first.Matched != 2 || first.Created != 2 || len(first.DeliveryIDs) != 2 {
+		t.Fatalf("first replay = %+v, want 2 matched and 2 created", first)
+	}
+	if first.Repeated {
+		t.Fatalf("the first replay of a key reported itself as a repeat: %+v", first)
+	}
+	if first.ReleasePerSecond != store.ReplayReleasePerSecond {
+		t.Fatalf("release rate = %d/s, want %d/s (FR-1107)", first.ReleasePerSecond, store.ReplayReleasePerSecond)
+	}
+
+	// FR-1106: the repaired deliveries are unchanged - status, timestamps,
+	// attempt count and attempt rows alike.
+	after := e.deliverySnapshot(t, brokenA, brokenB, healthy)
+	if !equalSnapshots(before, after) {
+		t.Fatalf("replay mutated the history it replays:\nbefore %+v\nafter  %+v", before, after)
+	}
+	if attempts := e.countRows(t, `select count(*) from attempts`); attempts != attemptsBefore {
+		t.Fatalf("replay wrote %d attempt rows", attempts-attemptsBefore)
+	}
+
+	// The new deliveries: pending, linked to the row they repair, same event and
+	// endpoint, no attempts yet, and released one 1/50 s slot apart per endpoint
+	// (FR-1107), counted from the instant the replay created them.
+	//
+	// The schedule is read from the two stamps the SERVER wrote on the row -
+	// created_at and lease_expires_at, both now() inside the replay's own
+	// transaction - and never against time.Now() in this loop. A wall clock here
+	// measures the box, not the schedule: the lease is stamped when the replay
+	// commits, and the snapshot and count queries above this loop cost seconds on
+	// a loaded box, so a correctly scheduled replay reads as "in the past"
+	// whatever fixed tolerance is picked (measured 2026-10-28: 2 FAIL / 4
+	// fresh-DB runs at load 26-40, every failure at this line with a lease the
+	// server had stamped at the replay instant, while CI on the same commit is
+	// green in 0.10 s). The selection is this test's own endpoint, so the ids
+	// below are one release sequence.
+	slot := time.Second / time.Duration(store.ReplayReleasePerSecond)
+	lastSlot := time.Duration(len(first.DeliveryIDs)-1) * slot
+	for _, id := range first.DeliveryIDs {
+		var status, eventID, endpointID string
+		var replayOf *int64
+		var attempts int
+		var lease, createdAt time.Time
+		err := e.admin.QueryRow(context.Background(), `
+			select status, event_id, endpoint_id, replay_of_delivery_id, attempts, lease_expires_at, created_at
+			from deliveries where id = $1`, id).Scan(&status, &eventID, &endpointID, &replayOf, &attempts, &lease, &createdAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status != "pending" || attempts != 0 {
+			t.Fatalf("replayed delivery %d = %s/%d attempts, want pending/0", id, status, attempts)
+		}
+		if replayOf == nil || (*replayOf != brokenA && *replayOf != brokenB) {
+			t.Fatalf("replayed delivery %d links to %v, want one of the two failed deliveries", id, replayOf)
+		}
+		if endpointID != fx.EndpointID {
+			t.Fatalf("replayed delivery %d went to endpoint %s, want %s", id, endpointID, fx.EndpointID)
+		}
+		if _, ok := e.eventFor(t, eventID); !ok {
+			t.Fatalf("replayed delivery %d lost its event %s", id, eventID)
+		}
+		// FR-1107: row k of an endpoint's selection is released (k-1)/50 s after
+		// the transaction's now(), so every replayed lease lies between its own
+		// created_at and created_at + one slot per row before it. A lease before
+		// created_at is a replay scheduled in the past - the defect this
+		// assertion exists for - and one past the last row's slot is a schedule
+		// FR-1107 does not state.
+		if offset := lease.Sub(createdAt); offset < 0 || offset > lastSlot {
+			t.Fatalf("replayed delivery %d is not scheduled: lease %v, created %v (%v apart), want 0 to %v apart (FR-1107's %d/s)",
+				id, lease, createdAt, offset, lastSlot, store.ReplayReleasePerSecond)
+		}
+	}
+	leaseGap := e.leaseGap(t, first.DeliveryIDs)
+	if leaseGap <= 0 || leaseGap > 500*time.Millisecond {
+		t.Fatalf("two replays to one endpoint were released %v apart, want the %d/s spacing",
+			leaseGap, store.ReplayReleasePerSecond)
+	}
+
+	// FR-1108: the trail distinguishes a replay in both directions.
+	code, raw = e.do(http.MethodGet, fmt.Sprintf("/v1/producer/deliveries/%d?env=live", brokenA), tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusOK)
+	original := decode[deliveryJSON](t, raw)
+	if original.ReplayOfDeliveryID != nil {
+		t.Fatalf("the repaired delivery %d claims to be a replay of %v", brokenA, original.ReplayOfDeliveryID)
+	}
+	if len(original.ReplayedBy) != 1 || !containsID(first.DeliveryIDs, original.ReplayedBy[0]) {
+		t.Fatalf("the repaired delivery reports replayed_by=%v, want the replay it produced", original.ReplayedBy)
+	}
+	replayedID := original.ReplayedBy[0]
+	code, raw = e.do(http.MethodGet, fmt.Sprintf("/v1/producer/deliveries/%d?env=live", replayedID), tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusOK)
+	replayed := decode[deliveryJSON](t, raw)
+	if replayed.ReplayOfDeliveryID == nil || *replayed.ReplayOfDeliveryID != brokenA {
+		t.Fatalf("the replay reports replay_of_delivery_id=%v, want %d", replayed.ReplayOfDeliveryID, brokenA)
+	}
+
+	// AC-12: the same key again is the same set, and creates nothing.
+	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken, body)
+	mustStatus(t, code, raw, http.StatusOK)
+	second := decode[replayJSONBody](t, raw)
+	if !second.Repeated || second.Created != 0 {
+		t.Fatalf("second replay = %+v, want a repeat that created nothing", second)
+	}
+	if !sameIDs(first.DeliveryIDs, second.DeliveryIDs) {
+		t.Fatalf("the repeat returned %v, want the first call's %v", second.DeliveryIDs, first.DeliveryIDs)
+	}
+	total := e.countRows(t, `select count(*) from deliveries where endpoint_id = $1 and replay_of_delivery_id is not null`, fx.EndpointID)
+	if total != 2 {
+		t.Fatalf("two replays with one request key created %d deliveries, want one set (AC-12)", total)
+	}
+
+	// The replays are now pending, so a *new* key replays the same two failures
+	// again - and does not select the rows it created.
+	body["idempotency_key"] = "ac12-second-key"
+	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken, body)
+	mustStatus(t, code, raw, http.StatusOK)
+	third := decode[replayJSONBody](t, raw)
+	if third.Matched != 2 || third.Created != 2 {
+		t.Fatalf("a second replay key matched/created %d/%d, want 2/2 (the pending replays are not selections)",
+			third.Matched, third.Created)
+	}
+	if sameIDs(first.DeliveryIDs, third.DeliveryIDs) {
+		t.Fatalf("a new request key returned the previous key's deliveries: %v", third.DeliveryIDs)
+	}
+
+	// A replay needs a request key: without one a retry would double the batch.
+	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
+		map[string]any{"status": "failed_terminal"})
+	mustStatus(t, code, raw, http.StatusBadRequest)
+	if got := errorCode(t, raw); got != "idempotency_key_required" {
+		t.Fatalf("error code = %q, want idempotency_key_required", got)
+	}
+
+	// A dry run answers the count and the bound without writing.
+	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
+		map[string]any{"status": "failed_terminal", "endpoint_id": fx.EndpointID, "idempotency_key": "ac12-dry-run", "dry_run": true})
+	mustStatus(t, code, raw, http.StatusOK)
+	dry := decode[replayJSONBody](t, raw)
+	if dry.Matched != 2 || dry.Created != 0 || !dry.DryRun {
+		t.Fatalf("dry run = %+v, want matched 2 and nothing created", dry)
+	}
+	if n := e.countRows(t, `select count(*) from replay_requests where producer_id = $1`, tn.ID); n != requestsBefore+2 {
+		t.Fatalf("recorded %d replay requests, want exactly the two real replays (a dry run must not burn a key)", n-requestsBefore)
+	}
+}
+
+// TestReplayBoundIsRejectedNamingTheBound is AC-13: a selection larger than
+// FR-1107's 1,000 is refused, the refusal names the bound, and nothing is
+// written - including the request record, so the key is not burned.
+func TestReplayBoundIsRejectedNamingTheBound(t *testing.T) {
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+
+	recent := time.Now().Add(-3 * time.Hour)
+	old := time.Now().Add(-10 * 24 * time.Hour)
+	e.bulkDeliveries(t, tn, fx.ConsumerID, fx.EndpointID, "evtbulkrecent", 1000, recent)
+	e.bulkDeliveries(t, tn, fx.ConsumerID, fx.EndpointID, "evtbulkold", 4000, old)
+	bound := `select count(*) from deliveries where endpoint_id = $1`
+	before := e.countRows(t, bound, fx.EndpointID)
+	requestsBefore := e.countRows(t, `select count(*) from replay_requests where producer_id = $1`, tn.ID)
+
+	// AC-13: 5,000 selected, refused, and the refusal says why.
+	code, raw := e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
+		map[string]any{"endpoint_id": fx.EndpointID, "idempotency_key": "ac13-over"})
+	mustStatus(t, code, raw, http.StatusUnprocessableEntity)
+	if got := errorCode(t, raw); got != "replay_bound_exceeded" {
+		t.Fatalf("error code = %q, want replay_bound_exceeded", got)
+	}
+	if !strings.Contains(string(raw), "1000") {
+		t.Fatalf("the refusal does not name the bound (AC-13): %s", raw)
+	}
+	if n := e.countRows(t, bound, fx.EndpointID); n != before {
+		t.Fatalf("a refused replay wrote %d deliveries", n-before)
+	}
+	if n := e.countRows(t, `select count(*) from replay_requests where producer_id = $1`, tn.ID); n != requestsBefore {
+		t.Fatalf("a refused replay recorded %d request keys, want 0", n-requestsBefore)
+	}
+
+	// The bound is inclusive: exactly 1,000 is one request's worth.
+	cutoff := time.Now().Add(-6 * time.Hour).UTC().Format(time.RFC3339)
+	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
+		map[string]any{"endpoint_id": fx.EndpointID, "from": cutoff, "idempotency_key": "ac13-at-the-bound"})
+	mustStatus(t, code, raw, http.StatusOK)
+	atBound := decode[replayJSONBody](t, raw)
+	if atBound.Matched != 1000 || atBound.Created != 1000 {
+		t.Fatalf("a 1000-delivery replay = %+v, want 1000 matched and created", atBound)
+	}
+	replayed := `select count(*) from deliveries where endpoint_id = $1 and replay_of_delivery_id is not null`
+	if n := e.countRows(t, replayed, fx.EndpointID); n != 1000 {
+		t.Fatalf("the at-bound replay created %d replayed deliveries, want 1000", n)
+	}
+
+	// And 1,001 is not: one more row in the window and the same request is out.
+	if _, err := e.admin.Exec(context.Background(), `
+		update deliveries set created_at = $2
+		where id = (select id from deliveries
+		            where endpoint_id = $1 and created_at < $2 and status = 'delivered'
+		              and replay_of_delivery_id is null
+		            order by id limit 1)`, fx.EndpointID, recent); err != nil {
+		t.Fatal(err)
+	}
+	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
+		map[string]any{"endpoint_id": fx.EndpointID, "from": cutoff, "idempotency_key": "ac13-over-by-one"})
+	mustStatus(t, code, raw, http.StatusUnprocessableEntity)
+	if !strings.Contains(string(raw), "1000") {
+		t.Fatalf("the refusal does not name the bound: %s", raw)
+	}
+
+	// A dry run applies the same bound, so a confirmation step cannot report a
+	// count it would then refuse.
+	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
+		map[string]any{"endpoint_id": fx.EndpointID, "idempotency_key": "ac13-dry-over", "dry_run": true})
+	mustStatus(t, code, raw, http.StatusUnprocessableEntity)
+}
+
+type deliveryRow struct {
+	Status      string
+	Attempts    int
+	DeliveredAt *time.Time
+	Reason      *string
+	ReplayOf    *int64
+}
+
+// deliverySnapshot reads the fields FR-1106 says a replay may not touch.
+func (e *env) deliverySnapshot(t *testing.T, ids ...int64) map[int64]deliveryRow {
+	t.Helper()
+	out := map[int64]deliveryRow{}
+	for _, id := range ids {
+		var row deliveryRow
+		err := e.admin.QueryRow(context.Background(), `
+			select status, attempts, delivered_at, non_delivery_reason, replay_of_delivery_id
+			from deliveries where id = $1`, id).Scan(&row.Status, &row.Attempts, &row.DeliveredAt, &row.Reason, &row.ReplayOf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[id] = row
+	}
+	return out
+}
+
+func equalSnapshots(a, b map[int64]deliveryRow) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for id, row := range a {
+		other, ok := b[id]
+		if !ok {
+			return false
+		}
+		if row.Status != other.Status || row.Attempts != other.Attempts {
+			return false
+		}
+		if !sameOptionalInt64(row.ReplayOf, other.ReplayOf) {
+			return false
+		}
+		if !sameOptionalString(row.Reason, other.Reason) {
+			return false
+		}
+		// Timestamps compare by value: two pointers to the same microsecond are
+		// different pointers.
+		if (row.DeliveredAt == nil) != (other.DeliveredAt == nil) {
+			return false
+		}
+		if row.DeliveredAt != nil && !row.DeliveredAt.Equal(*other.DeliveredAt) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameOptionalInt64(a, b *int64) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	return a == nil || *a == *b
+}
+
+func sameOptionalString(a, b *string) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	return a == nil || *a == *b
+}
+
+// expectDeliveryUntouched asserts a delivery is still the delivered row the
+// fixture created: FR-1106 says a replay never mutates the row it repairs.
+func (e *env) expectDeliveryUntouched(t *testing.T, id int64) {
+	t.Helper()
+	var status string
+	var replayOf *int64
+	var attempts int
+	err := e.admin.QueryRow(context.Background(),
+		`select status, replay_of_delivery_id, attempts from deliveries where id = $1`, id).
+		Scan(&status, &replayOf, &attempts)
+	if err != nil {
+		t.Fatalf("read delivery %d: %v", id, err)
+	}
+	if status != "delivered" || replayOf != nil || attempts != 1 {
+		t.Fatalf("delivery %d = %s / attempts %d / replay_of %v, want the untouched delivered row",
+			id, status, attempts, replayOf)
+	}
+}
+
+// eventFor reports whether an event id exists, so a replayed delivery is proven
+// to keep the event it replays.
+func (e *env) eventFor(t *testing.T, eventID string) (string, bool) {
+	t.Helper()
+	var typ string
+	err := e.admin.QueryRow(context.Background(), `select event_type from events where id = $1`, eventID).Scan(&typ)
+	if err != nil {
+		return "", false
+	}
+	return typ, true
+}
+
+// leaseGap is how far apart two replayed deliveries to one endpoint are
+// scheduled: FR-1107's 50/s, made observable.
+func (e *env) leaseGap(t *testing.T, ids []int64) time.Duration {
+	t.Helper()
+	if len(ids) < 2 {
+		return 0
+	}
+	leases := make([]time.Time, 0, len(ids))
+	for _, id := range ids {
+		var lease time.Time
+		if err := e.admin.QueryRow(context.Background(),
+			`select lease_expires_at from deliveries where id = $1`, id).Scan(&lease); err != nil {
+			t.Fatal(err)
+		}
+		leases = append(leases, lease)
+	}
+	first, last := leases[0], leases[0]
+	for _, l := range leases[1:] {
+		if l.Before(first) {
+			first = l
+		}
+		if l.After(last) {
+			last = l
+		}
+	}
+	return last.Sub(first)
+}
+
+func containsID(ids []int64, want int64) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sameIDs(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// --- FR-1105: a consumer user sees only its own consumer -----------------
+
+// seedCrossProducerDelivery gives a tenant one delivered delivery, on a
+// consumer-routed event type of its own, so the cross-producer suite's S7 cases
+// (FR-1101..FR-1111) have a real delivery id and a real event id in each tenant
+// to aim at the other.
+//
+// It is separate from seedCrossProducerEventType because that type is
+// broadcast-routed (the ingest cases publish to it without a consumer), and a
+// broadcast event has no fan-out target, so it produces no deliveries at all.
+func seedCrossProducerDelivery(t *testing.T, e *env, tn *tenant) {
+	t.Helper()
+	tn.DeliveryID, tn.DeliveryEventID = 0, ""
+	// A type of its own: the tenant's EventTypeName stays the broadcast type the
+	// ingest cases publish to (a broadcast event has no fan-out target at all).
+	tn.DeliveryEventTypeName = strings.ReplaceAll(tn.Slug, "-", "") + ".delivery"
+	code, raw := e.do(http.MethodPost, "/v1/event-types", tn.KeyPlain, map[string]any{
+		"name":           tn.DeliveryEventTypeName,
+		"routing_mode":   "consumer",
+		"payload_schema": map[string]any{"type": "object"},
+	})
+	mustStatus(t, code, raw, http.StatusCreated)
+	e.verifyEndpointFor(t, tn, tn.ConsumerID, tn.EndpointID, tn.EndpointVerifyToken, tn.DeliveryEventTypeName)
+	eventID := e.publishTypedEvent(t, tn, tn.DeliveryEventTypeName, tn.ConsumerRef)
+	ids := e.fanOut(t, tn, eventID)
+	if len(ids) != 1 {
+		t.Fatalf("the cross-producer fixture fanned out to %d deliveries, want 1", len(ids))
+	}
+	e.completeDelivery(t, ids[0], 1, time.Now().Add(-time.Second), time.Now())
+	tn.DeliveryID, tn.DeliveryEventID = ids[0], eventID
+	e.remember(t, tn)
+}
+
+// TestConsumerSeesOnlyItsOwnDeliveries is FR-1105 (and AC-39's shape): the
+// consumer-scoped list, detail and replay are forced to the session's consumer,
+// and another consumer's delivery is a 404, never a 403.
+//
+// The session here belongs to the shared tenant's own seeded consumer - the only
+// consumer in this file with a password behind it - and the sibling is this
+// test's cheap fixture consumer. That is the isolation worth proving: same
+// producer, same environment, two consumers.
+func TestConsumerSeesOnlyItsOwnDeliveries(t *testing.T) {
+	e, fx := setupS7(t)
+	mine := fx.Tenant
+	siblingConsumer, siblingRef := fx.ConsumerID, fx.Ref
+
+	// The session's consumer gets exactly one delivery, fanned out to its own
+	// endpoint.
+	mineDelivery := e.fanOut(t, mine, e.publishTypedEvent(t, mine, mine.EventTypeName, mine.ConsumerRef))
+	if len(mineDelivery) != 1 {
+		t.Fatalf("the session consumer's event fanned out to %d deliveries, want 1", len(mineDelivery))
+	}
+
+	// The sibling consumer's delivery is the thing the session must not see.
+	siblingIDs := e.deliverFor(t, fx)
+	if len(siblingIDs) != 1 {
+		t.Fatalf("the sibling consumer's event fanned out to %d deliveries, want 1", len(siblingIDs))
+	}
+
+	log := e.doListAsConsumer(t, mine.ConsumerToken)
+	if len(log) != 1 || log[0].ID != mineDelivery[0] {
+		t.Fatalf("the consumer's log returned %+v, want just its own delivery %d", log, mineDelivery[0])
+	}
+	for _, d := range log {
+		if d.ConsumerID != mine.ConsumerID {
+			t.Fatalf("the consumer's log contains consumer %s's delivery %d", d.ConsumerID, d.ID)
+		}
+	}
+
+	// A sibling consumer's delivery is a 404 through the detail route.
+	code, raw := e.do(http.MethodGet, fmt.Sprintf("/v1/consumer/deliveries/%d", siblingIDs[0]), mine.ConsumerToken, nil)
+	mustStatus(t, code, raw, http.StatusNotFound)
+	if got := errorCode(t, raw); got != "not_found" {
+		t.Fatalf("error code = %q, want not_found (never forbidden)", got)
+	}
+
+	// And replaying with a sibling consumer's id in the body is not honoured:
+	// the claim decides, so the selection is the caller's own.
+	e.failDelivery(t, siblingIDs[0], 500, 1, time.Now().Add(-time.Minute))
+	code, raw = e.do(http.MethodPost, "/v1/consumer/deliveries/replay", mine.ConsumerToken,
+		map[string]any{"consumer_id": siblingConsumer, "status": "failed_terminal", "idempotency_key": "s7-consumer-replay"})
+	mustStatus(t, code, raw, http.StatusOK)
+	result := decode[replayJSONBody](t, raw)
+	if result.Matched != 0 || result.Created != 0 {
+		t.Fatalf("a consumer replay with a sibling's consumer_id in the body = %+v, want an empty selection", result)
+	}
+	// Scoped to the two deliveries in question: the harness shares one database
+	// across the package's tests, so a global count would see other tests' rows.
+	if n := e.countRows(t,
+		`select count(*) from deliveries where replay_of_delivery_id = any($1)`, []int64{siblingIDs[0], mineDelivery[0]}); n != 0 {
+		t.Fatalf("the refused consumer replay created %d deliveries", n)
+	}
+	if siblingRef == mine.ConsumerRef {
+		t.Fatal("the sibling fixture reused the session consumer's ref")
+	}
+
+	// Its own consumer's deliveries are replayable from the portal (UI-16),
+	// which is the API's own bound and rate, not a portal-invented one.
+	if _, err := e.admin.Exec(context.Background(),
+		// `failed_terminal`, not `failed`: I-4's vocabulary, enforced by 0013's check.
+		`update deliveries set status = 'failed_terminal' where consumer_id = $1 and status = 'pending'`, mine.ConsumerID); err != nil {
+		t.Fatal(err)
+	}
+	code, raw = e.do(http.MethodPost, "/v1/consumer/deliveries/replay", mine.ConsumerToken,
+		map[string]any{"status": "failed_terminal", "idempotency_key": "s7-consumer-replay-own"})
+	mustStatus(t, code, raw, http.StatusOK)
+	own := decode[replayJSONBody](t, raw)
+	if own.Matched != 1 || own.Created != 1 {
+		t.Fatalf("the consumer's own replay = %+v, want its own 1 failed delivery", own)
+	}
+	if own.DeliveryIDs[0] == siblingIDs[0] {
+		t.Fatal("the consumer's replay reached the sibling consumer's delivery")
+	}
+	if own.ReleasePerSecond != store.ReplayReleasePerSecond {
+		t.Fatalf("the consumer replay used %d/s, want the API's %d/s (UI-16)",
+			own.ReleasePerSecond, store.ReplayReleasePerSecond)
+	}
+}
+
+// --- FR-903: the dedupe answer -------------------------------------------
+
+// TestDedupeAnswerWasThisADuplicate is FR-903: the support question is
+// answerable for the last 30 days from Postgres, and it counts a replay as a
+// duplicate delivery of the same pair.
+func TestDedupeAnswerWasThisADuplicate(t *testing.T) {
+	e, fx := setupS7(t)
+	tn := fx.Tenant
+
+	eventID := e.publishFor(t, fx, fx.Ref)
+	deliveryID := e.fanOut(t, tn, eventID)[0]
+	e.completeDelivery(t, deliveryID, 1, time.Now().Add(-time.Second), time.Now())
+
+	ask := func(token, endpointID, event string) (int, []byte) {
+		return e.do(http.MethodGet,
+			"/v1/producer/deliveries/dedupe?env=live&endpoint_id="+endpointID+"&event_id="+event, token, nil)
+	}
+
+	code, raw := ask(tn.OwnerToken, fx.EndpointID, eventID)
+	mustStatus(t, code, raw, http.StatusOK)
+	answer := decode[dedupeJSONBody](t, raw)
+	if !answer.Duplicate || answer.FirstDeliveryID != deliveryID || answer.FirstSeenAt == nil || answer.Deliveries != 1 {
+		t.Fatalf("the first answer = %+v, want a duplicate of delivery %d", answer, deliveryID)
+	}
+
+	// A replay of the same pair is a second delivery of the same pair, and the
+	// answer says so rather than counting the pair once.
+	code, raw = e.do(http.MethodPost, "/v1/producer/deliveries/replay?env=live", tn.OwnerToken,
+		map[string]any{"endpoint_id": fx.EndpointID, "idempotency_key": "s7-dedupe-replay"})
+	mustStatus(t, code, raw, http.StatusOK)
+	code, raw = ask(tn.OwnerToken, fx.EndpointID, eventID)
+	mustStatus(t, code, raw, http.StatusOK)
+	after := decode[dedupeJSONBody](t, raw)
+	if after.Deliveries != 2 || after.FirstDeliveryID != deliveryID {
+		t.Fatalf("after a replay the answer = %+v, want 2 deliveries and the same first one", after)
+	}
+
+	// An event this endpoint never received is not a duplicate - and is not an
+	// error, because "no" is a support answer.
+	code, raw = ask(tn.OwnerToken, fx.EndpointID, "evt_never_delivered")
+	mustStatus(t, code, raw, http.StatusOK)
+	if never := decode[dedupeJSONBody](t, raw); never.Duplicate || never.Deliveries != 0 {
+		t.Fatalf("an undelivered event answered %+v, want duplicate false", never)
+	}
+
+	// An endpoint outside this tenant's scope does not exist here (FR-108); the
+	// fully cross-tenant case - tenant A's owner asking about tenant B's endpoint,
+	// which the suite's shared DB makes reachable - is covered by the
+	// cross-producer table (TestCrossProducerRequestsAreNotFound).
+	code, raw = ask(tn.OwnerToken, "ep_another_tenants_endpoint", eventID)
+	mustStatus(t, code, raw, http.StatusNotFound)
+
+	// The key is a pair: without it the question is not answerable.
+	code, raw = e.do(http.MethodGet, "/v1/producer/deliveries/dedupe?env=live&endpoint_id="+fx.EndpointID, tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusBadRequest)
+	if got := errorCode(t, raw); got != "dedupe_key_required" {
+		t.Fatalf("error code = %q, want dedupe_key_required", got)
+	}
+}

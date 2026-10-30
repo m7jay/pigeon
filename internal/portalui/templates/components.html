@@ -1,0 +1,59 @@
+{{/* Shared, reusable components. Each is called with its own data argument, e.g.
+     {{template "table" .}} or {{template "badge" "delivered"}}. The base layout
+     calls "nav", "userbox" and "flash" with the whole Page. Portals override
+     "nav" (and may override "userbox") by defining them again in their own
+     templates. */}}
+
+{{define "nav"}}{{/* default empty; a portal overrides this with its nav */}}{{end}}
+
+{{define "userbox"}}
+<div class="userbox">
+  {{if .Email}}<span class="user-email">{{.Email}}</span>
+  <form method="post" action="/logout" class="inline">
+    {{template "csrf_field" .}}
+    <button class="link-btn" type="submit">Log out</button>
+  </form>
+  {{else}}
+  <a class="link-btn" href="/login">Log in</a>
+  {{end}}
+</div>
+{{end}}
+
+{{define "flash"}}
+<div class="flash flash-{{if .FlashKind}}{{.FlashKind}}{{else}}info{{end}}" role="status">
+  {{.Flash}}
+</div>
+{{end}}
+
+{{define "table"}}
+{{if .Rows}}
+<table class="data-table">
+  <thead><tr>{{range .Columns}}<th>{{.}}</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Rows}}<tr>{{range .}}<td>{{.}}</td>{{end}}</tr>{{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">{{if .Empty}}{{.Empty}}{{else}}Nothing here yet.{{end}}</p>
+{{end}}
+{{end}}
+
+{{define "badge"}}
+<span class="badge badge-{{.}}">{{.}}</span>
+{{end}}
+
+{{define "empty"}}
+<p class="empty">{{.Message}}</p>
+{{end}}
+
+{{define "busy"}}
+<span class="htmx-indicator" hx-indicator>processing…</span>
+{{end}}
+
+{{define "csrf_field"}}{{/* FR-1009 (AC-50): the hidden token every form must carry. It is
+     rendered by the server from the token the portal's CSRF middleware minted for
+     this request and bound to the session cookie, so a form cannot be forged from
+     another origin - and a same-origin sibling origin, or Chrome's Lax+POST window
+     on a freshly set cookie, cannot forge one either. Called with the page or the
+     fragment view, both of which carry CSRFToken. */}}
+<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">{{end}}

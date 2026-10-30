@@ -1,0 +1,71 @@
+{{define "content"}}
+<h1>{{.Data.Endpoint.Name}}</h1>
+<p class="page-sub">Environment <strong>{{.Data.Env}}</strong>{{if .Data.Consumer.Name}} - <a href="/consumers/{{.Data.Endpoint.ConsumerID}}">back to {{.Data.Consumer.Name}}</a>{{end}}</p>
+
+{{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+
+{{if .Data.Endpoint.VerificationToken}}
+<div class="notice">
+  <strong>Verification token.</strong> This is shown once, when the endpoint was created, and the API never returns it again. Answer the challenge below with it (FR-403).
+  <pre class="snippet">{{.Data.Endpoint.VerificationToken}}</pre>
+</div>
+{{end}}
+
+<div class="card">
+  <dl class="kv">
+    <dt>ID</dt><dd class="mono">{{.Data.Endpoint.ID}}</dd>
+    <dt>URL</dt><dd class="mono">{{.Data.Endpoint.URL}}</dd>
+    <dt>Status</dt><dd>{{template "badge" .Data.Endpoint.Status}}</dd>
+    <dt>Verified</dt><dd>{{if .Data.Endpoint.Verified}}{{template "badge" "active"}} ownership answered{{else}}{{template "badge" "unverified"}} waiting for the challenge{{end}}</dd>
+    <dt>Notification email</dt><dd>{{if .Data.Endpoint.NotificationEmail}}{{.Data.Endpoint.NotificationEmail}}{{else}}<span class="muted">not set</span>{{end}}</dd>
+    <dt>Failure streak</dt><dd>{{.Data.Endpoint.FailureStreak}}</dd>
+    <dt>Last status</dt><dd class="mono">{{if .Data.Endpoint.LastStatus}}{{.Data.Endpoint.LastStatus}}{{else}}<span class="muted">no delivery yet</span>{{end}}</dd>
+    <dt>Last delivery</dt><dd class="muted">{{if .Data.Endpoint.LastDeliveryAt}}{{.Data.Endpoint.LastDeliveryAt}}{{else}}never{{end}}</dd>
+  </dl>
+</div>
+
+{{if not .Data.Endpoint.Verified}}
+<div class="card">
+  <h2>Answer the ownership challenge</h2>
+  <p class="page-sub">Paste the verification token that was shown when this endpoint was created. Until it is answered the endpoint receives no live events (FR-403).</p>
+  <form method="post" action="/endpoints/{{.Data.Endpoint.ID}}/verify" class="inline">
+    {{template "csrf_field" .}}
+    <input type="text" name="token" required placeholder="vrf_..." class="mono">
+    <button class="btn btn-sm" type="submit">Verify endpoint</button>
+  </form>
+</div>
+{{end}}
+
+<div class="card">
+  <h2>Deliveries to this endpoint</h2>
+  <p class="page-sub">Pausing skips delivery to this endpoint without deleting anything: its history stays, and resuming picks it up again.</p>
+  <div class="row-actions">
+    <form method="post" action="/endpoints/{{.Data.Endpoint.ID}}/pause">
+      {{template "csrf_field" .}}
+      <button class="btn btn-sm btn-secondary" type="submit">Pause</button>
+    </form>
+    <form method="post" action="/endpoints/{{.Data.Endpoint.ID}}/resume">
+      {{template "csrf_field" .}}
+      <button class="btn btn-sm btn-secondary" type="submit">Resume</button>
+    </form>
+    <a class="btn btn-sm btn-secondary" href="/deliveries?endpoint_id={{.Data.Endpoint.ID}}">This endpoint's delivery log</a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Signing secret</h2>
+  {{if .Data.Endpoint.RotatedSecret}}
+  <p class="page-sub">This is the new signing secret, shown once. Copy it into your verifier now - the API never returns it again.</p>
+  <pre class="snippet">{{.Data.Endpoint.RotatedSecret}}</pre>
+  {{if .Data.Endpoint.RotatedHint}}<p class="page-sub muted">Hint: {{.Data.Endpoint.RotatedHint}}</p>{{end}}
+  <p class="page-sub">The <strong>old</strong> secret keeps verifying deliveries until <strong>{{if .Data.Endpoint.RotatedUntil}}{{.Data.Endpoint.RotatedUntil}}{{else}}the end of the overlap window{{end}}</strong>{{if .Data.Endpoint.RotatedOverlap}} - the API reported a {{.Data.Endpoint.RotatedOverlap}} overlap{{end}}. That window is the overlap (FR-1004): until it closes, a delivery may be signed with either the old or the new secret, so update your verifier before it ends and accept both signatures while it is open.</p>
+  <p><a class="btn btn-sm btn-secondary" href="/snippet?endpoint={{.Data.Endpoint.ID}}">Build a verification snippet for this secret</a></p>
+  {{else}}
+  <p class="page-sub">Every endpoint signs with its own secret (FR-404). Rotating mints a new one and leaves the old one verifying until the overlap window closes (UI-6), so you can deploy the new secret without dropping deliveries.</p>
+  {{end}}
+  <form method="post" action="/endpoints/{{.Data.Endpoint.ID}}/rotate" onsubmit="return confirm('Rotate the signing secret? Your verifier must be updated with the new secret before the overlap window closes.')">
+    {{template "csrf_field" .}}
+    <button class="btn btn-sm btn-secondary" type="submit">Rotate the signing secret</button>
+  </form>
+</div>
+{{end}}

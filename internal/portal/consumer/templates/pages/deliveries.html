@@ -1,0 +1,73 @@
+{{define "content"}}
+<h1>Delivery log</h1>
+<p class="page-sub">Every delivery of your own consumer, newest first, each with its full attempt trail and response bodies (UI-15). Replay is bounded by the API's own limits (UI-16).</p>
+
+{{if .Data.Error}}
+<div class="notice">The API refused that request: {{.Data.Error}}</div>
+{{end}}
+
+<div class="card">
+  <h2>Filter</h2>
+  <p class="page-sub">These are the API's own delivery filters (FR-1101). The portal forwards the ones your request carries, unchanged, and shows the API's answer - including a filter or a page size the API refuses.</p>
+  {{/* A GET form: the filter set is a URL, so a filtered log is linkable and the
+       browser's back button works. The cursor is deliberately not carried here,
+       so changing a filter starts at the newest page; the endpoint choices come
+       from the caller's own endpoints, so the control cannot offer an id the API
+       would answer nothing for. */}}
+  <form method="get" action="/deliveries">
+    <div class="form-row">
+      <label for="endpoint_id">Endpoint</label>
+      <select id="endpoint_id" name="endpoint_id">
+        <option value="">All endpoints</option>
+        {{range .Data.Endpoints}}<option value="{{.ID}}"{{if eqs .ID $.Data.Filter.EndpointID}} selected{{end}}>{{.Name}}</option>{{end}}
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="status">Status</label>
+      <select id="status" name="status">
+        <option value="">Any status</option>
+        {{range .Data.Statuses}}<option value="{{.}}"{{if eqs . $.Data.Filter.Status}} selected{{end}}>{{.}}</option>{{end}}
+      </select>
+    </div>
+    {{if .Data.Filter.EventType}}<input type="hidden" name="event_type" value="{{.Data.Filter.EventType}}">{{end}}
+    {{if .Data.Filter.From}}<input type="hidden" name="from" value="{{.Data.Filter.From}}">{{end}}
+    {{if .Data.Filter.To}}<input type="hidden" name="to" value="{{.Data.Filter.To}}">{{end}}
+    <button class="btn btn-sm" type="submit">Apply filters</button>
+    <a class="btn btn-sm btn-secondary" href="/deliveries">Clear</a>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Deliveries</h2>
+  {{if .Data.Error}}
+  <p class="empty">The log could not be read with those filters (see the API's reason above).</p>
+  {{else if .Data.Deliveries}}
+  <table class="data-table">
+    <thead><tr><th>ID</th><th>Event type</th><th>Endpoint</th><th>Status</th><th>Attempts</th><th>First attempt</th><th>Delivered</th><th>Duration</th><th></th></tr></thead>
+    <tbody>
+    {{range .Data.Deliveries}}
+      <tr>
+        <td class="mono">{{.ID}}{{if .ReplayOf}} <span class="muted">replay of {{.ReplayOf}}</span>{{end}}</td>
+        <td class="mono">{{.EventType}}</td>
+        <td class="mono">{{.EndpointID}}</td>
+        <td>{{template "badge" .Status}}</td>
+        <td>{{.Attempts}}</td>
+        <td class="muted">{{.FirstAttemptAt}}</td>
+        <td class="muted">{{.DeliveredAt}}</td>
+        <td class="muted">{{.Duration}}</td>
+        <td class="row-actions"><a class="btn btn-sm btn-secondary" href="/deliveries/{{.ID}}">Attempts and bodies</a></td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{if .Data.NextPageURL}}<p><a class="btn btn-sm btn-secondary" href="{{.Data.NextPageURL}}">Next page</a>{{if .Data.Filter.Cursor}} <a class="btn btn-sm btn-secondary" href="{{.Data.FilterURL}}">Back to the newest</a>{{end}}</p>{{end}}
+  {{else}}
+  <p class="empty">No deliveries match this filter yet.</p>
+  {{end}}
+</div>
+
+<div class="card">
+  <h2>Replay</h2>
+  {{template "frag:replay/panel" .Data.Replay}}
+</div>
+{{end}}

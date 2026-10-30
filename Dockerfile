@@ -14,6 +14,18 @@ ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags "-s -w -X main.version=${VERSION}" \
       -o /out/pigeon ./cmd/pigeon
+# The consumer portal is a second deployable shipped in the same image (§14,
+# AC-40): a stateless proxy with no database, started by overriding the
+# entrypoint.
+RUN CGO_ENABLED=0 go build -trimpath \
+      -ldflags "-s -w -X main.version=${VERSION}" \
+      -o /out/consumer-portal ./cmd/consumer-portal
+# The producer portal is the third deployable in the same image (§14, AC-40):
+# like the consumer portal, a stateless proxy with no database, started by
+# overriding the entrypoint.
+RUN CGO_ENABLED=0 go build -trimpath \
+      -ldflags "-s -w -X main.version=${VERSION}" \
+      -o /out/producer-portal ./cmd/producer-portal
 
 FROM alpine:3.20 AS certs
 RUN apk add --no-cache ca-certificates
@@ -21,9 +33,15 @@ RUN apk add --no-cache ca-certificates
 FROM scratch
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/pigeon /pigeon
+COPY --from=build /out/consumer-portal /consumer-portal
+COPY --from=build /out/producer-portal /producer-portal
 
-# Non-root, no shell, no package manager: the delivery worker is an outbound-only
-# process and has no reason to own anything in the image.
+# Non-root, no shell, no package manager: every binary is an outbound-only static
+# Go process with no reason to own anything in the image.
 USER 65532:65532
-EXPOSE 8080
+EXPOSE 8080 8082 8083
+# The default entrypoint is the core; the portals are reached by overriding it
+# (`entrypoint: ["/consumer-portal"]`, `["/producer-portal"]` in compose.yaml).
+# Not `command:` - that appends arguments to this entrypoint instead of replacing
+# it, so the container would run `/pigeon /consumer-portal`.
 ENTRYPOINT ["/pigeon"]

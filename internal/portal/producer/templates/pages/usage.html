@@ -1,0 +1,49 @@
+{{define "content"}}
+<h1>Disk and retention</h1>
+
+{{if not .Data.Available}}
+{{/* SB-6: an unreadable disk is not an empty disk. This branch deliberately shows
+     no gauge, no percentage and no totals - only the refusal and why it is
+     rendered rather than a number. */}}
+<div class="notice">
+  <strong>The portal cannot tell how full the disk is.</strong>
+  <p>The API did not hand back a pressure reading, so there is no figure here that would be true. That is why this page shows no gauge rather than a gauge at 0%: a reading that could not be taken is not a reading of zero, and a calm empty panel is exactly how an operator misses a disk that has filled up.</p>
+  {{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+</div>
+{{else}}
+<div class="card">
+  <h2>Disk</h2>
+  <dl class="kv">
+    <dt>Used</dt><dd>{{.Data.Usage.Disk.UsedBytes}} bytes</dd>
+    <dt>Total</dt><dd>{{.Data.Usage.Disk.TotalBytes}} bytes</dd>
+    <dt>Used (percent)</dt><dd>{{.Data.Usage.Disk.UsedPct}}%</dd>
+    <dt>Budget</dt><dd>{{.Data.Usage.MaxDiskPct}}% of the volume</dd>
+    <dt>Against the budget</dt><dd>{{if .Data.Usage.OverBudget}}{{template "badge" "warning"}} over budget - publishes are shed with a 429 rather than accepted and dropped (SB-7){{else}}{{template "badge" "active"}} inside the budget{{end}}</dd>
+    <dt>Reading source</dt><dd class="mono">{{if .Data.Usage.Disk.Source}}{{.Data.Usage.Disk.Source}}{{else}}<span class="muted">not reported</span>{{end}}</dd>
+    <dt>Checked</dt><dd class="muted">{{if .Data.Usage.CheckedAt}}{{.Data.Usage.CheckedAt}}{{else}}<span class="muted">not reported</span>{{end}}</dd>
+  </dl>
+  {{if .Data.Usage.ReadError}}<p class="flash flash-error">The figure above is the last good reading: {{.Data.Usage.ReadError}}</p>{{end}}
+</div>
+
+<div class="card">
+  <h2>Retention</h2>
+  <p class="page-sub">How long each kind of history is kept before partitions are dropped.</p>
+  {{if .Data.Usage.RetentionDays}}
+  <table class="data-table">
+    <thead><tr><th>Retention window</th><th>Days</th></tr></thead>
+    <tbody>
+    {{range $window, $days := .Data.Usage.RetentionDays}}<tr><td class="mono">{{$window}}</td><td>{{$days}}</td></tr>{{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">The API reported no retention windows.</p>
+  {{end}}
+  <dl class="kv">
+    <dt>Partitions dropped</dt><dd>{{.Data.Usage.DroppedPartitions}}</dd>
+    <dt>Dedupe archive</dt><dd>{{.Data.Usage.DedupeArchiveBytes}} bytes</dd>
+  </dl>
+  {{if .Data.Usage.Note}}<p class="page-sub muted">{{.Data.Usage.Note}}</p>{{end}}
+</div>
+{{end}}
+<p class="page-sub">Environment: <strong>{{.Data.Env}}</strong>.</p>
+{{end}}

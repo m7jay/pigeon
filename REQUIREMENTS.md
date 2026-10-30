@@ -134,7 +134,7 @@ Install is one `docker compose up` that brings up all five. No cloud account, no
                  relay (SKIP LOCKED, LISTEN/NOTIFY + 1 s poll)      │
                                  ▼               └────────────────┘
                           ┌──────────────┐              ▲
-                          │ Redis Streams│              │ scoped tokens
+                          │ Redis Streams│              │ session token
                           │ events       │              │ (same API)
                           │ deliveries:* │──────────────┘
                           │ dlq · limits │
@@ -275,7 +275,7 @@ erDiagram
 
 - **I-1** Every entity except `producer` carries `producer_id`, and no query path exists that does not filter on it.
 - **I-2** A `delivery` row is created before the first attempt and is not removed before its retention window. It is the durable record that this event was owed to this endpoint.
-- **I-3** `(event_id, endpoint_id)` is unique, so fan-out and replay are idempotent by construction.
+- **I-3** `(event_id, endpoint_id)` is unique for **first fan-out**, so fan-out is idempotent by construction. A replay is deliberately a second delivery for the same pair, linked by `replay_of_delivery_id` and made idempotent by its own request key (FR-1106, FR-1107); the uniqueness is a partial index over rows where `replay_of_delivery_id IS NULL`.
 - **I-4** A delivery is terminal only in `delivered`, `failed_terminal`, `cancelled`. Everything else is in flight and MUST be visible as in-flight.
 - **I-5** Event type names are unique per producer, not globally.
 - **I-6** A delivery's lease is the only authority on whether it is being worked on. Status is never inferred from the attempt log.
@@ -290,20 +290,24 @@ erDiagram
 |---|---|---|---|
 | Accepted event (`202` returned) | Postgres `events` + `outbox`, one transaction | none | — |
 | Publish intent | Postgres `outbox` | none | — |
-| Delivery record at fan-out | Postgres, batched insert | ≤ 200 ms; rebuildable by re-fan-out | none — unique `(event_id, endpoint_id)` makes re-fan-out idempotent |
-| Attempt record + response body | Redis list → Postgres batches | **0 on worker crash**; ≤ 1 s if Redis itself dies uncleanly | evidence gap only; the delivery is still driven by its lease |
-| Terminal delivery state | same batch | ≤ 200 ms | delivery re-attempted → duplicate, deduped by the consumer on `event_id` |
+| Delivery record at fan-out | Postgres, batched insert | ≤ 200 ms; rebuildable by re-fan-out | none — the partial `(event_id, endpoint_id)` unique index over first fan-out makes re-fan-out idempotent (I-3) |
+| Attempt record + response body | Redis Stream with a consumer group → Postgres batches, acknowledged only after the commit and retired in the same transaction | **0 on worker crash**; ≤ 1 s if Redis itself dies uncleanly | evidence gap only; the delivery is still driven by its lease, and the attempt counter by control state (D-2) |
+| Terminal delivery state | Postgres, control batch (`synchronous_commit=on`) | none | — |
+| Dedupe key `(endpoint, event_id)`, first 14 d | the `deliveries` row itself | none while the partition exists; under SB-3 disk pressure a partition dropped before its copy ran loses every key it held, logged at warn (FR-903) | a support answer is missing; never a delivery |
+| Dedupe key, 14 to 30 d tail | Postgres `delivery_dedupe`, copied from a partition as the sweeper drops it (FR-905) | none on an ordinary drop - the copy and the drop commit in one transaction and a failed copy aborts both (FR-905); under SB-3 disk pressure either that partition's 14 to 30 d tail (dropped before its copy ran) or whole archived day-ranges (dropped oldest-first ahead of `dedupe_retention`), or both in one pressure event, each logged at warn with the partition and days (FR-903) | a support answer is missing; never a delivery |
 | Signing secret, config | Postgres, synchronous | none | — |
 
 **Rules**
 
 - **D-1** The attempt buffer MUST live in Redis, never in worker process memory. A worker crash therefore loses nothing; only a Redis crash can lose the tail.
-- **D-2** Retry and status MUST NOT depend on the attempt buffer. Retry is driven by `lease_expires_at`; the attempt counter comes from the Redis Streams pending-entry delivery count. `attempt_log.mode = buffered | sync` MUST be configurable — `sync` writes every attempt inline for operators who value evidence over throughput.
+- **D-2** Retry and status MUST NOT depend on the attempt buffer. Retry is driven by `lease_expires_at`; the attempt counter is control state on the delivery row (`deliveries.attempts`), advanced monotonically by the write that schedules the retry and returned with the claim, and MUST NOT be derived from the buffer. An attempt carries `max(deliveries.attempts, the attempt rows already written) + 1`, so `buffered` and `sync` number attempts identically. The Redis Stream's pending-entry list is the buffer's own recovery accounting - it is what lets an un-acked evidence batch be reclaimed after a flusher crash - and is not the attempt counter. `attempt_log.mode = buffered | sync` MUST be configurable — `sync` writes every attempt inline, and has no stream to count entries in, for operators who value evidence over throughput.
 - **D-3** On `SIGTERM`, workers MUST drain in-flight attempts and the flusher MUST flush before exit. Deploys and restarts lose nothing.
 - **D-4** The relay MUST have both a `LISTEN/NOTIFY` fast path and a 1 s polling fallback: a notification is not durable, and a missed one must not strand an event.
 - **D-5** Redis MUST run `appendonly yes` with `appendfsync everysec`; RDB-only persistence is unsupported because it loses the queue. The startup gate is OPS-7.
 - **D-6** The sweeper MUST re-queue any delivery whose `lease_expires_at < now` within 10 s, so a crashed worker costs one lease interval, not a lost delivery.
 - **D-7** Exactly one sweeper MUST be active per deployment. Leadership is taken with a Postgres advisory lock and MUST be released within 30 s of the holder dying, because partition drops (SB-3) are destructive and MUST NOT run concurrently. Every other core replica runs as a standby that competes for the lock.
+- **D-8** Pause state for an endpoint or a subscription MUST be a durable Postgres column written as control state, never a Redis key. Losing a failure-counter window MAY delay a pause, but MUST NOT pause or unpause anything.
+- **D-9** The attempt buffer's acknowledgement MUST be one transaction - the `XACK` and the entry's removal together - and MUST NOT be revocable by the cancellation that ends a flush pass: the attempt row is committed before either command is sent, so a revoke can lose the retirement and never the evidence. A batch whose acknowledgement failed MUST NOT block the next batch. A start MUST retire the entries a peer acknowledged but never removed that lie below the oldest pending entry when it sweeps, and every such entry when nothing is pending, because they have left the pending list, where no reclaim can reach them, and `XLEN` - the depth gauge OBS-9 watches - counts them for the life of the stream. That bound MUST NOT be widened to reach a strand above it: an `XTRIM` that crosses a pending entry deletes evidence rather than correcting a gauge. A strand above the bound MUST therefore be retired by a later sweep in the same process, so the flusher MUST keep sweeping at most once per `StaleAfter` for as long as it runs rather than once at startup, and a sweep that removed anything MUST record the depth it left, because a trim moves `XLEN` with no insert behind it: the wait for such a strand is then up to two pending-batch intervals - one before a sweep whose bound has moved above it, and one more when the entry holding the bound down is a peer's untouched pending batch, which only a stale reclaim takes over, after its own `StaleAfter` - instead of the life of the process, which is what returns OBS-9's gauge to its baseline (NFR-6) without widening the bound.
 
 ---
 
@@ -324,8 +328,10 @@ Priorities: **P0** ships or nothing · **P1** in the first release, cuttable und
 | FR-107 | Suspending a producer MUST stop ingestion and non-terminal deliveries, reversibly. | P1 |
 | FR-108 | Producer-scoped resources MUST be reachable only via that producer's credential; violations MUST return `404`, never `403`. | P0 |
 | FR-109 | Producer owners MUST be able to invite a **consumer user**, bound to exactly one consumer, and revoke that access independently of the consumer record. | P0 |
-| FR-110 | A consumer user's session MUST carry a `consumer_id` claim, and every API request made with it MUST be filtered by that claim server-side. | P0 |
+| FR-110 | A consumer user's credential MUST be bound to exactly one `consumer_id` at issuance, and every API request made with it MUST be filtered by that binding server-side, never by a field the client asserts. | P0 |
 | FR-111 | Consumer users MUST authenticate by emailed invitation or password reset; they MUST NOT be able to self-register into a producer. | P0 |
+| FR-112 | A portal session MUST be an opaque random token, stored only as a hash, delivered as an `HttpOnly; Secure; SameSite=Lax` cookie (FR-1009) and accepted by the API as a bearer; the scope binding MUST live in the session record, not in the token or the client. Revocation MUST take effect within 5 s. | P0 |
+| FR-113 | The consumer portal MUST call the core API over the network as a scoped client, presenting that session's bearer, and MUST NOT authorise anything itself: a request the portal could make is a request the same token could make directly. The CSRF token on its own mutations is the browser-to-portal token of FR-1009 (§14.2), which the portal mints and verifies itself; it is not presented to the core, and no second token is minted for the portal-to-core hop. | P0 |
 
 ### 7.2 API keys (FR-2)
 
@@ -414,6 +420,8 @@ Each is a different email to a different person, which is why one generic `not_d
 | FR-510 | One event MUST represent one business occurrence for one consumer. A batch affecting N consumers MUST be published as N events, so payload size stays bounded, dedupe stays per-consumer, and one consumer's failing endpoint cannot delay the other N-1. | P0 |
 | FR-511 | `consumer_ref` resolution MUST be cached in Redis with invalidation on consumer change, so publish latency excludes the lookup. | P1 |
 | FR-512 | An API key MAY be scoped to a single `consumer_ref`, for producer backends that emit from a per-consumer context. | P2 |
+| FR-513 | The envelope of a `consumer`-routed event MUST carry the resolved `consumer_ref` whether the producer supplied `consumer_id` or `consumer_ref`; `consumer_id` MUST NOT appear in the envelope, and a `broadcast` event carries neither. | P0 |
+| FR-514 | A `consumer_id` that is unknown, deleted, or belongs to another producer MUST be treated exactly as an unresolvable `consumer_ref` (FR-508), so the two reference forms cannot diverge and no id-enumeration oracle exists. | P0 |
 
 ### 7.6 Ingestion (FR-6)
 
@@ -433,7 +441,7 @@ Each is a different email to a different person, which is why one generic `not_d
 |---|---|---|
 | FR-701 | The relay MUST publish outbox rows to the events stream, marking published only after the broker acknowledges. | P0 |
 | FR-702 | Rows MUST be claimed with a lease (`SKIP LOCKED`) so two relays never publish the same row. | P0 |
-| FR-703 | Fan-out MUST create one delivery per matching subscription before any attempt, one transaction per event. | P0 |
+| FR-703 (amended by `SPEC.md` A-11) | Fan-out MUST create one delivery per matching subscription before any attempt. The transaction boundary is the batch, not the event (FR-818), because §8.1's L1 lever calls transaction boundaries an implementation detail, not a contract: one event's fan-out set is never split across transactions - its delivery rows and the outbox mark that claims them commit together, which `PackFanOut` enforces by never splitting a plan - while one transaction carries as many events as the write budget's row capacity holds (FR-815). An event whose own fan-out set exceeds that capacity takes the single-event entry point, one transaction per event, which §8.1's L1 already puts at the batching floor. | P0 |
 | FR-704 | Fan-out MUST be idempotent on `(event_id, endpoint_id)`. | P0 |
 | FR-705 | Priority and normal events MUST use separate streams and separate worker pools. | P0 |
 | FR-706 | Delivery-row creation MUST be batched (multi-row insert), never one round-trip per row. | P0 |
@@ -473,8 +481,9 @@ The class is declared on the event type, not chosen per event, so a payload cann
 |---|---|---|
 | FR-901 | Every event MUST carry a globally unique `event_id` (ULID). | P0 |
 | FR-902 | The envelope MUST carry `delivery_id`, distinct from `event_id`, plus `attempt`. | P1 |
-| FR-903 | The platform SHOULD store `(endpoint, event_id)` dedupe keys with a 30-day TTL and expose them, so support can answer "was this a duplicate?". | P1 |
+| FR-903 | Support MUST be able to answer "was this event a duplicate for this endpoint?" for 30 days after delivery, and the answer MUST survive a Redis wipe and outlive delivery retention. Exactly two kinds of SB-3 disk-pressure drop MAY shorten that window, each logged at warn with the partition and the day range it covered, so the gap is known rather than discovered (one pressure event can produce both): a `deliveries` partition dropped before its copy ran, which loses the answer for every key that partition held from the moment of the drop - SB-3 drops on disk pressure *before* age, so the partition can still be inside its first 14 days and the loss is not confined to the 14 to 30 d portion; and a `delivery_dedupe` partition dropped before its `dedupe_retention`, so the archive's oldest days disappear whole (FR-905). No other drop and no other failure MAY lose a dedupe answer: an age-driven drop in particular loses nothing, because FR-905 requires the copy and the drop in one transaction and aborts that transaction if the copy fails. | P1 |
 | FR-904 | The integration guide MUST state the idempotency requirement and name both keys. | P0 |
+| FR-905 | The dedupe answer MUST be served from Postgres: from the `deliveries` row while its partition exists, and otherwise from a range-partitioned archive table copied at partition drop, with configurable archive retention (default 30 d, so the archive holds only the difference between the two retentions). Nothing about dedupe MAY live in Redis, and the archive MUST be dropped by partition, never by `DELETE`. An ordinary drop MUST copy the partition and drop it **in one transaction**, so that at every instant either the `deliveries` row or the archive row answers a key (both commit or neither does), and MUST abort that transaction - copy and drop together - if the copy fails; only an SB-3 disk-pressure drop MAY skip the copy, because the space is what is being reclaimed, and it MUST log the resulting gap (FR-903). Because the archive is derived from `deliveries`, an SB-3 pressure drop MUST remove `delivery_dedupe` partitions oldest-first before it removes any `deliveries` partition, and each such drop MUST log the day range it removed (FR-903). The archive's documented per-row cost MUST include the heap tuple header and the `(endpoint_id, event_id)` primary-key index (published as ~200 B for 26-character text ids), and its on-disk size MUST be exposed as a gauge read from `pg_total_relation_size`, so the operator's number is measured rather than assumed. | P1 |
 
 ### 7.10 Security (FR-10)
 
@@ -512,25 +521,49 @@ The class is declared on the event type, not chosen per event, so a payload cann
 |---|---|---|
 | FR-1201 | A delivery whose retry count or retry window is exhausted MUST become `failed_terminal` and remain replayable. The window takes precedence: an attempt scheduled beyond it is not made. | P0 |
 | FR-1202 | 10 failures for one `(endpoint, event_type)` within an hour MUST pause that subscription. | P0 |
-| FR-1203 | 100 failures for one endpoint within an hour MUST pause the endpoint. | P0 |
-| FR-1204 | A pause MUST notify the configured address once, naming endpoint, event type, first and last failing response. | P0 |
+| FR-1203 | The endpoint MUST pause when the number of distinct subscriptions on it that have each accumulated 3 failed attempts within the same sliding hour reaches `N = min(active, max(3, ceil(active/4)))`, where `active` is that endpoint's count of unpaused subscriptions and `active ≥ 2`. The count includes every subscription on the endpoint that has accumulated 3 failures in the hour, paused or not - a subscription that has paused has already met the floor. The threshold scales with the endpoint's live subscription surface so it is reachable on a small endpoint and does not pause a large one for three coincidental failures. There is no fixed 100-attempt endpoint threshold: a paused subscription stops producing failures (FR-1202), so an endpoint accumulates at most 10 failures per subscription that exists, paused or not, and a fixed number therefore encodes a subscription count rather than a failure signal - at 100 it fires only once ten subscriptions have each exhausted their own threshold, which is the mail storm it was meant to prevent, and below ten subscriptions it cannot fire at all. | P0 |
+| FR-1204 | A pause MUST notify the configured address once, naming the endpoint, the event type for a subscription pause or the count of failing subscriptions for an endpoint pause, and the first and last failing response. | P0 |
 | FR-1205 | Resume MUST be one action and MUST NOT auto-replay. | P0 |
 | FR-1206 | The dead-letter view MUST be per endpoint, sortable by failure reason. | P1 |
 | FR-1207 | The retry deadline MUST be extended by any period during which the delivery was paused, so a pause cannot consume a delivery's remaining window. | P0 |
 | FR-1208 | Each delivery MUST expose `next_attempt_at` and `retry_deadline`, so a consumer can see how long the platform intends to keep trying. | P1 |
+| FR-1209 | A failure for FR-1202/FR-1203 MUST mean one attempt that did not return `2xx`, counted in a sliding one-hour window per `(endpoint, event_type)` and per subscription for the breadth count; a success MUST NOT count toward either. | P0 |
+| FR-1210 | The endpoint threshold MUST be evaluated before the subscription threshold. When the endpoint trips, exactly one FR-1204 notification MUST be sent for it, naming the endpoint, the number of failing subscriptions and the first and last failing response; no further per-subscription pause notification MUST be emitted for that endpoint while it is paused; and a notification already sent before the endpoint tripped MUST NOT be repeated or recalled (AC-44). The endpoint pause MUST NOT write per-subscription pause rows, so resuming the endpoint restores every subscription that had not tripped its own threshold and leaves behind exactly those that did. | P0 |
+| FR-1211 | Resume MUST clear the pause and that key's counter state in one action. Resuming a subscription MUST delete its attempt window and its membership in the endpoint's breadth set. Resuming an endpoint MUST delete the breadth set **and** the attempt window of every subscription that was a member, so each former member re-qualifies only after accumulating 3 fresh failures, while subscriptions that were not members are untouched. Clearing only the set would leave those windows at or above the 3-attempt floor, FR-1203's predicate would still hold, and the endpoint would re-pause after one further failure per subscription (AC-44). | P0 |
+
+**Why the unit is an attempt, not a delivery.** A pause exists to stop hammering a receiver that is failing, and a delivery counts as one failure whether it failed once or fifteen times. Counting attempts is therefore the honest unit: at the default backoff a single dead delivery contributes 7 failing attempts inside its first hour, so a subscription carrying steady traffic pauses within minutes of an outage, while a quiet subscription pauses only once it has genuinely accumulated 10 failures and not on one bad event. The endpoint level counts breadth rather than depth for the same reason the subscription level counts attempts: depth is capped at 10 per subscription once it pauses, so an endpoint can only be judged by how many of its subscriptions are failing, and the 3-attempt floor keeps one bad event from counting a subscription as failing.
 
 ### 7.13 Quotas and fairness (FR-13)
 
 | ID | Requirement | Pri |
 |---|---|---|
-| FR-1301 | Per-producer publish and delivery quotas MUST be configurable. | P1 |
+| FR-1301 | Per-producer **publish** and **delivery** quotas MUST be configurable. The publish half is met by FR-207's per-key and per-producer rate limits (`429` with `Retry-After`, per process, §13.1) and the row is recorded that way rather than left unowned. The delivery half is **deferred to v1.1**: the mistake it guards against is real (a producer with many endpoints can occupy the shared delivery lanes up to the sum of its endpoints' caps), but v1.0 bounds a producer's blast radius per endpoint (FR-1302, FR-1306), per attempt class (FR-1303) and at publish (FR-207), never per producer, and a per-producer value needs a config surface and an API to set it. `REQUIREMENTS.md` §17.1 states the cost of the deferral. | P1 |
 | FR-1302 | Per-endpoint **concurrency** (default 10) MUST be enforced cluster-wide, not per process: slots are leased in Redis with a TTL, acquisition and release are atomic, and a crashed worker's slots expire. An in-process semaphore MAY exist as a latency optimisation but MUST NOT be the authoritative limit. | P0 |
-| FR-1303 | Retries MUST draw a separate budget from first attempts. | P0 |
-| FR-1304 | Throttling MUST be visible to the producer as "holding back deliveries", not silent latency. | P1 |
+| FR-1303 | Retries MUST draw on a budget separate from first attempts, and that budget is the platform's **attempt-execution capacity**, never a second set of endpoint limits: a delivery worker MUST partition its attempt budget into a first-attempt lane (`deliveries.attempts = 0`) and a retry lane (`attempts > 0`) with independent allowances, so retry work cannot consume the allowance a first attempt draws on; the claim path MUST be able to select a class, or a retry backlog is claimed ahead of every newer first attempt. The partition MUST divide the process's existing attempt budget (`PIGEON_DELIVERY_CONCURRENCY`, FR-816's per-process cap, default 64) rather than add to it, so the retry allowance `R` (`PIGEON_DELIVERY_RETRY_CONCURRENCY`, default 16) and the first-attempt allowance `C - R` (default 48) still total at most `C` attempts in flight per process. The retry lane's allowance MUST be configurable, MUST be validated `>= 1` at config load the way `C` is, and is `R = clamp(configured, 0, C - 1)`, so the first-attempt lane keeps at least one slot at every accepted `C` while `R >= 1` at every `C >= 2`. `R = 0` is a defined state, reached only by that clamp at `C = 1`, and it means one lane serves both classes and this isolation is not claimed for that process - not that retries stop (FR-1201), and not a mode an operator can select. Both lanes are per process, the scope FR-816's cap has; the endpoint's limits stay shared by every attempt class (FR-1308). | P0 |
+| FR-1304 | Throttling MUST be visible to the producer as "holding back deliveries", not silent latency. A delivery an endpoint's limits cannot admit MUST NOT be attempted, and MUST NOT hold a claim or a lane slot while it waits: the worker reschedules it at the wait the limiter reports, records the hold on the delivery row (`held_back_since`, `held_back_reason`), and returns to the next claim. The hold MUST be returned by the delivery view (FR-1102, FR-1103) and counted per endpoint (OBS-13). A hold MUST NOT consume a retry attempt and MUST NOT extend the retry deadline: the window moves only for a pause (FR-1207), and an endpoint that is up but at its cap has not exercised that reason. | P1 |
 | FR-1305 | A saturated producer MUST NOT raise another producer's publish p99 by more than 20%. | P0 |
 | FR-1306 | Per-endpoint **RPS** (default 25) MUST be enforced by a token bucket refilled at a fixed rate and decremented atomically. RPS and concurrency MUST NOT be conflated: a bucket bounds rate over time, a leased slot bounds in-flight count, and a request that is slow is still one request. | P0 |
 | FR-1307 | Increasing the replica count MUST NOT increase the effective per-endpoint concurrency or RPS. The limit is a property of the endpoint, not of the cluster size, and is verified by AC-41. | P0 |
 | FR-1308 | Replay and first attempts MUST draw on the same endpoint limits, so a replay burst cannot exceed the cap the endpoint was promised. | P0 |
+
+**Why FR-1303's budget is the worker's and not the receiver's.** An attempt passes two
+independent admissions, and the two halves of this section are those admissions. The lane it
+belongs to decides whether it may start (FR-1303: platform capacity, per process, so a retry
+storm cannot reach the allowance a first attempt draws on) and the endpoint's limits decide how
+many attempts of any class reach the receiver at once (FR-1302, FR-1306, FR-1308: the receiver's
+capacity, cluster-wide, shared by first attempts, retries and replays alike). Read against each
+other, the two are consistent by construction: a second slot set for retries would break FR-1308,
+because a capped endpoint would see twice the concurrency it was promised, exactly when it is
+least able to absorb it, and a per-producer quota is a third axis (FR-1301) that answers a
+different question. The mechanism, the hold's interaction with the retry window, and the trade-off
+are recorded in `SPEC.md` A-10 so a slice does not invent its own reading.
+
+**A hold is not an attempt, and it is not a pause.** It moves no attempt number and no deadline -
+only `next_attempt_at`, so the producer sees "holding back" and the receiver's cap is still
+honoured. FR-1207 extends the deadline for a pause because the endpoint was broken; an endpoint
+that is up and at its cap has given no such reason, and the window stays the consumer's promise
+about staleness. The distinction is the reason FR-1304 names the hold rather than leaving it as
+latency.
 
 ---
 
@@ -641,7 +674,7 @@ Goroutine count is therefore bounded everywhere it is created, and the real ceil
 |---|---|---|
 | FR-816 | Each delivery attempt MUST run in its own goroutine. Concurrency is bounded by the cluster-wide endpoint limit (FR-1302) plus a per-process global cap; the local semaphore is a backpressure device, never the authority. The ingest and fan-out paths MUST NOT spawn a goroutine per event outside a fixed worker pool. | P0 |
 | FR-817 | The HTTP client MUST use a dedicated `http.Transport` per endpoint with `MaxConnsPerHost` equal to that endpoint's concurrency cap, keep-alives enabled, and every response body drained and closed on all paths, so a slow endpoint cannot leak connections. | P0 |
-| FR-818 | Database writes MUST pass through a bounded batch queue. When the queue is full the relay and delivery workers MUST block and propagate backpressure to ingest (`429`), never grow goroutines or drop accepted events. | P0 |
+| FR-818 (amended by `SPEC.md` A-11) | Control-state database writes from the relay and delivery workers MUST pass through a bounded batch queue: one fixed-capacity **write budget** per process with a fixed worker pool, batching what §8.1's table binds on (fan-out delivery rows, delivery completion and terminal updates, outbox marks) into one transaction per batch, so the commit rate stays in the tens per second (FR-815) and no goroutine is created per event or per delivery (FR-816). When the budget is full those workers MUST **block**, so the pressure is absorbed by the outbox and delivery backlogs in Postgres, never by memory. Ingest MUST observe the same budget: `POST /v1/events` MUST be admitted within `PIGEON_INGEST_ADMIT_TIMEOUT` or refused with `429` + `Retry-After` and counted as shed (`code=over_capacity`), and MUST NOT wait unboundedly for a pool connection or a write slot. The publish transaction itself stays **one transaction per publish** (FR-604: the `202` is the commit) — batching it would put FR-815's 2,000-row floor inside NFR-1's 100 ms publish budget (2,000 rows at the 250 events/s reference rate is a 4 s window) and would need a savepoint per job to keep FR-303's failing pointer, FR-508's test-mode refusal and FR-603's idempotency intact; evidence writes keep their own bounded Redis-backed buffer and flusher (D-1). Never drop an accepted event: a failed batch is not an accept and its callers get a retryable error, and a shed publish leaves no `events` row. | P0 |
 | FR-819 | Every attempt MUST carry a `context.WithTimeout` of the endpoint's configured timeout, cancelled on shutdown, so a hung peer is bounded in both time and goroutine lifetime. | P0 |
 
 ### 8.3 Language: why Go, not Rust or C++
@@ -682,9 +715,9 @@ Three independent ladders. Adding capacity to one does nothing for the others, a
 | Ingest API | yes | N | one transaction per publish |
 | Relay | yes | N | `SKIP LOCKED` prevents double-claim (FR-702) |
 | Fan-out consumer | yes | N | Redis Streams consumer group |
-| Delivery workers | yes | N | `(event_id, consumer_id)` unique makes duplicate consumption harmless |
-| Producer portal | yes | N | thin API client, signed cookie session |
-| Consumer portal | yes | N | thin API client, scoped token |
+| Delivery workers | yes | N | the partial `(event_id, endpoint_id)` unique index makes duplicate fan-out harmless (I-3) |
+| Producer portal | yes | N | thin API client, opaque session token (FR-112) |
+| Consumer portal | yes | N | thin API client, opaque session token (FR-112) |
 | Flusher | yes, but | few | batching amortises better with fewer writers |
 | **Sweeper** | **no** | **1, leased** | partition drops are destructive (D-7) |
 | **Migrations** | **no** | **1, advisory lock** | §2.2 stack |
@@ -753,7 +786,7 @@ The shape matters as much as the length. Retries start at 30 seconds, so a recei
 | `type` | per event type | Producer-defined. |
 | `version` | per event type | Payload schema version. |
 | `producer_id` | per event | Lets a shared endpoint route without a lookup. |
-| `consumer_ref` | per event | The producer's own identifier for the consumer: which consumer this event is about. Present when the event type routes to a consumer. |
+| `consumer_ref` | per event | The producer's own identifier for the consumer: which consumer this event is about. Always present when the event type routes to a consumer, whether the producer published by `consumer_ref` or by `consumer_id` (FR-513); absent for `broadcast`. `consumer_id` is deliberately not in the envelope: the receiver is handed only an identifier its own integration already understands. |
 | `created_at` | per event | ISO-8601 UTC, milliseconds. |
 | `delivery_id` | per delivery | Distinguishes a retry from a new event. |
 | `attempt` | per attempt | 1-based. |
@@ -799,10 +832,10 @@ Written against the 2 vCPU / 4 GB reference machine (§2.1).
 
 | ID | Requirement |
 |---|---|
-| NFR-1 | Ingest p99 ≤ 100 ms at 1,000 req/s. |
+| NFR-1 | Ingest p99 ≤ 100 ms at every load up to the machine class's ingest rating (§8.1): 1,000 events/s ingest-only on the reference machine, 250 events/s end-to-end on the reference machine, 1,000 events/s end-to-end on 8 vCPU / 16 GB. |
 | NFR-2 | Priority delivery p99 publish→first attempt ≤ 2 s; normal ≤ 60 s. |
 | NFR-3 | Outbox lag p99 ≤ 2 s; alarm at 30 s. |
-| NFR-4 | Ingest MUST sustain 1,000 events/s at 2 vCPU / 4 GB. Delivery capacity per machine class is defined once in §8.1 and is not restated here; at 10 subscriptions, 1,000 events/s implies 10,000 deliveries/s. |
+| NFR-4 | The rated load MUST be a property of the machine class, not one number asserted on every machine: **1,000 events/s ingest-only** and **250 events/s × 10 subscriptions end-to-end** on 2 vCPU / 4 GB, and **1,000 events/s × 10 subscriptions** on 8 vCPU / 16 GB. Delivery amplification is why the two differ, and §8.1 carries the row-level model for each. |
 | NFR-5 | Steady-state RSS ≤ 1.5 GB per service at target load. |
 | NFR-6 | Queue depth MUST return to baseline within 10 minutes of a burst ending (observed by OBS-9); a queue that does not drain is a defect, not a backlog. |
 | NFR-7 | Idempotent restart: killing any worker mid-attempt yields a retried or completed attempt, never a lost delivery. |
@@ -813,7 +846,9 @@ Written against the 2 vCPU / 4 GB reference machine (§2.1).
 | NFR-12 | Upgrade: `docker compose pull && up`, migrations automatic, no loss of accepted events. |
 | NFR-13 | Delivery throughput MUST scale at ≥80% efficiency per doubling of core replicas while the Postgres write path is below its measured ceiling, and MUST NOT claim to scale past it. Verified by AC-43. |
 
-**Capacity basis for NFR-4** — ingest and delivery are not the same workload, and conflating them was the defect this section fixed. Ingest is 2 rows per event and stays cheap; delivery is `subscriptions × events/s` rows plus one update each, which is what binds. §8.1 carries the row-level model and the levers that make it fit.
+**Capacity basis for NFR-4** — ingest and delivery are not the same workload, and conflating them was the defect this section fixed. Ingest is 2 rows per event and stays cheap; delivery is `subscriptions × events/s` rows plus one update each, which is what binds. §8.1 carries the row-level model and the levers that make it fit. 1,000 events/s × 10 subscriptions is 10,000 deliveries/s plus 10,000 completion updates, which §8.1 rates at 8 vCPU / 16 GB: the earlier wording asserted that workload on the 2 vCPU / 4 GB reference machine, where it is not a target but an impossibility.
+
+**Load protocol, which is what makes these numbers mean anything.** Every load claim in this section and in §16 is measured the same way: 5 minutes of warm-up excluded from the measurement, 30 minutes measured, pass criteria evaluated over the last 10 minutes; `attempt_log.mode=buffered`; the generator outside the machine under test or in its own container so it does not compete for the 2 vCPU; accepted events reconciled against `events` and `outbox` rows rather than taken from the generator's own counter; `pg_stat_database.xact_commit` sampled to prove FR-815's batching. An ingest-only claim stops the relay deliberately, because delivery amplification is the only thing that separates the two figures. A miss is a defect to fix, or an amendment to §8.1 recorded as one, never a tolerance added to the test.
 
 ---
 
@@ -835,6 +870,7 @@ Every metric marked **[absence]** exists to catch work that should have happened
 | OBS-10 | `endpoints_paused_total` | any increase notifies producer |
 | OBS-11 | `disk_used_pct`, `retention_dropped_partitions_total` | > 80% |
 | OBS-12 | `publish_5xx_rate` | > 0.5% |
+| OBS-13 | `endpoint_held_back_total`, `endpoint_held_back_seconds` per endpoint (FR-1304) | - |
 
 Trace one `event_id` from accept through relay, fan-out, and every attempt. Metrics MUST be exposable without an external collector; Grafana is optional.
 
@@ -850,10 +886,12 @@ A service delivering 2,500 requests a second cannot log a line per success - tha
 
 Logs are for **debugging the process**; the database is for **answering questions about deliveries**. Neither substitutes for the other, and no consumer-visible fact may exist only in a log.
 
+**The success line is gated, and the gate's bound is stated here so no other document has to guess it.** A delivery that succeeds increments its counters either way; it writes a success line only when the gate admits it - below the rate every success is admitted, at or above the rate the gate admits at the rate, and the one-second allowance stated next is why a single window may exceed the rate. The gate is a token bucket that holds one second's allowance and refills at that rate, so LOG-2's bound is **`PIGEON_SUCCESS_LOG_RPS` sustained, and at most 2 × that rate in any one-second window**: the bucket starts full, so the first second of a burst can carry the allowance plus that second's refill - measured, a 10,000-deliveries-in-one-second burst emits 199 lines in its first second at the default. While a load stays above the rate the gate emits at the rate; an idle stretch restores the allowance, so a new burst gets its own first second, and 2 × the rate remains the ceiling for every window. Two scopes come with that number: the gate is **per process**, so a deployment's ceiling is `replicas × PIGEON_SUCCESS_LOG_RPS` sustained (the same scope FR-207's rate limits have), and the bound covers successes only - failures and state transitions are never gated, because those are the lines the log exists for.
+
 | ID | Requirement | Pri |
 |---|---|---|
 | LOG-1 | Logs MUST be structured JSON on stdout carrying `event_id`, `delivery_id`, `endpoint_id`, `producer_id`, `attempt` and `status` where applicable, so one delivery is one grep. | P0 |
-| LOG-2 | A successful delivery MUST NOT emit a log line per attempt above 100/s; successes increment counters. Failures and state transitions MUST always log at warn. | P0 |
+| LOG-2 | A successful delivery MUST NOT emit a log line per attempt above `PIGEON_SUCCESS_LOG_RPS` (100/s by default) in one process, sustained; the gate holds a one-second allowance, so a one-second window MUST NOT exceed 2 × the rate (§13.1). Successes increment counters either way. Failures and state transitions MUST always log at warn. | P0 |
 | LOG-3 | Payload bodies, secrets and full response bodies MUST never be logged; a redacted status plus error class is the maximum. | P0 |
 | LOG-4 | Log level MUST be runtime-configurable, and `debug` MUST be rate-limited per endpoint so enabling it cannot take the box down. | P1 |
 
@@ -861,7 +899,7 @@ Logs are for **debugging the process**; the database is for **answering question
 
 ## 14. Portals
 
-Three deployables: the **core** (API and workers, no UI), the **producer portal** (producer-facing), and the **consumer portal** (consumer-facing). Both portals are server-rendered web apps sharing a component library, shipped as separate containers, independently hostable and independently themeable. Neither embeds business logic: each is a thin API client over the same public API using scoped tokens, so anything the portal can do is also scriptable.
+Three deployables: the **core** (API and workers, no UI), the **producer portal** (producer-facing), and the **consumer portal** (consumer-facing). Both portals are server-rendered web apps sharing a component library, shipped as separate containers, independently hostable and independently themeable. Neither embeds business logic: each is a thin API client over the same public API using the session bearer in FR-112, so anything the portal can do is also scriptable.
 
 Splitting them is the whole point. They have different audiences (a producer's engineers versus its customers' engineers), different authentication (producer SSO versus emailed invitations), different release cadences, and different branding - the consumer portal carries the producer's brand, not Pigeon's. A single fused dashboard is how the production system ended up with a portal only its own team could use.
 
@@ -894,7 +932,91 @@ Splitting them is the whole point. They have different audiences (a producer's e
 | UI-18 | A Standard Webhooks verification snippet tailored to their own endpoint and `whsec_` secret. | P1 |
 | UI-19 | The consumer portal MUST be deployable on its own host and DNS name, and MAY be omitted entirely for API-only producers. | P0 |
 
-**Authorization is server-side.** Every consumer-portal request is scoped by `consumer_id` on a scoped token; the UI hiding a control is not the control. A consumer user calling the API directly MUST receive exactly the same filtered result set as through the portal (AC-20, AC-39).
+**Authorization is server-side.** Every consumer-portal request is scoped by the `consumer_id` binding on its own session record (FR-110, FR-112); the UI hiding a control is not the control. A consumer user calling the API directly MUST receive exactly the same filtered result set as through the portal (AC-20, AC-39).
+
+**Session security is a portal contract, not a dashboard preference (FR-1009).**
+Every cookie a portal sets carries `HttpOnly`, `Secure` and `SameSite=Lax` - a flash
+or one-shot cookie is no exception. Every state-changing route is a `POST` carrying a
+CSRF token bound to the caller's portal session cookie and verified in constant time
+before the handler runs; the anonymous `POST /login` and `POST /invite` are included,
+because login CSRF is the one form of the attack that needs no session at all.
+`SameSite=Lax` is defense in depth, not the control. The token is the portal's own,
+minted per form render as an HMAC over a fresh nonce under the portal session secret
+it already holds: the browser-to-portal hop is the only hop a CSRF attack traverses,
+and the portal is the only component in the deployment that sees the browser. The
+session cookie's lifetime is the core session's own expiry, read from the login
+response's `expires_at`: a portal MUST NOT hold a session longer than the token it
+carries, and MUST NOT keep a second TTL constant of its own (AC-49, AC-50, AC-51).
+
+**How this relates to `docs/spec-gap-closure`**, which has landed and is the source of
+§16's AC-44…AC-48 and of FR-112/FR-113. FR-112 cites FR-1009 for the session cookie's
+flags, and AC-47 asserts the consumer-portal end-to-end path - the *session* cookie's
+flags, a mutation without a CSRF token rejected, revocation inside 5 s. AC-49 and AC-50
+here are the shared invariant AC-47 does not state (every portal cookie, every
+state-changing `POST`, both portals, the anonymous routes included) and AC-51 is the
+lifetime leg AC-47 does not cover, so the three complement AC-47 rather than restate it.
+FR-113's "a CSRF token on mutations" is the browser-to-portal token above and not a
+second token on the portal-to-core hop: the portal presents its bearer to the core and
+no CSRF token, because a CSRF attack does not traverse that hop - S10 MUST NOT implement
+a second token beside this one.
+
+### 14.3 The producer portal's data paths
+
+The producer portal (M2a, `cmd/producer-portal`) is a thin client: every panel it
+renders is one of the calls below, made server-side with the signed-in member's
+opaque session bearer (FR-112), and nothing it does is impossible from the API. The
+credential column is the `routeKind` the route declares in
+`internal/httpapi/routes.go`; the `anonymous` rows are the ways in, which by
+definition have no session yet.
+
+| Route | Credential | Rendered by |
+|---|---|---|
+| `POST /v1/session` | anonymous | the login form |
+| `GET /v1/session` | session | read on every page - the core, not a cookie copy, is the authority on the role |
+| `DELETE /v1/session` | session | logout |
+| `POST /v1/session/password` | a session with FR-101's forced change pending | the account page |
+| `POST /v1/session/oidc` | anonymous | the OIDC callback hands the id_token to the core (FR-106) |
+| `POST /v1/password-resets` | anonymous | the forgot-password form (FR-111) |
+| `POST /v1/password-resets/accept` | anonymous | the reset form (FR-111) |
+| `GET /v1/producer/event-types` | member | UI-1 step 2, UI-9 |
+| `POST /v1/producer/event-types` | member | UI-1 step 2 |
+| `POST /v1/producer/events` | member | UI-1 steps 5-6, UI-4's test event |
+| `GET /v1/producer/events/{eventID}` | member | UI-1 step 6, the event page |
+| `GET /v1/producer/consumers` | member | UI-2, UI-10, UI-11 |
+| `POST /v1/producer/consumers` | member | UI-1 step 3, UI-10 create |
+| `GET /v1/producer/consumers/{consumerID}/endpoints` | member | UI-2's health, UI-11 |
+| `POST /v1/producer/consumers/{consumerID}/endpoints` | member | UI-1 step 3 |
+| `PATCH /v1/producer/consumers/{consumerID}/endpoints/{endpointID}` | member | UI-2 pause/resume |
+| `POST /v1/producer/consumers/{consumerID}/endpoints/{endpointID}/verify` | member | UI-1 step 4 |
+| `POST /v1/producer/consumers/{consumerID}/endpoints/{endpointID}/rotate` | member | UI-6 |
+| `GET /v1/producer/consumers/{consumerID}/events` | member | UI-11's unroutable rows |
+| `GET /v1/producer/consumers/{consumerID}/users` | member | UI-10 |
+| `POST /v1/producer/consumers/{consumerID}/invites` | owner | UI-10 invite |
+| `DELETE /v1/producer/consumers/{consumerID}/users/{userID}` | owner | UI-10 revoke |
+| `GET /v1/producer/deliveries` | member | UI-3 |
+| `GET /v1/producer/deliveries/{deliveryID}` | member | UI-3 detail |
+| `POST /v1/producer/deliveries/replay` | member | UI-5 |
+| `GET /v1/producer/usage` | member | UI-8 (SB-6's pressure panel) |
+
+`member` is FR-104's producer member session (an owner or a developer) and `owner`
+is the same session with the owner role; both are FR-112's opaque bearer, not a
+producer API key (FR-201). Every `member` route that addresses plane-scoped data
+also names the plane explicitly as `?env=test|live` (FR-103): the producer comes
+from the session claim and the environment from the query, and nothing in a body can
+move either. The producer-wide routes are the exception by design - `GET
+/v1/producer/members` and the invitation routes resolve a producer scope with no
+environment (`producerScope`), because a membership and a producer invitation
+belong to no plane. `POST /v1/events`
+stays key-only - it is the ingest path a producer's own infrastructure uses - while
+the portal publishes through `POST /v1/producer/events`, which is the same work
+through the same `servePublish` under a member credential, so the two cannot drift.
+
+The rest of the member surface in `internal/httpapi/routes.go` -
+`GET /v1/producer/members`, the invite list and revoke, the key routes, the
+subscription routes, `GET /v1/producer/deliveries/dedupe` and the single-consumer
+`GET /v1/producer/consumers/{consumerID}` - exists for non-portal callers; the
+portal above reads the list routes instead of caching an id, so what it renders can
+never disagree with the API's own answer.
 
 ---
 
@@ -910,7 +1032,7 @@ Splitting them is the whole point. They have different audiences (a producer's e
 | MT-4 | Rate limits are enforced per producer and per key. |
 | MT-5 | Instance-admin access MUST be audited with actor, reason, timestamp. |
 | MT-6 | Producer deletion MUST export data first, then hard-delete after retention. |
-| MT-7 | Secrets are encrypted with per-producer key derivation, so one producer's ciphertext is not decryptable under another's context. |
+| MT-7 | Secrets are encrypted with per-producer key derivation, so one producer's ciphertext is not decryptable under another's context. The one secret v1.0 encrypts at rest is an endpoint's custom header values (FR-1006): they are sealed under **one deployment key** with the table, the endpoint's row and the header name in the AAD (`docs/at-rest-encryption.md`), so a ciphertext cannot be moved into another producer's row - but that one key opens every producer's value. The per-producer derivation this row asks for is **deferred to v1.1**, and §17.1 states the cost of the deferral. MT-7's subject is every secret, and it is unmet for a second one: an endpoint's signing secret is stored plaintext (`endpoints.signing_secret`, `internal/db/migrations/0007_routing.sql:52`; FR-1001 needs the value at sign time, which rules out a hash and does not rule out encryption), so a `pg_dump` backup (OPS-5) carries signing material for every endpoint. That half is recorded in §17.1 and is not covered by the key-hierarchy deferral. |
 
 ### 15.2 Deployment and operations
 
@@ -919,13 +1041,14 @@ Splitting them is the whole point. They have different audiences (a producer's e
 | OPS-1 | `docker compose up -d` MUST bring up the core, both portals, Postgres and Redis with sane defaults and no manual migration. |
 | OPS-2 | A `scratch`-based image MUST be published; compose file and image MUST be version-pinned together. |
 | OPS-3 | Config MUST be environment-variable only, with a documented `.env.example` covering every knob in this document. |
-| OPS-4 | `pigeon doctor` MUST verify Postgres reachability, Redis `appendonly`, clock skew against a reference, disk headroom, and that `ulimit -n` covers the configured maximum concurrency (FR-816), printing an actionable fix for each failure. |
+| OPS-4 | `pigeon doctor` MUST verify Postgres reachability, Redis `appendonly`, clock skew against a reference, disk headroom, and that `ulimit -n` covers the configured maximum concurrency (FR-816), printing an actionable fix for each failure. It MUST be the `doctor` subcommand of the core binary, MUST be read-only, and MUST report each check under a stable id (OPS-11). |
 | OPS-5 | Backup MUST be documented as `pg_dump` plus a Redis AOF copy, with a restore drill. |
 | OPS-6 | Upgrades MUST be forward-compatible across one minor version; migrations reversible where feasible. |
 | OPS-7 | The app MUST refuse to start on an unsafe config (no `appendonly`, default admin password, `http` live endpoints). |
 | OPS-8 | The connection budget MUST satisfy `core_replicas × pool_max + reserved ≤ max_connections`, and the documented topology MUST place pgbouncer (or equivalent) in front of Postgres once core replicas exceed one - per-replica pools exhaust connections long before CPU becomes the limit. | 
 | OPS-9 | The compose file MUST scale core replicas independently (`docker compose up --scale core=N`), and the docs MUST state which processes are stateless (API, workers, portals) and which are singletons (sweeper, migrations), so an operator cannot accidentally run two partition-dropping sweepers. |
-| OPS-10 | `pigeon doctor` MUST warn when the configured replica count implies a connection budget above `max_connections`, naming the arithmetic rather than just failing. |
+| OPS-10 | `pigeon doctor` MUST warn when the configured replica count implies a connection budget above `max_connections`, naming the arithmetic rather than just failing. The check MUST be reported under the id `db.connection_budget`, with the substituted formula as its observed value. |
+| OPS-11 | `pigeon doctor` MUST print one line per check as `<status> <check-id> <observed> <required> <fix>` with `<status>` one of `pass`, `warn`, `fail`, `skip`, MUST support `--json` emitting `{"ok":bool,"checks":[{"id","status","observed","required","fix"}]}`, and MUST exit `0` when nothing failed, `1` on any failure, `2` on warnings only, `3` when doctor could not run at all. It MUST finish within 20 s with every check bounded at 5 s, MUST NOT print secrets (FR-1008), and MUST NOT offer automatic repair. |
 
 ---
 
@@ -942,11 +1065,11 @@ Splitting them is the whole point. They have different audiences (a producer's e
 | AC-07 | `SIGKILL` a worker mid-attempt | Retried by lease within 40 s; no duplicate attempt numbers |
 | AC-08 | Kill the relay after accept | Published on restart; exactly one delivery set |
 | AC-09 | Stop the relay 10 minutes | OBS-2 alarms; publish still `202`; nothing lost |
-| AC-10 | `FLUSHALL` Redis with events in the outbox | All re-published; no duplicate deliveries; attempt gap ≤ 1 s |
+| AC-10 | `FLUSHALL` Redis with events in the outbox | All re-published; no duplicate deliveries; each re-publish is an attempt the platform recorded, taken after the flush, with `published_at` after that attempt. The third clause read "attempt gap ≤ 1 s" until S8 measured it: 40 samples at load 19-24 on 2 vCPU gave min 0.506 s, median 3.193 s, max 7.210 s - 38 of 40 over the ceiling - with the broker holding each event exactly once in every run, so that bound graded the box and not the relay (§19) |
 | AC-11 | Valid / tampered / stale-timestamp signatures | Only the valid one passes |
 | AC-12 | Replay twice with one idempotency key | One set of new deliveries |
 | AC-13 | Replay 5,000 events | Rejected, naming the 1,000 bound |
-| AC-14 | 50 failures for one endpoint in an hour | Subscription paused, one email, resume works |
+| AC-14 | 10 failed attempts for one `(endpoint, event_type)` within an hour | That subscription paused; one email naming endpoint, event type and the first and last failing response; the endpoint's other subscriptions unaffected; resume clears the window and the next matching event delivers |
 | AC-15 | Producer A requests producer B's delivery | `404`, logged |
 | AC-16 | Load: 1,000 events/s, 10 subs, one hanging endpoint, on 8 vCPU / 16 GB | NFR-1/2 hold; hanging endpoint capped; commit rate stays under 100/s |
 | AC-17 | Load: one producer at 50% | Other producer p99 degrades ≤ 20% |
@@ -955,7 +1078,7 @@ Splitting them is the whole point. They have different audiences (a producer's e
 | AC-20 | Cross-producer suite over every resource | All `404`; suite runs in CI |
 | AC-21 | Graceful restart during in-flight attempts | `SIGTERM` drains; zero lost attempts |
 | AC-22 | `pigeon doctor` on a misconfigured box | Fails with a specific, actionable message |
-| AC-23 | Publish a consumer-routed event with an unknown `consumer_ref` | Live: `202`, recorded `unroutable:consumer_not_registered`, visible in UI and a metric, zero deliveries. Test: `422` |
+| AC-23 | Publish a consumer-routed event with an unknown `consumer_ref`, and separately with an unknown, deleted, or another producer's `consumer_id` | Live: `202`, recorded `unroutable:consumer_not_registered`, visible in UI and a metric, zero deliveries. Test: `422`. The id form behaves identically (FR-514) |
 | AC-24 | Consumer exists but nothing subscribed to that event type | `not_delivered:no_matching_subscription`, distinguishable from AC-23 in the UI and in the metric label |
 | AC-25 | Publish with both `consumer_id` and `consumer_ref`, or with neither | `422` naming the conflict |
 | AC-26 | Batch settlement for 400 consumers published as 400 events | Deliveries independent per consumer; one consumer's hanging endpoint does not delay the other 399 |
@@ -965,7 +1088,7 @@ Splitting them is the whole point. They have different audiences (a producer's e
 | AC-30 | Load one instance past its documented delivery ceiling | Publish sheds with `429`; no silent latency growth; the ceiling matches the §8.1 table within 20% |
 | AC-31 | 250 events/s with 10 subs on 2 vCPU / 4 GB | NFR-1/2 hold at the default machine; delivery ceiling reported honestly rather than degrading silently |
 | AC-32 | Open a delivered event in the UI | Rollup `all_delivered`; each delivery shows status, timestamp and duration; no attempt rows and no empty trail rendered |
-| AC-33 | 10,000 deliveries/s, all succeeding | No per-success log lines; log volume stays under the documented bound; counters advance |
+| AC-33 | 10,000 deliveries/s, all succeeding | No line per success: one process emits at most §13.1's documented bound (`PIGEON_SUCCESS_LOG_RPS` sustained, ≤ 2 × the rate in any one-second window), and the emitted and suppressed counters advance together |
 | AC-34 | 2,500 concurrent attempts on 2 vCPU | Goroutines bounded by pool plus per-endpoint caps; FD usage within the documented `ulimit`; CPU largely idle |
 | AC-35 | Endpoint down 20 h, then healthy | Delivered on a scheduled retry inside the 72 h window with no operator action |
 | AC-36 | Endpoint still failing at 72 h | `failed_terminal` at the window boundary; attempt count ≤ 16; replayable |
@@ -976,6 +1099,36 @@ Splitting them is the whole point. They have different audiences (a producer's e
 | AC-41 | Two core replicas, one endpoint capped at 10 concurrent, 100 deliveries enqueued at once | The endpoint never observes more than 10 in-flight requests; observed count is identical with 1 and 2 replicas |
 | AC-42 | Start two sweepers; kill the lock holder | The standby takes leadership within 30 s; exactly one partition is dropped; no delivery is re-queued twice |
 | AC-43 | Scale 1 → 2 → 4 replicas at fixed load below the DB ceiling | Throughput scales ≥ 80% per doubling; above the ceiling, throughput does not improve and p99 worsens, matching §8.4 |
+| AC-44 | Run 1: one endpoint with 10 subscriptions and 9 interleaved failed attempts - 3 each across 3 subscriptions - inside one hour, none reaching 10. Run 2: one subscription fails 10 times and pauses, then 2 other subscriptions reach 3 failures each | Run 1: endpoint paused by FR-1203's breadth trigger (3 of 10 distinct subscriptions failing) with no subscription threshold reached; zero subscriptions paused; exactly one email, naming the endpoint and the 3 failing subscriptions; all 10 subscriptions stop receiving; one resume delivers again to all 10; the 3 former members restart from an empty window, so two further failures on each of them (6 attempts) leave the endpoint running, and it re-pauses only once a third failure each (9 attempts total) has re-qualified all 3 (FR-1211). Run 2: exactly one subscription email, then exactly one endpoint email, the first not repeated or recalled; resume leaves the individually paused subscription paused and restores the other two (FR-1210, FR-1211) |
+| AC-45 | Ingest-only load on 2 vCPU / 4 GB: 1,000 events/s for 30 minutes with the relay stopped, warm-up excluded | Every request `202`; p99 ≤ 100 ms over the last 10 minutes; zero `429` and zero `5xx`; `events` + `outbox` rows equal the accepted count; commit rate ≤ 100/s; RSS ≤ 1.5 GB per service (NFR-5, §12 load protocol) |
+| AC-46 | With `deliveries` retention set to 1 h, deliver an event, let the sweeper drop the partition, then flush Redis and ask the dedupe question for that `(endpoint, event_id)`; then read the archive's size from `pg_total_relation_size` and from the metric after 100,000 archived pairs | The answer is present, served from `delivery_dedupe`, with its `first_delivery_id` and original timestamp; nothing about the answer came from Redis (FR-905); the measured per-pair size is within 50% of the documented ~200 B and the gauge agrees with `pg_total_relation_size` |
+| AC-47 | A consumer user logs in; the same token is used directly against the API for another consumer's delivery; then the session row is revoked | The cookie is `HttpOnly; Secure; SameSite=Lax` and no credential is readable by script; the direct call returns `404` exactly as through the portal; a mutation without the CSRF token is rejected; after revocation the next request is `401` within 5 s |
+| AC-48 | `pigeon doctor` with `appendonly no`, then on a healthy box, then with `--json` on the broken one | First run exits `1` with check id `redis.appendonly`, the observed value and the exact setting to change, and no secret in the output; the healthy box exits `0`; `--json` parses to `ok:false` with that check's id and status |
+| AC-49 | Every `Set-Cookie` a portal emits (session, flash, CSRF) | Carries `HttpOnly`, `Secure` and `SameSite=Lax`; no portal cookie lacks any of the three |
+| AC-50 | A state-changing `POST` to a portal route - the anonymous `/login` and `/invite` included - with the CSRF token absent or not matching the session cookie: a cross-origin form, or a same-origin request with the hidden field stripped | `403` and no state change; the same `POST` carrying the token the page rendered succeeds |
+| AC-51 | Core `PIGEON_SESSION_TTL=24h`, then log in to a portal; repeat at `15m` | The session cookie's `Max-Age` is the 24 h / 15 m the core issued (from the login response's `expires_at`), not the 12 h constant the portal used to hardcode |
+| AC-52 | The process attempt budget `PIGEON_DELIVERY_CONCURRENCY` (`C`, default 64) partitioned into a first-attempt lane of `C - R` slots and a retry lane of `R` (`PIGEON_DELIVERY_RETRY_CONCURRENCY`, default 16, so 48 first-attempt slots), with one endpoint at its concurrency cap holding a due retry backlog and a second endpoint healthy | The healthy endpoint's delivery is claimed and attempted without waiting for the capped endpoint's backlog; retry attempts in flight never exceed `R` and never hold a first-attempt allowance; with first attempts due throughout the drain, first-attempt attempts keep being claimed and started to the healthy endpoint while the retry backlog drains; attempts in flight across both lanes never exceed `C` (FR-1303, FR-816). Its two lane clauses - the `R` bound and "never hold a first-attempt allowance" - are asserted for `R >= 1`; at `R = 0` (only `C = 1`) one lane serves both classes and only the progress and `C` clauses are asserted |
+| AC-53 | An endpoint at its concurrency cap (and separately, an endpoint whose RPS bucket is empty) while deliveries are due | No attempt is made and no attempt row is written; each held delivery carries `held_back_since` and a reason, the delivery view returns them, `endpoint_held_back_total` advances, `retry_deadline` is unchanged and `deliveries.attempts` does not advance; when the cap frees, the delivery's next attempt is the one it already owed (FR-1304) |
+
+AC-44…AC-48 are defined above, by the gap amendment that landed as
+`docs/spec-gap-closure` - AC-47 is its consumer-session criterion and overlaps
+AC-49/AC-50 in scope; the three portal-security criteria take the ids after it for that
+reason, so §16's table reads as one contiguous AC-44…AC-51 block and no criterion
+restates another. AC-52 and AC-53 are the delivery-fairness criteria added by `SPEC.md`
+A-10 (FR-1303, FR-1304). They are integration-level - two endpoints, one capped, one
+healthy - so they are slice S11's exit rather than a load measurement; AC-16, AC-17 and
+AC-43 are measured on the 8 vCPU / 16 GB class by the operator on a rated host; S10 records them as
+deferred with the measured legs named (`t_bcfda850`) and the recipe preserved on the archived
+deferral card `t_94f397ba`, because this project has no host that
+carries the rating. AC-16's NFR-2 leg was blocked on S11, which has landed (PR #54); the
+measurement it enables is now waiting only on the rated host. The partition's boundary is
+part of S11's exit rather than an inference from the row: `R = clamp(PIGEON_DELIVERY_RETRY_CONCURRENCY,
+0, C - 1)` over a knob validated `>= 1` at config load, so `R >= 1` at every accepted `C >= 2` and
+`R = 0` is reached only by that clamp, at `C = 1`, where one lane serves both classes and FR-1303's
+isolation is not claimed. AC-52's two lane clauses are asserted for `R >= 1`; at `R = 0` the single
+lane serves both classes, so only its progress and `C` clauses are asserted. S11 pins both ends of
+that range: `C = 1`, the single-lane state, and `C = 2`, where the retry lane can hold at most one
+slot while the first-attempt lane keeps the other.
 
 ### 16.5 Fault injection matrix
 
@@ -990,12 +1143,12 @@ The durability claims in §6 are only credible if each failure mode is exercised
 | M0 | Schema, migrations, producer/keys, `/health`, cross-producer CI harness | AC-15, AC-20 |
 | M1 | Event types, endpoints, subscriptions, ingest + outbox + relay | AC-02, AC-03, AC-08, AC-09 |
 | M2 | Fan-out, delivery, leases, sweeper, attempt buffer | AC-04…AC-07, AC-21 |
-| M3 | Retry classification, DLQ, pause thresholds, throttles | AC-05, AC-14, AC-16, AC-17 |
-| M2a | Producer portal: onboarding, endpoints, deliveries, consumers (parallel) | AC-01 |
+| M3 | Retry classification, DLQ, pause thresholds, throttles | AC-05, AC-14, AC-16, AC-17, AC-52, AC-53 |
+| M2a | Producer portal: onboarding, endpoints, deliveries, consumers (parallel) - landed as S9a `t_c0144baa` | AC-01 |
 | M2b | Consumer portal: invitation, self-service endpoints and subscriptions, scoped log, replay (parallel) | AC-38, AC-39 |
 | M4 | Replay with bounds, inspect API, dedupe visibility | AC-12, AC-13 |
 | M5 | Partitioning, retention-by-disk, metrics, absence alarm | AC-10, AC-11, AC-18 |
-| M6 | Hardening: SSRF, rotation, doctor, load test, docs | AC-19, AC-22, NFR-4 |
+| M6 | Hardening: SSRF, rotation, doctor, load test, docs, portal session security (FR-1009) | AC-19, AC-22, AC-49, AC-50, AC-51, NFR-4 |
 
 **Two things are M1, not later:** the outbox (it changes the ingest transaction) and per-endpoint throttling (it changes the queue topology). Both are expensive to retrofit; everything else fits behind an interface.
 
@@ -1013,6 +1166,9 @@ The durability claims in §6 are only credible if each failure mode is exercised
 | Kafka transport | if >100K events/min | A consumer rewrite; the envelope does not change |
 | Helm chart | on demand | Packaging only |
 | Signed asymmetric payloads (Ed25519) | if demanded | A new signature header version; HMAC stays valid |
+| Per-producer delivery quotas (FR-1301's delivery half) | v1.1 | A producer with several endpoints can occupy the shared delivery lanes up to the sum of its endpoints' caps, so one producer's volume can raise another's delivery latency; v1.0 bounds it per endpoint (FR-1302, FR-1306), per attempt class (FR-1303) and at publish (FR-207), never per producer. The enforcement itself is a producer-keyed lease beside `internal/limit` (the claim row already carries `producer_id`); what is deferred is the *configurable* part, a per-producer value plus a config surface and an API to set it |
+| Per-producer key derivation for encrypted secrets (MT-7) | v1.1 | v1.0 seals every producer's custom header values under one deployment key (`PIGEON_HEADERS_KEY`), with the table, the row and the field in the AAD and no producer identity in the sealed value's context: a ciphertext cannot be *moved* into another producer's row, but the key that opens one producer's value opens every producer's, so a holder of it - every *core* process of the deployment - reads them all. What is deferred is not a one-line derivation: a subkey per producer from that same key (`HKDF(master, producer_id)`) changes the stored format for no boundary, because whoever holds the deployment key can derive every producer's subkey. The boundary needs per-producer key *material* - a per-producer key wrapped by the deployment key - and a migration that re-seals every stored value, which is the v1.1 shape. Until then the AAD is what keeps one producer's ciphertext from being delivered under another's identity |
+| Encrypting endpoint signing secrets at rest (MT-7's second half, FR-1001) | if demanded | The exposure is a dump, a replica or an operator read of `endpoints.signing_secret`: the value is signing material, so whoever holds a backup can forge deliveries to every consumer, and `PIGEON_HEADERS_KEY` does not protect it the way it protects custom header values. What bounds it meanwhile: the column is read only on the delivery path and returned once at creation, so the API, the portal, the logs and the attempt rows never carry it (FR-1008) - the blast radius is DB-level access. What the fix costs: sealing the column with the shipped `internal/atrest` primitive, one column, a migration, the rotate path and FR-1004's `previous_signing_secret` once S10 lands - which is why it is not scheduled beside open PR #58, whose storage change to that table is in flight |
 
 ---
 
@@ -1057,9 +1213,17 @@ Recorded so they are not relitigated in review.
 | Tenancy | Producer → consumer → endpoint | Models "send webhooks to *our* customers" without a second product |
 | Routing | Producer supplies `consumer_id` or `consumer_ref`; platform resolves | The producer declares the subject, the consumer owns the endpoint and its subscriptions; producer code never changes when a consumer adds or moves an endpoint |
 | Attempt writes | Buffered in Redis, `sync` optional | Throughput on a small box; the loss window is evidence-only and documented |
+| Attempt counter and success-log bound (S6) | The attempt counter is `deliveries.attempts`, control state advanced by the write that schedules a retry; the buffer's pending-entry list is the buffer's accounting only (D-2). The success gate is `PIGEON_SUCCESS_LOG_RPS` per process, sustained, with a one-second allowance (LOG-2) | The pending-entry list cannot number attempts in `sync` mode, where no stream exists, and its counts move with the flusher's reclaims rather than with delivery attempts; a per-window clamp on the log gate would cost a quiet deployment its first visible successes to save at most one extra second's worth of lines. Recorded in `SPEC.md` A-7 and A-8 |
+| Attempt-buffer acknowledgement (S6) | The retirement is one `MULTI`/`EXEC` per batch (the `XACK` and the removal together) on a deadline-bounded context the flush pass's cancellation cannot revoke, and the flusher sweeps the entries a peer acknowledged but never removed that lie below the oldest pending entry when it sweeps - at startup and then at most once per `StaleAfter` (A-9) | The row is committed before either command is sent, so a cancellation can lose only the retirement - and losing it is not free: an `XACK` without its removal takes the entry out of the pending list, where no reclaim can see it, while `XLEN`, the gauge OBS-9 reads, keeps counting it for the life of the stream. The batch still leaves the retry slot before the retirement is attempted, because holding it would stall the whole evidence path behind one unackable batch - worse than the `StaleAfter` delay it would remove. A strand above the sweep's bound - a tear whose older pending entry was still pending at the sweep, which a failed insert or retirement on a startup reclaim leaves behind - is retired by the next sweep in the same process, within one `StaleAfter` of the retry that retires the entry holding the bound down, and that sweep records the depth it left, so the gauge returns to its baseline without the bound being widened. Recorded in `REQUIREMENTS.md` D-9 and `SPEC.md` A-9 |
 | Retry policy | 15 retries, exponential, 72 h window, 12 h cap | Matches the market default shape (Hook0 8 d / 24 attempts, Svix days); 10 min lost a receiver's whole afternoon to the DLQ. Priority-class endpoints override to 1-6 h so stale events are not replayed |
 | Deployables | Three: core, producer portal, consumer portal | Different audiences, auth, branding and release cadence. Svix ships no portal in OSS and Hook0's themes stop at a logo, so this is the differentiator, and fusing them is what made the production portal internal-only. Portals are thin API consumers, so the core can run without either |
 | Transport, compute | Kafka and serverless both rejected | Argued once in §0.1; not restated here |
+| The six specification gaps | Closed, see `SPEC.md`'s amendments A-1…A-6 | Six places these requirements were silent, contradictory or untestable. Recorded with mechanism and trade-off so they are not re-argued per slice, and so a slice that needs one does not invent its own |
+| Retry budget (FR-1303) and visible throttling (FR-1304) | Retries draw on the worker's attempt-execution capacity, partitioned into a first-attempt lane and a retry lane with the claim path able to select a class; the endpoint's limits stay shared by every attempt class (FR-1302, FR-1306, FR-1308 unchanged). A delivery an endpoint cannot admit is held, not attempted: it consumes no attempt, moves no retry deadline and is visible to the producer | The pre-S11 dispatch path claimed a delivery and took the process slot *before* it asked the endpoint for a slot, then slept inside that path (`internal/delivery/delivery.go` at `a9b3a67:439-486`; wait loops `:502-514`, `:521-534`), so with `PIGEON_DELIVERY_WORKERS=1` (the default) one capped endpoint occupied a process's only dispatch loop - an endpoint at its cap of 10 with 5 s hangs drained at 2 attempts/s, so 1,000 due rows parked that process for about 8 minutes against NFR-2's 60 s bound. A second endpoint slot set for retries would instead break FR-1308 and double what a capped receiver sees. Mechanism in `SPEC.md` A-10; slice S11 (card `t_558a9f59`) |
+| Bounded write budget (FR-818, amended) | One fixed-capacity write budget per process, shared by ingest and the worker write paths: `Submit` blocks for the relay and delivery workers (fixed worker pool; the fan-out insert and the delivery completion/terminal updates batched into one transaction per batch), `Admit` waits at most `PIGEON_INGEST_ADMIT_TIMEOUT` for ingest and then sheds `429`/`over_capacity` against the shed counter. The publish transaction stays one transaction per publish, and `PIGEON_DB_MAX_CONNS` moves 10 → 40; FR-703's "one transaction per event" is read as one transaction per batch (an event's fan-out set is never split, and the batch the write budget forms is where the boundary is stated) | The measured defect is that the instance queues on the pgx pool instead of shedding: 250 events/s offered for 30 minutes, zero sheds, p99 3,593.4 → 4,281.6 ms, and a single publish taking 10.2 s at the shipped pool of 10 against 86 ms at 40 (`docs/load-test.md`, `run3-250x10.json`). Batching the publish transaction itself is rejected: FR-815's 2,000-row floor is a 4 s window at the reference rate against NFR-1's 100 ms publish p99, and one bad payload would fail a whole batch without a savepoint per job. 40 is the OPS-8-safe pool for the reference class's rated ingest load at one and two replicas (`1 × 40 + 5 ≤ 100`); a default that sheds at the rated load would make AC-45 red. Mechanism in `SPEC.md` A-11; slice S12 (card `t_c6afa452`), graded run `t_0bf3effa` |
+| Portal session security (FR-1009) | `HttpOnly` + `Secure` + `SameSite=Lax` on every portal cookie; CSRF via a stateless HMAC double-submit token bound to the portal's own session cookie and verified on every state-changing `POST`, the anonymous `/login` and `/invite` included; the session cookie's lifetime is the core session's `expires_at`, with no portal-side TTL constant (AC-49…AC-51) | `SameSite=Lax` alone loses to Chrome's Lax+POST 2-minute window on a freshly set cookie and to any same-site sibling origin — and UI-19 puts the consumer portal on the producer's own domain, where such siblings exist. A `PORTAL_SESSION_TTL` knob would drift from `PIGEON_SESSION_TTL` and re-create the cookie-outlives-token mismatch this decision removes. The token costs no server storage because the portal renders its own form server-side and can HMAC the nonce under the cookie secret it already holds. AC-47 (gap A-5) already asserts the consumer session cookie's flags and the CSRF rejection, so AC-49/AC-50 state the shared invariant and AC-51 the lifetime leg it lacks instead of restating it; A-5's `csrf_secret` on the session record would have put a second token on the portal-to-core hop, which no CSRF attack traverses, so A-5's mechanism no longer carries one and FR-113 names this single browser-to-portal token - not a second mechanism |
+| Encrypting a secret at rest (MT-7, FR-1006) | One deployment key (`PIGEON_HEADERS_KEY`), with the table, the row and the field in the AAD, and both limits stated in `docs/at-rest-encryption.md` rather than implied: no rotation, and no per-producer key derivation (MT-7, deferred to v1.1 with its cost in §17.1) | The AAD stops a ciphertext being *moved* - into another producer's row, another row, or another header name - which is the failure a confused read path produces, and it costs nothing. Key separation between producers is the other half of MT-7 and cannot be had from one key: any subkey derived from it is reproducible by whoever holds it, so deriving without per-producer key material is a format change with no boundary behind it. Doing it properly is a wrapped per-producer key plus a migration that re-seals every stored value: a v1.1 slice rather than something to bolt onto the first column that ever needs a key. Recorded so the next encrypted column does not assume the tree already has it. The AAD binds the header name as well as the endpoint (`headerAAD`); the checksum-frozen `0018_endpoint_custom_headers.sql` header, which prints the earlier row-only form of that string, is not edited and is superseded by this row and `docs/at-rest-encryption.md`. The AAD binds the endpoint *row*, not the producer, so a future path that re-parents an endpoint across producers (changing `endpoints.producer_id` while keeping its id) would carry its sealed values with it: MT-6's export and any endpoint transfer MUST re-seal `custom_headers` under the destination's AAD, or re-mint the endpoint id, and MUST NOT copy the column across a producer boundary. No path does this today (no statement writes `endpoints.producer_id`) |
+| AC-10's third clause (S8) | The clause is the observable the relay mechanism actually produces: each re-publish is an attempt the platform recorded, taken after the flush, with `published_at` after that attempt. The 1 s wall-clock bound is withdrawn | The bound was never a property of the relay. 40 samples at load 19-24 on 2 vCPU, with the broker holding each event exactly once in every run, gave min 0.506 s, median 3.193 s, max 7.210 s - 38 of 40 over the 1 s ceiling while the mechanism was correct - so a threshold on it graded the box, and a widened one would assert nothing. The replacement is read from the platform's own stamps (`pigeon_lease_outbox`'s `now() + lease` and `pigeon_mark_outbox_published`'s `now()`), which is what makes it a property of the mechanism rather than of the machine, and it is asserted by `TestRelayFlushWhilePendingRepublishesAll` (`internal/relay/ac10_flush_test.go`), a `ci.yml` required name. The drain bound (30 s) stays a wait rather than a verdict, per §8's rule that a missed number is an amendment recorded as one and never a tolerance added to the test. A clock seam was rejected rather than taken: the AC-36/AC-41 fix could add `Options.Now` to the delivery worker because that worker *computes* a retry schedule and writes it to `next_attempt_at`, so the test drives arithmetic rather than a race - the relay computes nothing from a clock. Its cadence is `time.NewTicker(Poll)` and both of its row stamps are written server-side inside SECURITY DEFINER functions, so an `Options.Now` field would be read by nothing (a dead knob) and routing the lease deadline through it would need a client stamp in the definer function's signature, trading the server's own timeline - the property the replacement relies on - for the test's clock. Driving the ticker instead would assert the test's own injected scheduler, not the relay. S8, card `t_708a0af3` |
 
 ---
 

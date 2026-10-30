@@ -1,0 +1,21 @@
+{{define "nav"}}
+{{/* The producer nav. Called by the shared layout with the whole Page, so it can
+     see .ActiveNav (which link is highlighted) and .CSRFToken (the environment
+     switch below is a POST: it changes the plane the next requests act in, and a
+     state-changing GET is exactly what FR-1009 forbids). */}}
+<nav class="nav">
+  <a href="/onboarding" class="{{if eqs .ActiveNav "onboarding"}}active{{end}}">Get started</a>
+  <a href="/consumers" class="{{if eqs .ActiveNav "consumers"}}active{{end}}">Consumers</a>
+  <a href="/deliveries" class="{{if eqs .ActiveNav "deliveries"}}active{{end}}">Deliveries</a>
+  <a href="/guide" class="{{if eqs .ActiveNav "guide"}}active{{end}}">Integration guide</a>
+  <a href="/snippet" class="{{if eqs .ActiveNav "snippet"}}active{{end}}">Snippets</a>
+  <a href="/usage" class="{{if eqs .ActiveNav "usage"}}active{{end}}">Disk &amp; retention</a>
+  <a href="/account" class="{{if eqs .ActiveNav "account"}}active{{end}}">Account</a>
+</nav>
+<form method="post" action="/env" class="inline env-switch">
+  {{template "csrf_field" .}}
+  <span class="muted">Environment</span>
+  <button class="btn btn-sm btn-secondary" type="submit" name="env" value="test">Test</button>
+  <button class="btn btn-sm btn-secondary" type="submit" name="env" value="live">Live</button>
+</form>
+{{end}}

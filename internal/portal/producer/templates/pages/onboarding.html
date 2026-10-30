@@ -1,0 +1,116 @@
+{{define "content"}}
+<h1>Get started</h1>
+<p class="page-sub">Six steps from nothing to a delivery you can watch (UI-1), all of them in the <strong>{{.Data.Env}}</strong> environment. Each step's state is read from the API - the checklist remembers no clicks, so it cannot disagree with the platform.</p>
+
+<div class="card">
+  <h2>Your checklist</h2>
+  <ol class="checklist">
+    {{range .Data.Steps}}
+    <li class="step {{if .Done}}step-done{{else}}step-todo{{end}}">
+      {{if .Done}}<span class="badge badge-active">done</span>{{else}}<span class="badge badge-default">todo</span>{{end}}
+      <strong>{{.N}}. {{.Title}}</strong>
+      <span class="muted">{{.Detail}}</span>
+    </li>
+    {{end}}
+  </ol>
+</div>
+
+<div class="card">
+  <h2>Step 2: register an event type</h2>
+  <p class="page-sub">The contract you publish against: a name, a routing mode and a JSON Schema the API validates every publish of this type against.</p>
+  <form method="post" action="/onboarding/event-type">
+    {{template "csrf_field" .}}
+    <div class="form-row"><label for="name">Name</label><input id="name" type="text" name="name" required placeholder="order.shipped"></div>
+    <div class="form-row">
+      <label for="routing_mode">Routing mode</label>
+      <select id="routing_mode" name="routing_mode">
+        <option value="consumer">consumer - the event names one consumer (FR-505)</option>
+        <option value="broadcast">broadcast - the event names no consumer (FR-505)</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="payload_schema">Payload schema (JSON Schema)</label>
+      <textarea id="payload_schema" name="payload_schema" rows="8" class="mono" placeholder='{"type":"object"}'></textarea>
+      <span class="muted">An empty box registers <span class="mono">{"type":"object"}</span>, which accepts any JSON object. Anything else must be a JSON document or the form refuses it before the API sees it.</span>
+    </div>
+    <button class="btn btn-sm" type="submit">Register the event type</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Step 3: register a consumer and an endpoint</h2>
+  <p class="page-sub">A consumer is your customer; an endpoint is a URL that customer's systems receive your events at. Both are created by one submit: the consumer first, then the endpoint inside it.</p>
+  <form method="post" action="/onboarding/endpoint">
+    {{template "csrf_field" .}}
+    <div class="form-row"><label for="consumer_ref">Consumer reference</label><input id="consumer_ref" type="text" name="consumer_ref" required placeholder="acme" class="mono"></div>
+    <div class="form-row"><label for="consumer_name">Consumer name</label><input id="consumer_name" type="text" name="consumer_name" required placeholder="Acme Inc."></div>
+    <div class="form-row"><label for="endpoint_name">Endpoint name</label><input id="endpoint_name" type="text" name="name" placeholder="production webhook"></div>
+    <div class="form-row"><label for="endpoint_url">Endpoint URL</label><input id="endpoint_url" type="url" name="url" required placeholder="https://acme.example.com/hooks"></div>
+    <div class="form-row"><label for="internal">Internal endpoint</label><input id="internal" type="checkbox" name="internal" value="1"><span class="muted">FR-402's escape hatch: private, loopback, link-local and metadata ranges are refused unless the endpoint is marked internal, for an endpoint you own on a private network.</span></div>
+    <button class="btn btn-sm" type="submit">Register the consumer and endpoint</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Step 5: send yourself a test event</h2>
+  <p class="page-sub">A test event is a real event: it is validated, fanned out, delivered and logged exactly like production, and marked as a test wherever it appears (UI-4).</p>
+  <p><a class="btn btn-sm" href="/test-event{{if .Data.EventTypes}}{{with index .Data.EventTypes 0}}?event_type={{.Name}}{{end}}{{end}}">Open the test-event form</a></p>
+</div>
+
+<div class="card">
+  <h2>Event types</h2>
+  {{if .Data.EventTypes}}
+  <table class="data-table">
+    <thead><tr><th>Name</th><th>Routing mode</th><th>Enabled</th></tr></thead>
+    <tbody>
+    {{range .Data.EventTypes}}
+    <tr>
+      <td class="mono">{{.Name}}</td>
+      <td>{{.RoutingMode}}</td>
+      <td>{{if .Enabled}}{{template "badge" "active"}} accepting publishes{{else}}{{template "badge" "paused"}} not accepting publishes{{end}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">No event types yet. Step 2 above registers the first one.</p>
+  {{end}}
+</div>
+
+<div class="card">
+  <h2>Consumers and endpoints</h2>
+  {{if .Data.Consumers}}
+  <table class="data-table">
+    <thead><tr><th>Reference</th><th>Name</th><th>Endpoints</th></tr></thead>
+    <tbody>
+    {{range .Data.Consumers}}
+    <tr>
+      <td class="mono"><a href="/consumers/{{.ID}}">{{.Ref}}</a></td>
+      <td><a href="/consumers/{{.ID}}">{{.Name}}</a></td>
+      <td>{{.EndpointCnt}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">No consumers yet. Step 3 above registers the first one.</p>
+  {{end}}
+  {{if .Data.Endpoints}}
+  <table class="data-table">
+    <thead><tr><th>Endpoint</th><th>URL</th><th>Verified</th><th>Failure streak</th></tr></thead>
+    <tbody>
+    {{range .Data.Endpoints}}
+    <tr>
+      <td><a href="/endpoints/{{.ID}}">{{.Name}}</a></td>
+      <td class="mono muted">{{.URL}}</td>
+      <td>{{if .Verified}}{{template "badge" "active"}} ownership answered{{else}}{{template "badge" "unverified"}} waiting for the challenge{{end}}</td>
+      <td>{{.FailureStreak}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">No endpoints yet.</p>
+  {{end}}
+</div>
+{{end}}

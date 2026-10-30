@@ -1,0 +1,49 @@
+{{define "content"}}
+<h1>Delivery {{.Data.Delivery.ID}}</h1>
+<p class="page-sub"><a href="/deliveries">Back to the delivery log</a> - environment <strong>{{.Data.Env}}</strong></p>
+
+{{if .Data.Delivery.IsTest}}<p class="flash flash-info">This is a synthetic test delivery (UI-4): a real event that travelled the same path as production, marked as a test wherever it appears.</p>{{end}}
+{{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+
+<div class="card">
+  <dl class="kv">
+    <dt>ID</dt><dd class="mono">{{.Data.Delivery.ID}}{{if .Data.Delivery.ReplayOfDeliveryID}} <span class="muted">a replay of {{.Data.Delivery.ReplayOfDeliveryID}}</span>{{end}}</dd>
+    <dt>Event</dt><dd class="mono"><a href="/events/{{.Data.Delivery.EventID}}">{{.Data.Delivery.EventID}}</a> <span class="muted">({{.Data.Delivery.EventType}})</span></dd>
+    <dt>Endpoint</dt><dd class="mono"><a href="/endpoints/{{.Data.Delivery.EndpointID}}">{{.Data.Delivery.EndpointID}}</a></dd>
+    <dt>Consumer</dt><dd class="mono">{{.Data.Delivery.ConsumerID}}</dd>
+    <dt>Status</dt><dd>{{template "badge" .Data.Delivery.Status}}</dd>
+    <dt>Attempts</dt><dd>{{.Data.Delivery.Attempts}}</dd>
+    <dt>Created</dt><dd class="muted">{{.Data.Delivery.CreatedAt}}</dd>
+    <dt>Duration</dt><dd class="muted">{{.Data.Delivery.DurationMs}}</dd>
+    {{if .Data.Delivery.NonDeliveryReason}}<dt>Non-delivery reason</dt><dd>{{.Data.Delivery.NonDeliveryReason}}</dd>{{end}}
+    {{if .Data.Delivery.HeldBackReason}}<dt>Held back</dt><dd>{{.Data.Delivery.HeldBackReason}}</dd>{{end}}
+  </dl>
+  {{if .Data.Delivery.RollupNote}}<p class="page-sub">{{.Data.Delivery.RollupNote}}</p>{{end}}
+</div>
+
+<div class="card">
+  <h2>Attempt trail</h2>
+  <p class="page-sub">Every attempt with its response body, error class and next retry time (FR-1102, FR-1103). An entry marked "no attempt row (FR-1110)" is the API's effective attempt standing in for a first attempt that has no row of its own, so a successful delivery never renders an empty trail.</p>
+  {{if .Data.Delivery.Trail}}
+  <table class="data-table">
+    <thead><tr><th>#</th><th>When</th><th>Duration</th><th>Response</th><th>Body</th><th>Error class</th><th>Outcome</th><th>Next retry</th></tr></thead>
+    <tbody>
+    {{range .Data.Delivery.Trail}}
+    <tr>
+      <td>{{.Attempt}}{{if .Synthesized}} <span class="muted">no attempt row (FR-1110)</span>{{end}}</td>
+      <td class="muted">{{.OccurredAt}}</td>
+      <td>{{.DurationMs}}</td>
+      <td class="mono">{{.ResponseStatus}}</td>
+      <td><pre class="snippet">{{.ResponseBody}}</pre></td>
+      <td class="mono">{{.ErrorClass}}</td>
+      <td class="mono">{{.Outcome}}</td>
+      <td class="muted">{{.NextRetryAt}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">This delivery has not been attempted yet (status {{.Data.Delivery.Status}}); nothing has been sent for it.</p>
+  {{end}}
+</div>
+{{end}}

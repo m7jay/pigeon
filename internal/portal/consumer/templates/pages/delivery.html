@@ -1,0 +1,52 @@
+{{define "content"}}
+<h1>Delivery {{.Data.ID}}</h1>
+<p class="page-sub"><a href="{{.Data.BackURL}}">Back to the delivery log</a></p>
+
+<div class="card">
+  <dl class="kv">
+    <dt>ID</dt><dd class="mono">{{.Data.ID}}{{if .Data.ReplayOf}} <span class="muted">a replay of {{.Data.ReplayOf}}</span>{{end}}</dd>
+    <dt>Event</dt><dd class="mono">{{.Data.EventID}} <span class="muted">({{.Data.EventType}})</span></dd>
+    <dt>Endpoint</dt><dd class="mono">{{.Data.EndpointID}}</dd>
+    <dt>Status</dt><dd>{{template "badge" .Data.Status}}{{if ne .Data.NonDeliveryReason "-"}} <span class="muted">{{.Data.NonDeliveryReason}}</span>{{end}}</dd>
+    <dt>Attempts</dt><dd>{{.Data.Attempts}}</dd>
+    <dt>Created</dt><dd class="muted">{{.Data.CreatedAt}}</dd>
+    <dt>First attempt</dt><dd class="muted">{{.Data.FirstAttemptAt}}</dd>
+    <dt>Delivered</dt><dd class="muted">{{.Data.DeliveredAt}}</dd>
+    <dt>Duration</dt><dd class="muted">{{.Data.Duration}}</dd>
+    {{if .Data.ReplayedBy}}
+    <dt>Replayed by</dt><dd>{{range .Data.ReplayedBy}}<a class="mono" href="/deliveries/{{.}}">{{.}}</a> {{end}}</dd>
+    {{end}}
+  </dl>
+</div>
+
+<div class="card">
+  <h2>Attempt trail</h2>
+  <p class="page-sub">Every attempt with its response body, error class and next retry time (FR-1103). A replayed delivery is marked as one (FR-1108).</p>
+  {{if .Data.Trail}}
+  <table class="data-table">
+    <thead><tr><th>#</th><th>When</th><th>Duration</th><th>Response</th><th>Body</th><th>Error class</th><th>Outcome</th><th>Next retry</th></tr></thead>
+    <tbody>
+    {{range .Data.Trail}}
+      <tr>
+        <td>{{.Attempt}}{{if .Synthesized}} <span class="muted">(no attempt row)</span>{{end}}</td>
+        <td class="muted">{{.OccurredAt}}</td>
+        <td>{{.Duration}}</td>
+        <td>{{.ResponseStatus}}</td>
+        <td><pre class="snippet">{{.ResponseBody}}</pre></td>
+        <td class="mono">{{.ErrorClass}}</td>
+        <td class="mono">{{.Outcome}}</td>
+        <td class="muted">{{.NextRetryAt}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  {{/* Only reached for a delivery the API reports has not been attempted yet
+       (pending, with no attempt row and no effective attempt). A successful
+       first attempt has no row of its own either, and the API's effective
+       attempt stands in for it above, so FR-1110's "MUST NOT render an empty
+       trail" is satisfied without this branch. */}}
+  <p class="empty">This delivery has not been attempted yet (status {{.Data.Status}}); nothing has been sent for it.</p>
+  {{end}}
+</div>
+{{end}}

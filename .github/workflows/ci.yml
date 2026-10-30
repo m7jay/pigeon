@@ -12,7 +12,12 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # 30, not 15: the httpapi package alone runs ~525s under -race on this runner
+    # before the consumer-portal work (each acceptance test builds its own env,
+    # which re-runs the entire migration set, so a test costs ~17-40s and the
+    # package grows with the route table). The test step's own `-timeout 25m` is
+    # the budget that matters; this cap only has to stay above it.
+    timeout-minutes: 30
 
     services:
       postgres:
@@ -42,6 +47,11 @@ jobs:
       # whole point of CI is that it must not skip.
       PIGEON_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/pigeon_test?sslmode=disable
       PIGEON_TEST_REDIS_URL: redis://localhost:6379/0
+      # FR-1006's at-rest key for endpoint custom header values. config.Load
+      # refuses to boot without a 32-byte base64 key, and internal/delivery's
+      # AC-41 test reads the shipped configuration through it. A test-only value:
+      # it protects nothing and is not a deployment secret.
+      PIGEON_HEADERS_KEY: /mxm1i7pxOA1RGvIcQHGx1EPyWXCuUTPrG9l0DtCza4=
 
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +73,402 @@ jobs:
         run: go vet ./...
 
       - name: test
-        run: go test -count=1 -race ./...
+        run: |
+          set -euo pipefail
+          # -p 1 because every integration package in this tree shares the one
+          # service-container database: running packages in parallel lets one
+          # package's fixtures (and the identity bootstrap test, which deletes and
+          # recreates the instance admin) interfere with another's.
+          # -timeout 25m: Go's default is 10m per test binary, and internal/httpapi
+          # spent 652.880s of that on the S7 head (run 40586485856). The budget was
+          # a symptom, so card t_23c796d3 measured what the money went on, under
+          # -race on 2 vCPUs: a fresh migration set is 184 ms and the harness
+          # builds one env per package (sync.Once), while every seedTenant fixture
+          # accepts three invitations and logs in four times - seven bcrypt calls
+          # at the production cost of 12, ~3.5 s each. The harness now hashes test
+          # identities at bcrypt.MinCost (internal/httpapi/main_test.go, a test-only
+          # knob; the shipped default is unchanged), which took the package from
+          # 664.8 s to 13.2 s standalone. The 25m stays as headroom rather than as
+          # the thing the suite depends on.
+          go test -count=1 -race -p 1 -v -timeout 25m ./... 2>&1 | tee /tmp/go-test.log
+          # A skip is a failure here. The whole point of S0 is that the
+          # cross-producer harness (AC-20) actually executes against Postgres;
+          # a green run that silently skipped it is the bug this closes.
+          if grep -q -- "--- SKIP" /tmp/go-test.log; then
+            echo "a test skipped in CI; the AC-20 harness must run"
+            grep -- "--- SKIP" /tmp/go-test.log
+            exit 1
+          fi
+          # S0 proved isolation at the SQL layer; S1 proves it at the HTTP layer
+          # (AC-15) and that the route table is fully covered (AC-20). Each name
+          # below is an acceptance criterion, so a rename without a CI update
+          # fails loudly instead of quietly dropping the assertion.
+          #
+          # S4 (AC-04..07, AC-21, AC-28) and D-6/D-7, and S6 (AC-29, AC-33,
+          # D-1..D-3, FR-815/SB-4), registered theirs only after their PRs
+          # merged; their names are the tail of the list. Keep the list in the
+          # order the criteria were registered.
+          #
+          # S5 (AC-14, AC-35..AC-37, AC-41 plus FR-1207) and S8 (AC-10, AC-18,
+          # AC-42 plus MT-1 and D-7's second half) registered theirs the same
+          # way, after their PRs merged. AC-16/AC-17 stay S10's: they are
+          # load-level criteria and no harness for them exists in the tree.
+          # S11 (AC-52, AC-53, plus the lane-partition boundary that FR-1303's
+          # clamp depends on) registers its names here with the change itself, so
+          # the regression it pins cannot be renamed away silently.
+          # Where one criterion's own sentence names more than one outcome,
+          # every leg it names has a name here: either leg can otherwise be
+          # deleted with the job still green, which is the failure this list
+          # exists to stop. AC-18 names three - the oldest partition dropped
+          # under disk pressure (TestRunOnceOverBudgetDropsOldestPartitionFirst),
+          # the log record of that drop (TestRunOnceLogsTheDroppedPartition) and
+          # the 429 shed (TestPublishShedsWith429OverDiskBudget). AC-42 names
+          # three - leadership handed over within 30 s
+          # (TestSweeperStandbyTakesOverWhenTheHolderIsKilled), exactly one
+          # partition dropped (TestTwoSweepersDropExactlyOnePartition) and no
+          # delivery re-queued twice, which the pre-existing
+          # TestSweeperRequeuesExpiredLease and
+          # TestLeaseExpiryReclaimsWithoutDuplicateAttempts already pin. That
+          # "exactly one partition dropped" leg compares the live partition
+          # catalogue against each replica's books, so it can only hold while a
+          # cancelled caller cannot revoke the outcome of a DROP it has already
+          # sent: TestDropPartitionOutcomeSurvivesCallerCancellation (registered
+          # last, with the fix for that window) is the pin. AC-35
+          # (durable row and 72 h arithmetic), AC-36 (terminal row and <= 16
+          # attempt bound) and AC-37 (governing window and the terminal it
+          # causes) each name two, and both halves are registered.
+          #
+          # AC-46 (FR-905) registered its two halves the same way, after PR #37
+          # merged: the answer surviving the partition sweep
+          # (TestDedupeAnswerSurvivesTheSweep) and the archive's measured
+          # per-pair size agreeing with its exported gauge
+          # (TestDedupeArchiveSizingAndGaugeAgree).
+          #
+          # AC-34's census (TestAttemptFanOutIsBounded) is registered here too, so
+          # the criterion's evidence cannot be renamed away. Its assertions are the
+          # bound - the peak in-flight count stays at or under the endpoint's cap of
+          # 10 with 2,500 due deliveries offered, the goroutine and descriptor
+          # footprint does not track the offered backlog across three backlogs six
+          # and twenty times apart, and the process's CPU rate does not either. The
+          # literal leg's absolute CPU figure is reported rather than asserted: it
+          # is the whole test binary's CPU under -race, so it lands either side of
+          # half a core on a shared 2 vCPU runner whether or not the bound holds
+          # (three CI runs of this file on the previous head measured 0.44, 0.49 and
+          # 0.51 cores on that leg, and the last failed a 0.5 threshold while the
+          # bound held in all three). The test's own header states the choice and the
+          # alternative it rejected; the CPU clause it enforces instead compares the
+          # two legs that attempt at the same rate (0.12/0.12, 0.09/0.11 and
+          # 0.12/0.14 cores/s in those three runs, against an allowance of twice the
+          # small leg's rate plus 0.2).
+          # FR-405 and FR-1006 carry no AC number (no row in REQUIREMENTS.md §16
+          # mentions headers), so their pins are requirement-level, the same shape
+          # as TestFR1207ResumeExtendsThePromisedWindow and the D-6/D-7 entries.
+          # Both sentences state two halves and both are registered, per leg:
+          # FR-405's "up to 5" and "rejected at registration" are
+          # TestCustomHeaderValidationIsFR405 (the cap and the four names, at the
+          # store) and TestEndpointCustomHeadersRefusals (the same refusals as a
+          # 4xx with a message, at the API); "not silently dropped" is
+          # TestCreateEndpointRejectsReservedHeadersBeforeAnyRow, which asserts no
+          # row was written either. FR-1006's "encrypted at rest" is
+          # TestCreateEndpointStoresHeaderValuesEncrypted (the column, read raw);
+          # "redactable" is TestEndpointCustomHeadersRoundTripIsRedacted (API
+          # reads), TestEndpointDetailShowsHeaderNamesAndMasks (the portal's UI)
+          # and TestCustomHeaderValuesNeverReachTheLogs (logs).
+          #
+          # The AAD's second leg registered last, with the change that added it:
+          # TestOpenSealedHeadersIsBoundToTheHeaderName pins that a ciphertext
+          # moved between two header names inside one endpoint's row does not
+          # authenticate, which the row-only AAD (FR-1006 as first shipped) could
+          # not catch. The row-level leg is TestOpenSealedHeadersIsBoundToTheEndpoint
+          # and the moved-row leg is TestClaimDropsACiphertextMovedToAnotherEndpointsRow.
+          #
+          # The relay's batch drain (FR-815 and FR-818 as amended by SPEC.md A-11,
+          # card `t_b9850e1b`) is registered here in three parts, because the defect
+          # it fixes was a missing shape rather than a wrong value: the lease is one
+          # call for a batch of outbox rows (TestRelayFanOutBatchWritesOneTransaction
+          # and TestRelayBatchSizeFormsTheTransaction count the transactions a batch
+          # opens - one, not one per event - and TestRelayBatchSizeOneDrainsPerEvent
+          # is the control), the fan-out of that batch is one transaction per pack
+          # that fills the write budget's row bound
+          # (TestRelayFanOutSplitsAPassIntoPacksAtTheRowBound and
+          # TestPackFanOutSplitsAtTheRowBound), and the batched path keeps every
+          # property the per-event path had: the tenant scope per producer
+          # (TestRelayFanOutBatchKeepsEachProducersScope), idempotency on a
+          # re-submitted batch (TestRelayFanOutBatchIsIdempotentOnResubmit), the
+          # §7.5a reasons on the durable rows
+          # (TestRelayFanOutBatchRecordsReasonsAndIdleEvents), the acknowledged
+          # prefix when a publish fails mid-batch
+          # (TestRelayBatchHonoursTheAcknowledgedPrefix), a failed transaction
+          # leaving the outbox pending (TestRelayFanOutBatchFailureRollsBackAndLeavesTheOutboxPending)
+          # and the single-event escape hatch for a fan-out wider than the bound
+          # (TestRelayOversizedEventTakesItsOwnTransaction).
+          # AC-30's third clause (card `t_0bf3effa`) registered its names with the
+          # change that implemented it, in `cmd/loadgen`, and registers all of them:
+          # the clause is "the ceiling matches the §8.1 table within 20%", so its legs
+          # are: the table in the harness is §8.1's (TestClassTableIsSection81 - row by
+          # row, both columns, and §8.1's spellings are accepted,
+          # TestClassNamesAcceptSection81Spellings), a machine is one class and not
+          # another (TestClassMatchIsCoresExactAndMemoryABand) and the row a machine
+          # itself carries is recorded (TestObservedClassNamesTheRowTheMachineCarries),
+          # the class is checked against the *machine under test* - not the generator's
+          # machine block, which is what the block holds on every gradeable run: the
+          # machine under test is declared with -sut-cpus/-sut-mem-gib when the
+          # generator runs off it (§12) and resolved from the observed machine when it
+          # shares it (TestDeclaredSUTNeedsBothFiguresAndIsRecorded,
+          # TestSUTDeclarationMustAgreeWithTheObservedMachine,
+          # TestClassPreflightRequiresTheMachineUnderTestWhenTheGeneratorIsOffIt), the
+          # harness refuses a class that machine does not carry before the run
+          # (TestClassPreflightRefusesAMachineThatDoesNotCarryTheClass) and at the
+          # verdict (TestGradeFailsWhenTheMachineDoesNotCarryTheClass), with the rest
+          # of the preconditions refused by name as well
+          # (TestClassPreflightRequiresSection81BasisAndTheDatabase), it compares both
+          # units of the graded window against the declared row and against the
+          # requirement's numbers rather than the artifact's own copy
+          # (TestGradeComparesBothUnitsOfTheGradedWindow,
+          # TestGradeReadsTheTargetFromTheTableNotTheArtifact), it refuses a run that
+          # cannot support the claim in nine named ways
+          # (TestGradeRefusesRunsThatCannotSupportTheClaim) - including an attested
+          # class with no machine under test recorded
+          # (TestGradeRefusesAnAttestedClassWithNoMachineUnderTest), a doctored or
+          # missing class evidence (TestGradeChecksTheMachineWhenTheArtifactRecordsNoClassEvidence,
+          # TestGradeRefusesAnObservedClassOnAnUnratedMachine) and a generator that
+          # shared the machine under test (TestGradeRefusesASharedGeneratorMachine) -
+          # how the generator's host resolves, auto or by flag, is derived
+          # (TestGeneratorOnSUTResolvesFromBaseAndFlag), the generator's own tally is
+          # reported as a cross-check and not graded
+          # (TestGradeReportsTheGeneratorTallyWithoutGradingIt), it re-decides clauses
+          # 1-2 from the artifact instead of believing the verdicts the artifact
+          # carries (TestGradeRecomputesClausesOneAndTwoFromTheArtifact), its exit
+          # status is the verdict (TestGradeExitStatusIsTheVerdict), §12's windows are
+          # the protocol's (TestPhaseWindowsFollowSection12), and `run` records the
+          # claim and the machine under test in the artifact
+          # (TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase).
+          # OPS-3's coverage guard (card `t_44795f13`): .env.example claims to be
+          # the complete list of settings, so the test that holds the claim now
+          # scans every non-test .go file of this module - not a nested module, a
+          # module cache, a nested checkout, vendor/, node_modules/ or testdata/ -
+          # plus compose.yaml's own interpolations, not just
+          # internal/config/config.go. Registered so the deployables' knobs - the
+          # portals', doctor's, the load harness's - cannot drift out from under it
+          # unnoticed, and so the tree that pins the scope rule
+          # (TestEnvKnobScanIgnoresOtherTrees) cannot be deleted quietly.
+          # OPS-1's other half (card `t_1505ca1d`): the guard above asks that a
+          # knob this module reads be documented, not that a knob a deployable
+          # reads be forwarded to it - and compose hands a portal an explicit
+          # environment list, so a name missing from that list is a documented
+          # knob the reference deployment ignores. The name below pins that
+          # direction, and with it the binary each locally built service declares
+          # it runs (the image's own entrypoint is the core, so a portal service
+          # that names none is a core container).
+          for want in \
+            TestCrossProducerReadsAreEmpty \
+            TestProducersAreAdminOnly \
+            TestCrossProducerRequestsAreNotFound \
+            TestCrossProducerSuiteCoversEveryRoute \
+            TestEveryNonAnonymousRouteRejectsAnUnauthenticatedCall \
+            TestRelayKillMidFlightRepublishes \
+            TestRelayStoppedEventIsNotLost \
+            TestRelayPublishesThenMarks \
+            TestPatchEventTypeLifecycle \
+            TestInstanceAdminCreatesProducersAndIsAudited \
+            TestSuspensionStopsIngestionAndIsReversible \
+            TestMembershipSpansProducersAndRolesAreEnforced \
+            TestConsumerUserIsBoundToOneConsumerAndRevocable \
+            TestAPIKeyLifecycleAndRevocation \
+            TestRateLimitsArePerKeyAndPerProducer \
+            TestTestAndLivePlanesAreSeparate \
+            TestAuditLogIsAppendOnly \
+            TestInvitationAcceptanceRequiresTheInviteesOwnSession \
+            TestInviteAcceptanceCannotRewriteAnExistingAccount \
+            TestInviteAcceptLooksUpTheInviteBeforeHashing \
+            TestReplayScopedKeyCanBeIssued \
+            TestSuspendIsIdempotentAndReportsTheStoredTimestamp \
+            TestDeliveryListFiltersAndCursorPagination \
+            TestDeliveryDetailExposesOrderedAttempts \
+            TestDeliveryViewReturnsTheHold \
+            TestEventRollupStatuses \
+            TestDeliveredFirstAttemptHasNoEmptyTrail \
+            TestReplayCreatesNewDeliveriesIdempotently \
+            TestReplayBoundIsRejectedNamingTheBound \
+            TestConsumerSeesOnlyItsOwnDeliveries \
+            TestDedupeAnswerWasThisADuplicate \
+            TestTenantTablesCannotBeBypassedByTheRuntimeRole \
+            TestMigratorRoleMustDifferFromTheRuntimeRole \
+            TestComposeSplitsTheMigratorFromTheRuntimeRole \
+            TestConsumerPortalSelfService \
+            TestConsumerPortalForeignResourcesAreNotFound \
+            TestConsumerPortalSubscribableGate \
+            TestConsumerPortalDeliveryLogEndToEnd \
+            TestConsumerDeliveryLogListsItsOwnConsumer \
+            TestConsumerDeliveryLogShowsTheAPIsOwnRefusalOfAFilter \
+            TestConsumerDeliveryLogNeverNamesAConsumer \
+            TestConsumerDeliveryDetailShowsResponseBodies \
+            TestDeliveryDetailRendersTheEffectiveAttemptNotAnEmptyTrail \
+            TestForeignDeliveryIsNotFoundFromThePortal \
+            TestConsumerReplayIsConfirmedByTheAPIsOwnCountAndRate \
+            TestConsumerReplayShowsTheAPIsBoundWhereTheUserActed \
+            TestConsumerSnippetRendersEveryLanguageAndNeverSendsTheSecret \
+            TestConsumerGuideRendersTheLiveEventTypeSchemas \
+            TestCoreDoesNotDependOnThePortal \
+            TestRetryThenDelivered \
+            TestTerminalFailureOn404 \
+            TestTimeoutRecordedAndRetried \
+            TestLeaseExpiryReclaimsWithoutDuplicateAttempts \
+            TestShutdownLeavesInFlightDeliveryPending \
+            TestSuccessfulDeliveryWritesNoAttemptRow \
+            TestSweeperRequeuesExpiredLease \
+            TestSweeperLeadershipLockIsExclusive \
+            TestEvidenceAndControlTxAreDistinguishableInPgStatActivity \
+            TestSuccessLogGateHoldsTheBoundAtLoad \
+            TestBufferedAttemptsFlowFromWorkerThroughRedisToPostgres \
+            TestBatchedEvidenceInsertIsOneIdempotentStatement \
+            TestRunDrainsOnCancellation \
+            TestAC14SubscriptionPauseAndResume \
+            TestAC35RecoversInsideTheWindow \
+            TestAC35DeliveryRecoversInsideTheWindow \
+            TestAC36RetryWindowEndsTheDelivery \
+            TestAC36WindowBoundaryTerminalWithinSixteenAttempts \
+            TestAC37ClaimUsesTheEndpointWindow \
+            TestAC37PerEndpointWindowGoverns \
+            TestAC41ConcurrencyCapIsIdenticalAtOneAndTwoReplicas \
+            TestAttemptFanOutIsBounded \
+            TestAC52DeliveryLanesPartitionTheProcessBudget \
+            TestAC52SharedLaneAtOneProcessSlotRunsBothClasses \
+            TestAC52RegressionHealthyEndpointNotParkedBehindCappedBacklog \
+            TestAC53HoldOnTheEndpointConcurrencyCap \
+            TestAC53HoldOnTheEndpointsEmptyRateBucket \
+            TestLaneAllowancePartitionsEveryAcceptedProcessCap \
+            TestLanesAtTheTwoBoundaries \
+            TestFR1207ResumeExtendsThePromisedWindow \
+            TestRelayFlushWhilePendingRepublishesAll \
+            TestRelayDrainsABatchInOneTransaction \
+            TestRelayFanOutSplitsAPassIntoPacksAtTheRowBound \
+            TestRelayBatchSizeOneDrainsPerEvent \
+            TestRelayBatchSizeFormsTheTransaction \
+            TestRelayBatchHonoursTheAcknowledgedPrefix \
+            TestRelayOversizedEventTakesItsOwnTransaction \
+            TestRelayFanOutBatchWritesOneTransaction \
+            TestRelayFanOutBatchKeepsEachProducersScope \
+            TestRelayFanOutBatchIsIdempotentOnResubmit \
+            TestRelayFanOutBatchRecordsReasonsAndIdleEvents \
+            TestRelayFanOutBatchFailureRollsBackAndLeavesTheOutboxPending \
+            TestPackFanOutSplitsAtTheRowBound \
+            TestRunOnceOverBudgetDropsOldestPartitionFirst \
+            TestPublishShedsWith429OverDiskBudget \
+            TestUsageEndpointIs503WithoutDiskSignal \
+            TestDropPartitionSerialisesWithAConcurrentDrop \
+            TestSweeperStandbyTakesOverWhenTheHolderIsKilled \
+            TestTwoSweepersDropExactlyOnePartition \
+            TestPartitionLeavesEnforceTenantIsolation \
+            TestRunOnceLogsTheDroppedPartition \
+            TestDedupeAnswerSurvivesTheSweep \
+            TestDedupeArchiveSizingAndGaugeAgree \
+            TestDropPartitionOutcomeSurvivesCallerCancellation \
+            TestCustomHeaderValidationIsFR405 \
+            TestEndpointCustomHeadersRefusals \
+            TestCreateEndpointRejectsReservedHeadersBeforeAnyRow \
+            TestCreateEndpointStoresHeaderValuesEncrypted \
+            TestEndpointCustomHeadersRoundTripIsRedacted \
+            TestEndpointDetailShowsHeaderNamesAndMasks \
+            TestCustomHeaderValuesNeverReachTheLogs \
+            TestOpenSealedHeadersIsBoundToTheHeaderName \
+            TestPortalCookiesCarryAllThreeFlags \
+            TestCSRFMiddlewareRejectsMissingAndMismatchedTokens \
+            TestEveryRenderedPostFormCarriesTheCSRFToken \
+            TestPortalSessionCookieLifetimeFollowsCoreExpiry \
+            TestSessionExpiryFollowsTheConfiguredTTL \
+            TestHealthyBoxPassesAndExitsZero \
+            TestConfigRefusalIsTheActionableMessage \
+            TestAConfiguredDependencyThatWillNotAnswerIsAFailure \
+            TestConnectionBudgetNamesTheArithmetic \
+            TestRedisWithoutAOFIsAFailure \
+            TestUlimitNamesTheConcurrencyItMustCover \
+            TestDiskHeadroomReadsTheVolumeOrTheDatabase \
+            TestClockSkewFailsPastTheLimit \
+            TestNothingToObserveIsExitThree \
+            TestNoSecretAppearsInAnyRendering \
+            TestObservedValuesAreSingleLine \
+            TestRebindingIsCaughtAtEveryCallSite \
+            TestDialControlIsTheOnlyCheckWithoutAWindow \
+            TestRequestTimeRefusalIsTerminal \
+            TestTransportRefusesToDialABlockedAddress \
+            TestRotationCarriesBothSignaturesFor24h \
+            TestNoRotationMeansOneSignature \
+            TestRotateKeepsThePreviousSecretForTheOverlap \
+            TestClaimScansAnEndpointThatHasNeverRotated \
+            TestExpiredPreviousSecretsAreCleared \
+            TestRotationOverlapEndsAt24Hours \
+            TestCheckVerificationURLRejectsAChangedAnswer \
+            TestArithmeticChecksSkipWhenTheConfigurationDidNotLoad \
+            TestJSONMatchesTheLineOutput \
+            TestChecksAreBoundedAndOrdered \
+            TestMetaEgressIPsReportsTheInstancesAddresses \
+            TestEgressIPsAreListedAndValidated \
+            TestClassTableIsSection81 \
+            TestClassNamesAcceptSection81Spellings \
+            TestClassMatchIsCoresExactAndMemoryABand \
+            TestObservedClassNamesTheRowTheMachineCarries \
+            TestClassPreflightRefusesAMachineThatDoesNotCarryTheClass \
+            TestClassPreflightRequiresSection81BasisAndTheDatabase \
+            TestClassPreflightRequiresTheMachineUnderTestWhenTheGeneratorIsOffIt \
+            TestSUTDeclarationMustAgreeWithTheObservedMachine \
+            TestDeclaredSUTNeedsBothFiguresAndIsRecorded \
+            TestGeneratorOnSUTResolvesFromBaseAndFlag \
+            TestPhaseWindowsFollowSection12 \
+            TestGradeComparesBothUnitsOfTheGradedWindow \
+            TestGradeReadsTheTargetFromTheTableNotTheArtifact \
+            TestGradeFailsWhenTheMachineDoesNotCarryTheClass \
+            TestGradeChecksTheMachineWhenTheArtifactRecordsNoClassEvidence \
+            TestGradeRefusesAnAttestedClassWithNoMachineUnderTest \
+            TestGradeRefusesAnObservedClassOnAnUnratedMachine \
+            TestGradeRefusesASharedGeneratorMachine \
+            TestGradeRefusesRunsThatCannotSupportTheClaim \
+            TestGradeReportsTheGeneratorTallyWithoutGradingIt \
+            TestGradeRecomputesClausesOneAndTwoFromTheArtifact \
+            TestGradeExitStatusIsTheVerdict \
+            TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase \
+            TestPasswordResetTokenIsStoredHashedAndBurnable \
+            TestPasswordResetAcceptChangesOnlyTheCredential \
+            TestEndpointHealthCountsTheFailureStreak \
+            TestProducerPortalSeesOnlyItsOwnProducerEvents \
+            TestTestPublishMarkerRidesTheEventToTheDeliveryLog \
+            TestSubscribableEventTypesCarryTheirSchema \
+            TestProducerRoutesRefuseAMachineKeyAndAConsumerToken \
+            TestProducerPublishTakesTheProducerFromTheSessionClaim \
+            TestTestPublishIsMarkedSyntheticEverywhere \
+            TestProducerRotateEndpointSecretOpensAnOverlapWindow \
+            TestPasswordResetRequestCannotEnumerateAccounts \
+            TestPasswordResetAcceptRewritesOnlyTheCredential \
+            TestOIDCLoginMintsASessionForAMappedIdentity \
+            TestOIDCLoginIsAbsentWithoutAProvider \
+            TestOnboardingChecklistIsDerivedFromTheAPI \
+            TestEndpointListShowsEveryConsumerWithHealth \
+            TestDeliveryLogShowsAttemptsAndFiltersByConsumer \
+            TestTestEventIsSubmittedWithTheSyntheticMarker \
+            TestReplayNeedsConfirmationStatingTheCountAndTheRate \
+            TestRotationExplainsTheOverlapWindow \
+            TestSnippetRendersFourLanguagesWithoutSendingTheSecret \
+            TestRetentionPanelSaysItCannotTellRatherThanZero \
+            TestIntegrationGuideRendersTheLiveSchemas \
+            TestConsumerInviteAndRevokeAreOwnerOnly \
+            TestConsumerViewShowsFailureStreakAndUnroutableEvents \
+            TestEveryFormCarriesTheCSRFToken \
+            TestEveryMemberCallThePortalMakesNamesThePlane \
+            TestLoginStartsWithTheCoresSessionAndRefusesANonMemberSession \
+            TestPasswordResetPagesCannotEnumerateAccounts \
+            TestOIDCControlIsAbsentWhenUnconfiguredAndCallbackChecksState \
+            TestLazyVerifierConstructsWithoutIO \
+            TestLazyVerifierDiscoversOnceAndVerifies \
+            TestEnvExampleDocumentsEveryKnob \
+            TestEnvKnobScanIgnoresOtherTrees \
+            TestComposeRunsEachDeployableWithItsOwnKnobs
+          do
+            if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
+              echo "required test did not pass: ${want}"
+              exit 1
+            fi
+          done
+          echo "AC-15/AC-20: SQL-layer and HTTP-layer cross-producer suites executed and passed"
 
       # D-5 is a property of the deployment, not of CI's throwaway Redis, and
       # redis-cli is not installed on the runner. Assert the artifact we ship

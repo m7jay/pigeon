@@ -1,32 +1,229 @@
-// Package httpapi is the ingest and read API.
+// Package httpapi is the management and ingest API.
 //
-// M0 ships only the surface that proves the skeleton is honest: liveness,
-// readiness, and an authenticated route whose response is filtered by the key
-// that made the request (FR-108). Event and delivery endpoints arrive in M1/M2.
+// Every route is declared once, in routes(), together with the kind of
+// credential it needs. The mux is built from that list, and the tests assert
+// against the same list, so "a route exists that nothing proves" is a failing
+// test rather than a review question (FR-108's done-condition for S1).
 package httpapi
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/m7jay/pigeon/internal/metrics"
+	"github.com/m7jay/pigeon/internal/ratelimit"
+	"github.com/m7jay/pigeon/internal/retention"
 	"github.com/m7jay/pigeon/internal/store"
+	"github.com/m7jay/pigeon/internal/writeq"
 )
 
 // Lookup authenticates a plaintext bearer key. Declared as a function type so the
 // tests can exercise the middleware without a database.
 type Lookup func(ctx context.Context, plaintext string) (store.Principal, error)
 
+// SessionLookup resolves a session token. Same reasoning as Lookup.
+type SessionLookup func(ctx context.Context, token string) (store.Session, error)
+
+// Data is the slice of the store the handlers use. It is an interface so the
+// routing and authentication tests can run with no database, and so the handler
+// layer cannot accidentally grow a query of its own: anything not in here is not
+// reachable from HTTP.
+//
+// The concrete implementation is *store.Store, which enforces the tenant scope
+// in SQL as well as in RLS (MT-1).
+type Data interface {
+	CreateProducer(ctx context.Context, actor store.Actor, in store.NewProducer) (store.Producer, store.Invite, error)
+	ListProducers(ctx context.Context) ([]store.Producer, error)
+	GetProducer(ctx context.Context, producerID string) (store.Producer, error)
+	SetProducerSuspended(ctx context.Context, actor store.Actor, producerID string, suspended bool, reason string) (store.Producer, error)
+	ListAudit(ctx context.Context, producerID string) ([]store.AuditEntry, error)
+	SelfRegisterProducer(ctx context.Context, slug, name, email, password string) (store.Producer, error)
+
+	CreateSession(ctx context.Context, in store.LoginInput, ttl time.Duration) (store.Session, string, error)
+	// CreateSessionForVerifiedIdentity is FR-106's login: an account whose identity
+	// an id_token proved, instead of a password. It resolves the same claims and
+	// refuses a claim-less account the same way.
+	CreateSessionForVerifiedIdentity(ctx context.Context, email string, ttl time.Duration) (store.Session, string, error)
+	RevokeSession(ctx context.Context, token string) error
+	ChangePassword(ctx context.Context, userID, oldPassword, newPassword string) error
+	AcceptInvite(ctx context.Context, token, password, callerUserID string) (store.AcceptedInvite, error)
+	// FR-111's reset half: mint a single-use reset token for an address, and spend
+	// one. Neither grants a claim - the write is one account's password and the
+	// revocation of its sessions.
+	CreatePasswordReset(ctx context.Context, email string, ttl time.Duration) (string, string, bool, error)
+	AcceptPasswordReset(ctx context.Context, token, newPassword string) (store.PasswordReset, error)
+
+	ListMembers(ctx context.Context, sc store.Scope) ([]store.Member, error)
+	InviteMember(ctx context.Context, sc store.Scope, actor store.Actor, email, role string) (store.Invite, error)
+	ListInvites(ctx context.Context, sc store.Scope) ([]store.InviteMeta, error)
+	RevokeInvite(ctx context.Context, sc store.Scope, inviteID string) error
+
+	ListConsumers(ctx context.Context, sc store.Scope) ([]store.Consumer, error)
+	CreateConsumer(ctx context.Context, sc store.Scope, ref, name string) (store.Consumer, error)
+	GetConsumer(ctx context.Context, sc store.Scope, consumerID string) (store.Consumer, error)
+	RekeyConsumer(ctx context.Context, sc store.Scope, consumerID, newRef string) (store.Consumer, error)
+	ListEndpointsForConsumer(ctx context.Context, sc store.Scope, consumerID string) ([]store.Endpoint, error)
+	CreateEndpoint(ctx context.Context, sc store.Scope, in store.NewEndpoint) (store.EndpointCreated, error)
+	GetEndpoint(ctx context.Context, sc store.Scope, endpointID string) (store.Endpoint, error)
+	SetEndpointPaused(ctx context.Context, sc store.Scope, endpointID string, paused bool) (store.Endpoint, error)
+	DeleteEndpoint(ctx context.Context, sc store.Scope, endpointID string) error
+	VerifyEndpoint(ctx context.Context, sc store.Scope, endpointID, token string) error
+	ListSubscriptionsForEndpoint(ctx context.Context, sc store.Scope, endpointID string) ([]store.Subscription, error)
+	CreateSubscription(ctx context.Context, sc store.Scope, in store.NewSubscription) (store.Subscription, error)
+	DeleteSubscription(ctx context.Context, sc store.Scope, endpointID, eventType string) error
+
+	// M2b consumer self-service (UI-13, UI-14, AC-39): the same operations as the
+	// producer-facing methods above, but every read and write is additionally
+	// filtered by consumerID, the caller's own consumer from the session claim. A
+	// foreign or deleted id is ErrNotFound, so guessing another consumer's id is a
+	// 404 whether it is an endpoint, a pause, a delete or a subscription.
+	CreateConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID string, in store.NewConsumerEndpoint) (store.EndpointCreated, error)
+	GetConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.Endpoint, error)
+	UpdateConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string, p store.ConsumerEndpointPatch) (store.Endpoint, error)
+	RotateConsumerEndpointSecret(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.EndpointSecret, error)
+	DeleteConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string) error
+	VerifyConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID, token string) error
+	ListSubscribableEventTypes(ctx context.Context, sc store.Scope) ([]store.SubscribableEventType, error)
+	ListConsumerSubscriptions(ctx context.Context, sc store.Scope, consumerID, endpointID string) ([]store.Subscription, error)
+	CreateConsumerSubscription(ctx context.Context, sc store.Scope, consumerID, endpointID, eventType string) (store.Subscription, error)
+	DeleteConsumerSubscription(ctx context.Context, sc store.Scope, consumerID, endpointID, eventType string) error
+
+	InviteConsumerUser(ctx context.Context, sc store.Scope, actor store.Actor, consumerID, email string) (store.Invite, error)
+	ListConsumerUsers(ctx context.Context, sc store.Scope, consumerID string) ([]store.ConsumerUser, error)
+	RevokeConsumerUser(ctx context.Context, sc store.Scope, consumerID, userID string) error
+
+	IssueKey(ctx context.Context, sc store.Scope, actor store.Actor, replayScope bool) (store.IssuedKey, error)
+	ListKeys(ctx context.Context, sc store.Scope) ([]store.KeyMeta, error)
+	GetKey(ctx context.Context, sc store.Scope, keyID string) (store.KeyMeta, error)
+	RevokeKey(ctx context.Context, sc store.Scope, keyID string) error
+
+	// Ingest (§11, FR-301..FR-306, FR-601..FR-607). Event types are the producer's
+	// published contracts; publishing writes the event and its outbox row in one
+	// transaction so an accept can never outrun a publish intent.
+	CreateEventType(ctx context.Context, sc store.Scope, in store.NewEventType) (store.EventType, error)
+	ListEventTypes(ctx context.Context, sc store.Scope) ([]store.EventType, error)
+	PatchEventType(ctx context.Context, sc store.Scope, name string, p store.EventTypePatch) (store.EventType, error)
+	PublishEvent(ctx context.Context, sc store.Scope, in store.PublishInput) (store.PublishedEvent, error)
+
+	// Inspection and replay (§7.11, FR-1101..FR-1111). The delivery list and its
+	// filters, one delivery with its ordered attempts, the event-level view with
+	// its rollup, the dedupe answer and the bounded, idempotent replay.
+	ListDeliveries(ctx context.Context, sc store.Scope, f store.DeliveryFilter, limit int, cursor *int64) (store.DeliveryPage, error)
+	GetDelivery(ctx context.Context, sc store.Scope, id int64) (store.DeliveryDetail, error)
+	EventView(ctx context.Context, sc store.Scope, eventID string) (store.EventView, error)
+	DedupeAnswer(ctx context.Context, sc store.Scope, endpointID, eventID string) (store.DedupeAnswer, error)
+	ReplayDeliveries(ctx context.Context, sc store.Scope, in store.ReplayInput) (store.ReplayResult, error)
+
+	// S9a's producer-portal reads (M2a): UI-2/UI-11's endpoint health, derived from
+	// the delivery rows, and UI-11's events addressed to one consumer that produced
+	// no delivery to it.
+	EndpointHealth(ctx context.Context, sc store.Scope, endpointIDs []string) (map[string]store.EndpointHealth, error)
+	ConsumerEvents(ctx context.Context, sc store.Scope, consumerID string, limit int) ([]store.ConsumerEvent, error)
+}
+
 // Deps are the collaborators the handlers need. Nil Ready means "nothing to
 // check", which is what the unit tests want.
 type Deps struct {
-	Lookup  Lookup
-	Ready   func(ctx context.Context) error
-	Version string
+	Lookup   Lookup
+	Sessions SessionLookup
+	Data     Data
+	Ready    func(ctx context.Context) error
+	Version  string
+
+	// SessionTTL is how long a login lasts (PIGEON_SESSION_TTL).
+	SessionTTL time.Duration
+
+	// KeyLimiter and ProducerLimiter implement FR-207's two ceilings. A nil
+	// limiter means "no limit", which is what the tests use.
+	KeyLimiter      *ratelimit.Limiter
+	ProducerLimiter *ratelimit.Limiter
+
+	// TouchKey records FR-206's last_used_at. The middleware calls it on a
+	// goroutine after a successful authentication, so a slow or failing evidence
+	// write can never delay or fail the request that carried the key. Nil disables
+	// it (unit tests only).
+	TouchKey func(ctx context.Context, keyID string) error
+
+	// SelfRegistration enables POST /v1/producers (FR-102's "enableable by
+	// config"). Off by default: an internet-facing instance must not let
+	// strangers create tenants.
+	SelfRegistration bool
+
+	// Metrics, when set, exposes the fan-out non-delivery counters (FR-508) at
+	// GET /metrics. Nil disables the route, which the unit tests want.
+	Metrics *metrics.Metrics
+
+	// Retention is the storage-budget surface: GET /v1/meta/usage (SB-6) and the
+	// publish gate that sheds load with 429 (SB-7). Nil means "no retention
+	// signal": the usage route answers 503 and publish never sheds, which is what
+	// the unit tests want. *retention.Manager implements it.
+	Retention Retention
+
+	// Writes is FR-818's bounded write budget (SPEC.md A-11): the publish path
+	// asks it for a slot and is refused with a 429 when the budget stays full for
+	// PIGEON_INGEST_ADMIT_TIMEOUT. It is the SAME queue the store's control-state
+	// writers submit to, so "full" means the machine's write capacity rather than
+	// one subsystem's queue. Nil means "no budget": publish never sheds for write
+	// pressure, which is what the handler tests that do not exercise the write
+	// path want. *writeq.Queue implements it.
+	Writes WriteBudget
+
+	// EgressIPs is PIGEON_EGRESS_IPS: the addresses this instance's deliveries
+	// come from, as the operator declared them (FR-1007). Empty means "discover
+	// them from the host's interfaces", which is right on a flat network and
+	// wrong behind NAT - the discovered case says so in the response.
+	EgressIPs []string
+
+	// DiscoverEgress overrides interface discovery. Nil reads the host's own
+	// addresses; the tests set it so the answer does not depend on the machine
+	// the suite runs on.
+	DiscoverEgress func() []string
+
+	// NotifyPasswordReset delivers FR-111's reset token (see passwordreset.go).
+	// Nil means "nowhere": the token is minted and hashed but never leaves the
+	// process, which is the safe default on a shared instance and is why the
+	// operator has to opt into the log transport explicitly.
+	NotifyPasswordReset PasswordResetNotifier
+
+	// PasswordResetTTL is how long an issued reset stays usable
+	// (PIGEON_PASSWORD_RESET_TTL). Zero means store.DefaultResetTTL.
+	PasswordResetTTL time.Duration
+
+	// OIDC is FR-106's optional login (see oidc.go). Nil disables the route: an
+	// instance that configured no provider has no OIDC control to render.
+	OIDC OIDCVerifier
+}
+
+// WriteBudget is FR-818's admission half. Admitting is all the publish path
+// needs: a slot is held for the request's one transaction and released when it
+// commits, which is the resource a pool connection would otherwise have made the
+// request wait for with no deadline. The interface exists so a handler test can
+// refuse admission without building a queue, and so *writeq.Queue's own tests do
+// not need an HTTP server.
+type WriteBudget interface {
+	Admit(ctx context.Context) (writeq.Release, error)
+}
+
+// Retention is the read side of the storage budget. The interface exists so the
+// HTTP layer can be tested with "the disk is at 95%" (AC-18) without a database
+// or a full volume, and so this package does not depend on the retention
+// policy's internals.
+type Retention interface {
+	// Status is the SB-6 payload: volume usage against the budget, the partition
+	// catalogue with sizes and row estimates, and the configured windows.
+	Status(ctx context.Context) (retention.Status, error)
+	// IngestGate reports whether publish should shed load right now (SB-7). It
+	// refreshes its cached reading at most once per its configured TTL, so the
+	// hot publish path does not statfs the volume per request.
+	IngestGate(ctx context.Context) bool
 }
 
 // Server holds the router and its dependencies.
@@ -41,17 +238,18 @@ func New(deps Deps, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
+	if deps.SessionTTL <= 0 {
+		deps.SessionTTL = 12 * time.Hour
+	}
 	return &Server{deps: deps, log: log}
 }
 
 // Handler returns the fully wrapped router.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /health", s.handleLiveness)
-	mux.HandleFunc("GET /health/ready", s.handleReadiness)
-	mux.Handle("GET /v1/whoami", s.authenticate(http.HandlerFunc(s.handleWhoami)))
-
+	for _, rt := range s.routes() {
+		mux.Handle(rt.pattern(), s.authorize(rt.Kind, rt.Handler))
+	}
 	return s.withRequestID(s.recoverer(mux))
 }
 
@@ -80,9 +278,11 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-// handleWhoami returns the principal the key proved. It exists because it is the
-// smallest route that exercises auth, the RLS scope variable, and the 404 policy
-// end to end, which is what M0's exit criteria test.
+// handleWhoami returns the principal the key proved. It is the smallest route
+// that exercises auth, the RLS scope variables and the 404 policy end to end,
+// which is what M0's exit criteria test; S1 adds the suspension flag, because a
+// suspended producer's key still authenticates and must be told why it is being
+// refused rather than seeing a mystery 403 elsewhere.
 func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 	p, ok := principalFrom(r.Context())
 	if !ok {
@@ -94,29 +294,87 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 		"producer_id": p.ProducerID,
 		"env":         p.Env,
 		"replay_only": p.ReplayOnly,
+		"suspended":   p.Suspended,
 	})
 }
 
-// authenticate resolves the bearer key and attaches the principal. Every failure
-// is 401 with the same body: whether a key is unknown, revoked, or malformed is
-// information an attacker would like and an operator does not need.
-func (s *Server) authenticate(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token, ok := bearerToken(r.Header.Get("Authorization"))
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "Authorization: Bearer <key> is required")
-			return
+// handleMetrics renders the fan-out non-delivery counters (FR-508) in a minimal
+// Prometheus text format. Each §7.5a reason is its own series label, so an
+// operator can see an un-onboarded consumer separate from a paused endpoint. The
+// route is anonymous but unauthenticated: it leaks only counter values, never
+// producer data, and the cross-producer suite proves it says the same thing to
+// everyone.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if s.deps.Metrics == nil {
+		writeError(w, http.StatusNotFound, "not_found", "metrics disabled")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	snap := s.deps.Metrics.NonDeliverySnapshot()
+	_, _ = fmt.Fprintf(w, "# HELP pigeon_non_deliveries_total Fan-out events that produced no delivery, by reason.\n")
+	_, _ = fmt.Fprintf(w, "# TYPE pigeon_non_deliveries_total counter\n")
+	for _, reason := range sortedReasons(snap) {
+		_, _ = fmt.Fprintf(w, "pigeon_non_deliveries_total{reason=%q} %d\n", reason, snap[reason])
+	}
+	// S6: the delivery, attempt and LOG-2 gate counters. They are the volume the
+	// success log line would have carried, which is exactly what LOG-2/AC-33
+	// require to be readable from here rather than from the log stream.
+	counters := s.deps.Metrics.CounterSnapshot()
+	names := make([]string, 0, len(counters))
+	for name := range counters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		metricType := "counter"
+		if metrics.IsGauge(name) {
+			metricType = "gauge"
 		}
-		p, err := s.deps.Lookup(r.Context(), token)
-		if err != nil {
-			if !errors.Is(err, store.ErrNotFound) {
-				s.log.Error("api key lookup failed", "error", err, "request_id", requestIDFrom(r.Context()))
-			}
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "invalid api key")
-			return
+		_, _ = fmt.Fprintf(w, "# TYPE %s %s\n", name, metricType)
+		_, _ = fmt.Fprintf(w, "%s %d\n", name, counters[name])
+	}
+	// SB-6's storage-budget counters. Emitted unconditionally: an alert rule on
+	// "partition drops started happening" needs the series to exist at zero, not
+	// only after the first drop.
+	_, _ = fmt.Fprintf(w, "# HELP pigeon_partition_drops_total Partitions dropped by retention because of the disk budget or age (SB-3).\n")
+	_, _ = fmt.Fprintf(w, "# TYPE pigeon_partition_drops_total counter\n")
+	_, _ = fmt.Fprintf(w, "pigeon_partition_drops_total %d\n", s.deps.Metrics.PartitionDropCount())
+	_, _ = fmt.Fprintf(w, "# HELP pigeon_publishes_shed_total Publishes refused with 429 because the disk was over budget (SB-7) or the write path was saturated (FR-818).\n")
+	_, _ = fmt.Fprintf(w, "# TYPE pigeon_publishes_shed_total counter\n")
+	_, _ = fmt.Fprintf(w, "pigeon_publishes_shed_total %d\n", s.deps.Metrics.ShedCount())
+	// OBS-13, per endpoint (FR-1304): how often an endpoint's limits refused to
+	// admit a delivery, and how long those holds lasted. A series exists once an
+	// endpoint has held something; an endpoint that never has is absent rather
+	// than zero, and the delivery row carries the per-delivery truth meanwhile.
+	held := s.deps.Metrics.HeldBackSnapshot()
+	if len(held) > 0 {
+		endpoints := make([]string, 0, len(held))
+		for id := range held {
+			endpoints = append(endpoints, id)
 		}
-		next.ServeHTTP(w, r.WithContext(withPrincipal(r.Context(), p)))
-	})
+		sort.Strings(endpoints)
+		_, _ = fmt.Fprintf(w, "# HELP %s Times this endpoint's limits refused to admit a delivery (FR-1304).\n", metrics.EndpointHeldBackTotal)
+		_, _ = fmt.Fprintf(w, "# TYPE %s counter\n", metrics.EndpointHeldBackTotal)
+		for _, id := range endpoints {
+			_, _ = fmt.Fprintf(w, "%s{endpoint_id=%q} %d\n", metrics.EndpointHeldBackTotal, id, held[id].Total)
+		}
+		_, _ = fmt.Fprintf(w, "# HELP %s Total time this endpoint's limits held deliveries back (FR-1304).\n", metrics.EndpointHeldBackSeconds)
+		_, _ = fmt.Fprintf(w, "# TYPE %s counter\n", metrics.EndpointHeldBackSeconds)
+		for _, id := range endpoints {
+			_, _ = fmt.Fprintf(w, "%s{endpoint_id=%q} %s\n", metrics.EndpointHeldBackSeconds, id, strconv.FormatFloat(held[id].Seconds(), 'f', -1, 64))
+		}
+	}
+}
+
+// sortedReasons gives the series a stable, deterministic order so the scrape is
+// byte-stable across calls (a test can assert on it).
+func sortedReasons(snap map[string]int64) []string {
+	reasons := make([]string, 0, len(snap))
+	for r := range snap {
+		reasons = append(reasons, r)
+	}
+	sort.Strings(reasons)
+	return reasons
 }
 
 func bearerToken(header string) (string, bool) {
@@ -143,4 +401,49 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]string{"code": code, "message": message},
 	})
+}
+
+// maxBody bounds every request body. S1 has no payload larger than a few hundred
+// bytes; the ingest limit (64 KB, FR-606) lands with the ingest path.
+const maxBody = 64 << 10
+
+// decodeJSON reads one JSON body into dst, answering 400 itself when the body is
+// not JSON. It returns false when the caller should stop.
+//
+// Unknown fields are rejected rather than ignored: a typo in `role` or `env` must
+// not silently become a default, because those two fields decide permissions.
+func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "request body must be a JSON object: "+err.Error())
+		return false
+	}
+	return true
+}
+
+// storeError maps the store's sentinel errors onto the API's status codes. The
+// important line is ErrNotFound: every tenant-scoped miss is a 404, never a 403
+// (FR-108), so a wrong producer id is indistinguishable from a nonexistent one.
+func (s *Server) storeError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		// AC-15 says "404, logged". Logging the miss is what makes enumeration
+		// visible instead of indistinguishable from a typo (MT-2); the line
+		// deliberately carries the path and the caller's tenant so an operator can
+		// tell a probe from a bug without another query.
+		s.logProbe(r, err)
+		writeError(w, http.StatusNotFound, "not_found", "no such resource")
+	case errors.Is(err, store.ErrConflict):
+		writeError(w, http.StatusConflict, "conflict", "that resource already exists")
+	case errors.Is(err, store.ErrInvalid), errors.Is(err, store.ErrInvalidEnv):
+		msg := strings.TrimPrefix(err.Error(), store.ErrInvalid.Error()+": ")
+		writeError(w, http.StatusUnprocessableEntity, "invalid", msg)
+	case errors.Is(err, store.ErrAmbiguousProducer):
+		writeError(w, http.StatusBadRequest, "producer_required",
+			"this user belongs to several producers; send producer_slug to choose one")
+	default:
+		s.log.Error("request failed", "error", err, "path", r.URL.Path, "request_id", requestIDFrom(r.Context()))
+		writeError(w, http.StatusInternalServerError, "internal", "internal error")
+	}
 }

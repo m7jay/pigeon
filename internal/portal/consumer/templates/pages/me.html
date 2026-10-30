@@ -1,0 +1,12 @@
+{{define "content"}}
+<h1>Your consumer</h1>
+<p class="page-sub">This portal shows only your own consumer's data (UI-12). There is no producer navigation and no other consumer here.</p>
+<div class="card">
+  <dl class="kv">
+    <dt>Consumer</dt><dd>{{.Data.Name}}</dd>
+    <dt>Reference</dt><dd class="mono">{{.Data.Ref}}</dd>
+    <dt>Environment</dt><dd>{{.Data.Env}}</dd>
+    <dt>Created</dt><dd>{{.Data.CreatedAt}}</dd>
+  </dl>
+</div>
+{{end}}

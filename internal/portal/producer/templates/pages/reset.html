@@ -1,0 +1,19 @@
+{{define "content"}}
+<div class="card narrow">
+  <h1>Choose a new password</h1>
+  {{if .Data.Error}}<p class="flash flash-error">{{.Data.Error}}</p>{{end}}
+  {{if .Data.Done}}
+  <p class="flash flash-success">Your password has changed. Log in with it.</p>
+  <p class="page-sub">Nothing was signed in for you: proving the new password at the login form is what starts a session.</p>
+  <p><a class="btn btn-sm" href="/login">Log in</a></p>
+  {{else}}
+  <p class="page-sub">The reset link carries a one-time token; choosing a password spends it. Nobody is signed in afterwards, so you will log in with the new password.</p>
+  <form method="post" action="/reset">
+    {{template "csrf_field" .}}
+    <input type="hidden" name="token" value="{{.Data.Token}}">
+    <div class="form-row"><label for="new_password">New password</label><input id="new_password" type="password" name="new_password" required minlength="8" autocomplete="new-password"></div>
+    <button class="btn" type="submit">Change the password</button>
+  </form>
+  {{end}}
+</div>
+{{end}}

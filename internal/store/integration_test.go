@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"os"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/m7jay/pigeon/internal/apikey"
 	"github.com/m7jay/pigeon/internal/db"
+	"github.com/m7jay/pigeon/internal/dbtest"
 )
 
 // appRole is the non-superuser the application is meant to run as in production.
@@ -49,31 +51,25 @@ func testPool(t *testing.T) *pgxpool.Pool {
 }
 
 // appPool provisions the non-superuser role (idempotently) and returns a pool
-// connected as it. Skips rather than fails when the connected role may not create
-// roles, so a developer's local database without CREATEROLE is a skip, not a lie.
+// connected as it.
+//
+// The provisioning is shared with the other DB-backed harnesses (internal/dbtest)
+// because a role is cluster-wide: two suites on this cluster can be creating
+// `pigeon_app` at the same moment, and the loser of that race must not be
+// reported as anything - the role exists, which is all this harness needs. A
+// session that genuinely may not create roles (a local database whose owner has
+// no CREATEROLE) still skips rather than fails, so it is a skip, not a lie - and
+// it is no longer indistinguishable from a lost race.
 func appPool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 
-	_, err := admin.Exec(ctx, `
-		do $$
-		begin
-			if not exists (select 1 from pg_roles where rolname = '`+appRole+`') then
-				create role `+appRole+` login password '`+appPassword+`' nosuperuser nobypassrls;
-			end if;
-		end $$;`)
+	err := dbtest.ProvisionAppRole(ctx, admin, appRole, appPassword)
 	if err != nil {
-		t.Skipf("cannot provision %s (needs CREATEROLE, e.g. the CI postgres superuser): %v", appRole, err)
-	}
-	for _, grant := range []string{
-		`grant usage on schema public to ` + appRole,
-		`grant select, insert, update, delete on all tables in schema public to ` + appRole,
-		`grant usage, select on all sequences in schema public to ` + appRole,
-		`grant execute on all functions in schema public to ` + appRole,
-	} {
-		if _, err := admin.Exec(ctx, grant); err != nil {
-			t.Fatalf("grant: %v", err)
+		if errors.Is(err, dbtest.ErrNeedsCreateRole) {
+			t.Skipf("cannot provision %s (needs CREATEROLE, e.g. the CI postgres superuser): %v", appRole, err)
 		}
+		t.Fatalf("provision %s: %v", appRole, err)
 	}
 
 	appDSN, err := withAppCredentials(os.Getenv("PIGEON_TEST_DATABASE_URL"))
@@ -188,6 +184,9 @@ func TestCrossProducerReadsAreEmpty(t *testing.T) {
 			if err := db.SetProducerScope(ctx, tx, producerID); err != nil {
 				return err
 			}
+			if err := db.SetEnvScope(ctx, tx, "live"); err != nil {
+				return err
+			}
 			return tx.QueryRow(ctx, `select count(*) from consumers where id = $1`, consumerID).Scan(&n)
 		})
 		if err != nil {
@@ -201,5 +200,209 @@ func TestCrossProducerReadsAreEmpty(t *testing.T) {
 	}
 	if got := countScoped(aID, "con_delta"); got != 0 {
 		t.Fatalf("producer %s can see %d of producer %s's rows; RLS is not enforcing isolation", aID, got, bID)
+	}
+
+	// FR-103, enforced by the same policy: the producer scope without an
+	// environment scope sees nothing at all, so a query that forgets the
+	// environment fails closed instead of reading both planes.
+	var withoutEnv int
+	if err := db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+		if err := db.SetProducerScope(ctx, tx, aID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `select count(*) from consumers where id = $1`, "con_gamma").Scan(&withoutEnv)
+	}); err != nil {
+		t.Fatalf("read without env scope: %v", err)
+	}
+	if withoutEnv != 0 {
+		t.Fatalf("a transaction with a producer scope but no environment scope saw %d rows; FR-103 is not enforced in SQL", withoutEnv)
+	}
+}
+
+// TestProducersAreAdminOnly proves both halves of the producers policy from
+// 0003: the tenant role sees nothing by default (fail closed), and the explicit
+// instance-admin path sees the rows it is meant to manage. Without the second
+// assertion, `using (false)` would pass this test while making the admin API
+// impossible to build.
+func TestProducersAreAdminOnly(t *testing.T) {
+	admin := testPool(t)
+	app := appPool(t, admin)
+	ctx := context.Background()
+
+	aID, _ := seedProducer(t, admin, "epsilon")
+	bID, _ := seedProducer(t, admin, "zeta")
+
+	countProducers := func(setScope func(pgx.Tx) error) (int, error) {
+		var n int
+		err := db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+			if err := setScope(tx); err != nil {
+				return err
+			}
+			return tx.QueryRow(ctx,
+				`select count(*) from producers where id in ($1, $2)`, aID, bID).Scan(&n)
+		})
+		return n, err
+	}
+
+	// Tenant scope only: producers stay invisible, because no producer id can
+	// isolate a producer list from itself (0001).
+	if n, err := countProducers(func(tx pgx.Tx) error {
+		return db.SetProducerScope(ctx, tx, aID)
+	}); err != nil {
+		t.Fatalf("tenant-scoped read: %v", err)
+	} else if n != 0 {
+		t.Fatalf("tenant role saw %d producers under tenant scope; producers must fail closed", n)
+	}
+
+	// Unset marker: still invisible. This is the "forgot to opt in" case.
+	if n, err := countProducers(func(pgx.Tx) error { return nil }); err != nil {
+		t.Fatalf("unmarked read: %v", err)
+	} else if n != 0 {
+		t.Fatalf("tenant role saw %d producers without the admin marker; the default must be no rows", n)
+	}
+
+	// Admin path: both rows are visible.
+	if n, err := countProducers(func(tx pgx.Tx) error {
+		return db.SetInstanceAdmin(ctx, tx)
+	}); err != nil {
+		t.Fatalf("admin-scoped read: %v", err)
+	} else if n != 2 {
+		t.Fatalf("instance-admin path saw %d of 2 producers; the admin policy is not working", n)
+	}
+
+	// Writes fail closed too: the tenant role cannot create a producer without
+	// the marker. A write path that only guards reads would be a hole.
+	_, err := admin.Exec(ctx, `delete from producers where id = 'prd_eta'`)
+	if err != nil {
+		t.Fatalf("cleanup prd_eta: %v", err)
+	}
+	if err := db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `insert into producers (id, slug, name) values ('prd_eta','eta','Producer eta')`)
+		return err
+	}); err == nil {
+		t.Fatalf("tenant role inserted a producer without the admin marker; RLS write path is open")
+	}
+	if err := db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+		if err := db.SetInstanceAdmin(ctx, tx); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `insert into producers (id, slug, name) values ('prd_eta','eta','Producer eta') on conflict (id) do nothing`)
+		return err
+	}); err != nil {
+		t.Fatalf("instance-admin insert failed: %v", err)
+	}
+}
+
+// TestAuditLogIsAppendOnly is MT-5's integrity half: the application role can
+// insert and read audit rows on the admin path, and cannot rewrite them. A log a
+// compromised app role can edit records nothing.
+func TestAuditLogIsAppendOnly(t *testing.T) {
+	admin := testPool(t)
+	app := appPool(t, admin)
+	ctx := context.Background()
+
+	producerID, _ := seedProducer(t, admin, "auditlog")
+	var actorID string
+	if err := admin.QueryRow(ctx, `
+		insert into users (id, email, password_hash) values ('usr_auditor', 'auditor@example.test', 'x')
+		on conflict (id) do update set email = excluded.email returning id`).Scan(&actorID); err != nil {
+		t.Fatalf("seed actor: %v", err)
+	}
+
+	insert := func() error {
+		return db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+			if err := db.SetInstanceAdmin(ctx, tx); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `
+				insert into admin_audit_log (id, actor_user_id, action, target_producer_id, reason)
+				values ('aud_t1', $1, 'producer.suspended', $2, 'testing')`, actorID, producerID)
+			return err
+		})
+	}
+	// The audit row carries a fixed id, and the disposable test database is reused
+	// across local runs: clear it so the row under test is this run's, not a
+	// previous run's leftover.
+	if _, err := admin.Exec(ctx, `delete from admin_audit_log where id = 'aud_t1'`); err != nil {
+		t.Fatalf("reset aud_t1: %v", err)
+	}
+	if err := insert(); err != nil {
+		t.Fatalf("admin path could not write an audit row: %v", err)
+	}
+
+	// No update or delete policy exists, so RLS refuses both silently (0 rows)
+	// rather than erroring: assert the row survives either way.
+	for _, stmt := range []string{
+		`update admin_audit_log set action = 'producer.resumed' where id = 'aud_t1'`,
+		`delete from admin_audit_log where id = 'aud_t1'`,
+	} {
+		_ = db.ControlTx(ctx, app, func(tx pgx.Tx) error {
+			if err := db.SetInstanceAdmin(ctx, tx); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, stmt)
+			return err
+		})
+	}
+
+	var action string
+	if err := admin.QueryRow(ctx, `select action from admin_audit_log where id = 'aud_t1'`).Scan(&action); err != nil {
+		t.Fatalf("audit row disappeared: %v", err)
+	}
+	if action != "producer.suspended" {
+		t.Fatalf("audit row was rewritten to %q; the log must be append-only", action)
+	}
+}
+
+// TestAuthLookupReportsSuspension is FR-107 at the authentication boundary: the
+// key stays valid, and the lookup says the producer is suspended so the caller can
+// answer 403 rather than 401.
+func TestAuthLookupReportsSuspension(t *testing.T) {
+	admin := testPool(t)
+	app := appPool(t, admin)
+	ctx := context.Background()
+
+	producerID, key := seedProducer(t, admin, "suspendedco")
+	// seedProducer inserts with `on conflict do nothing`, so a previous run against
+	// this same database left the producer suspended. The assertion below is about a
+	// fresh producer, so clear that state rather than inherit it.
+	if _, err := admin.Exec(ctx, `update producers set suspended_at = null where id = $1`, producerID); err != nil {
+		t.Fatalf("reset suspension of %s: %v", producerID, err)
+	}
+
+	p, err := LookupAPIKey(ctx, app, key)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if p.Suspended {
+		t.Fatal("a fresh producer is reported suspended")
+	}
+
+	if _, err := admin.Exec(ctx, `update producers set suspended_at = now() where id = $1`, producerID); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	p, err = LookupAPIKey(ctx, app, key)
+	if err != nil {
+		t.Fatalf("lookup after suspension: %v", err)
+	}
+	if !p.Suspended {
+		t.Fatal("a suspended producer's key authenticates without the suspension flag (FR-107)")
+	}
+}
+
+// TestRevokedKeyStopsAuthenticating is FR-205 at the SQL layer, with no cache and
+// no delay: the very next lookup returns nothing.
+func TestRevokedKeyStopsAuthenticating(t *testing.T) {
+	admin := testPool(t)
+	app := appPool(t, admin)
+	ctx := context.Background()
+
+	producerID, key := seedProducer(t, admin, "revokedco")
+	if _, err := admin.Exec(ctx,
+		`update api_keys set revoked_at = now() where producer_id = $1`, producerID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := LookupAPIKey(ctx, app, key); err != ErrNotFound {
+		t.Fatalf("a revoked key still authenticates: err = %v", err)
 	}
 }
