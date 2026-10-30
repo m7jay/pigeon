@@ -243,6 +243,12 @@ jobs:
           # the protocol's (TestPhaseWindowsFollowSection12), and `run` records the
           # claim and the machine under test in the artifact
           # (TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase).
+          # OPS-3's coverage guard (card `t_44795f13`): .env.example claims to be
+          # the complete list of settings, so the test that holds the claim now
+          # scans every non-test .go file in the repository and compose.yaml's own
+          # interpolations, not just internal/config/config.go. Registered so the
+          # deployables' knobs - the portals', doctor's, the load harness's - cannot
+          # drift out from under it unnoticed.
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -441,7 +447,8 @@ jobs:
             TestPasswordResetPagesCannotEnumerateAccounts \
             TestOIDCControlIsAbsentWhenUnconfiguredAndCallbackChecksState \
             TestLazyVerifierConstructsWithoutIO \
-            TestLazyVerifierDiscoversOnceAndVerifies
+            TestLazyVerifierDiscoversOnceAndVerifies \
+            TestEnvExampleDocumentsEveryKnob
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
