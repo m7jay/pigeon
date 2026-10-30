@@ -436,6 +436,7 @@ jobs:
             TestConsumerInviteAndRevokeAreOwnerOnly \
             TestConsumerViewShowsFailureStreakAndUnroutableEvents \
             TestEveryFormCarriesTheCSRFToken \
+            TestEveryMemberCallThePortalMakesNamesThePlane \
             TestLoginStartsWithTheCoresSessionAndRefusesANonMemberSession \
             TestPasswordResetPagesCannotEnumerateAccounts \
             TestOIDCControlIsAbsentWhenUnconfiguredAndCallbackChecksState \
