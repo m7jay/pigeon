@@ -25,21 +25,40 @@ type attemptResult struct {
 	sendErr    error         // transport-level error, for logging
 }
 
-// transportCache holds one *http.Transport per endpoint (FR-817), so a slow
-// endpoint's connection pool cannot bleed into another's, and MaxConnsPerHost
-// bounds that endpoint's in-flight deliveries to its concurrency cap. Clients are
-// created lazily and cached; the map is only touched while building a client, so
-// the common hot path (an endpoint already seen) is a single read after warm-up.
+// transportCache holds one *http.Transport per endpoint and FR-1005 dial policy
+// (FR-817), so a slow endpoint's connection pool cannot bleed into another's, and
+// MaxConnsPerHost bounds that endpoint's in-flight deliveries to its concurrency
+// cap. Clients are created lazily and cached; the map is only touched while
+// building a client, so the common hot path (an endpoint already seen) is a single
+// read after warm-up.
+//
+// The dial policy is part of the key because it is part of the transport: the hook
+// built from it decides, for every connection, whether a private address may be
+// dialled at all. Since 0022 the policy is read afresh with each claim, so an
+// operator turning FR-402's hatch on or off has to take effect on the next attempt
+// rather than at the next process start. Keyed by endpoint alone, a transport
+// assembled while the flag was off would keep refusing the address its own claim
+// had just admitted (and the reverse), and the two halves of FR-1005's request-time
+// check would disagree about one attempt. maxConns is deliberately not part of the
+// key: a stale cap mis-sizes a pool, while a stale dial policy refuses an attempt
+// the claim already admitted.
 type transportCache struct {
 	mu          sync.Mutex
-	byEndpoint  map[string]*http.Client
+	byKey       map[clientKey]*http.Client
 	fallbackCap int
+}
+
+// clientKey is the cache key: the endpoint whose connection pool this is, and the
+// FR-402 dial policy its dial hook was built with.
+type clientKey struct {
+	endpointID   string
+	allowPrivate bool
 }
 
 // newTransportCache is the constructor. fallbackCap is what an endpoint with no
 // concurrency cap of its own gets (config's PIGEON_DELIVERY_MAX_CONNS_PER_HOST).
 func newTransportCache(fallbackCap int) *transportCache {
-	return &transportCache{byEndpoint: map[string]*http.Client{}, fallbackCap: fallbackCap}
+	return &transportCache{byKey: map[clientKey]*http.Client{}, fallbackCap: fallbackCap}
 }
 
 // clientFor returns the cached client for an endpoint, creating it on first use.
@@ -61,7 +80,8 @@ func (c *transportCache) clientFor(endpointID string, maxConns int, allowInterna
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if cl, ok := c.byEndpoint[endpointID]; ok {
+	key := clientKey{endpointID: endpointID, allowPrivate: allowInternal}
+	if cl, ok := c.byKey[key]; ok {
 		return cl
 	}
 	// FR-1005's request-time half. The Control hook runs for every connection
@@ -91,7 +111,7 @@ func (c *transportCache) clientFor(endpointID string, maxConns int, allowInterna
 			DisableCompression:  true, // capture the raw body, not a decoded one (FR-804)
 		},
 	}
-	c.byEndpoint[endpointID] = cl
+	c.byKey[key] = cl
 	return cl
 }
 

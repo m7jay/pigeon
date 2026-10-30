@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -106,5 +108,66 @@ func TestTransportRefusesToDialABlockedAddress(t *testing.T) {
 	// connected would have taken longer and could have reached the service.
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("the refusal took %s; it should be decided before any connection attempt", elapsed)
+	}
+}
+
+// TestTransportCacheSeparatesTheDialPolicy pins FR-402's escape hatch at the layer
+// that actually connects: the client built for an endpoint flagged internal dials a
+// loopback address, the client built for the same endpoint without the flag does
+// not, and the cache never hands one policy's client to the other.
+//
+// It matters because the flag is now read afresh with every claim (0022), while a
+// transport outlives the attempt that built it. Keyed by endpoint alone, the cache
+// would answer with the client carrying the previous policy, so the dial hook could
+// refuse an attempt its own claim had just admitted - FR-1005's two request-time
+// halves disagreeing about one attempt.
+func TestTransportCacheSeparatesTheDialPolicy(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cache := newTransportCache(1)
+	optIn := cache.clientFor("end-hatch", 1, true)
+	public := cache.clientFor("end-hatch", 1, false)
+	if optIn == public {
+		t.Fatal("one client serves both dial policies; a loopback attempt is then judged by whichever policy was built first")
+	}
+	if again := cache.clientFor("end-hatch", 1, true); again != optIn {
+		t.Error("the client for one policy is not reused; every attempt would rebuild the endpoint's pool")
+	}
+
+	// The endpoint the operator opted in reaches the loopback address it was opted
+	// into.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := optIn.Do(req)
+	if err != nil {
+		t.Fatalf("an endpoint flagged internal could not reach a loopback address: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// The same endpoint without the flag is refused at the dial hook, so nothing
+	// reaches the sink - the same failure the pre-attempt check produces.
+	req, err = http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	if resp, err = public.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("a client without the escape hatch connected to a loopback address; FR-1005's dial hook did not run")
+	}
+	if !errors.Is(err, ssrf.ErrBlocked) {
+		t.Fatalf("dial err = %v, want it to wrap ssrf.ErrBlocked", err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("the sink saw %d requests, want 1: the refused dial reached it", got)
 	}
 }
