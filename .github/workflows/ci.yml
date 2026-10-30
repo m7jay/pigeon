@@ -245,10 +245,13 @@ jobs:
           # (TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase).
           # OPS-3's coverage guard (card `t_44795f13`): .env.example claims to be
           # the complete list of settings, so the test that holds the claim now
-          # scans every non-test .go file in the repository and compose.yaml's own
-          # interpolations, not just internal/config/config.go. Registered so the
-          # deployables' knobs - the portals', doctor's, the load harness's - cannot
-          # drift out from under it unnoticed.
+          # scans every non-test .go file of this module - not a nested module, a
+          # module cache, a nested checkout, vendor/, node_modules/ or testdata/ -
+          # plus compose.yaml's own interpolations, not just
+          # internal/config/config.go. Registered so the deployables' knobs - the
+          # portals', doctor's, the load harness's - cannot drift out from under it
+          # unnoticed, and so the tree that pins the scope rule
+          # (TestEnvKnobScanIgnoresOtherTrees) cannot be deleted quietly.
           for want in \
             TestCrossProducerReadsAreEmpty \
             TestProducersAreAdminOnly \
@@ -448,7 +451,8 @@ jobs:
             TestOIDCControlIsAbsentWhenUnconfiguredAndCallbackChecksState \
             TestLazyVerifierConstructsWithoutIO \
             TestLazyVerifierDiscoversOnceAndVerifies \
-            TestEnvExampleDocumentsEveryKnob
+            TestEnvExampleDocumentsEveryKnob \
+            TestEnvKnobScanIgnoresOtherTrees
           do
             if ! grep -q -- "--- PASS: ${want} " /tmp/go-test.log; then
               echo "required test did not pass: ${want}"
