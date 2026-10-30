@@ -130,7 +130,7 @@ func (s *Store) CreateConsumerEndpoint(ctx context.Context, sc Scope, consumerID
 	if err != nil {
 		return EndpointCreated{}, err
 	}
-	token := id.New("vrf") // high-entropy challenge, shown once
+	token, challengeHint := mintChallenge() // high-entropy challenge, shown once
 	// Minted before the insert because it is the AAD the values are sealed under
 	// (FR-1006).
 	endpointID := id.New("end")
@@ -147,7 +147,7 @@ func (s *Store) CreateConsumerEndpoint(ctx context.Context, sc Scope, consumerID
 			values ($1,$2,$3,$4,$5,$6,$7,false,$8, $9, $10, $11, $12)
 			returning `+endpointSelectCols,
 			endpointID, sc.ProducerID, sc.Env, consumerID, name, url, email, sealed,
-			tokenHash(token), token[:8], secret, hint,
+			tokenHash(token), challengeHint, secret, hint,
 		)
 		var scanErr error
 		ep, scanErr = scanEndpoint(row)
@@ -351,6 +351,73 @@ func (s *Store) RotateConsumerEndpointSecret(ctx context.Context, sc Scope, cons
 		return EndpointSecret{}, err
 	}
 	return out, nil
+}
+
+// EndpointChallenge is the one-time ownership-challenge token and its safe-to-display
+// prefix. It is minted by the same helper registration does (mintChallenge), so
+// the format cannot drift, and it is never read back or hashed: the caller only
+// ever receives it once, through the creation response and the re-issue route.
+type EndpointChallenge struct {
+	Token string
+	Hint  string
+}
+
+// ReissueEndpointChallenge mints a fresh ownership-challenge token for one of the
+// caller's endpoints (FR-409, SPEC.md A-12). Each call replaces both
+// verification_token_hash and verification_hint in a single UPDATE with the same
+// predicate the /rotate and /verify routes carry, so verified_at is untouched and
+// the previous token stops verifying when the write commits. There is no overlap
+// window: no counterparty holds a challenge token, and the registrant is the only
+// one who mints a new one.
+//
+// The store predicate (producer_id, env, consumer_id, id, status <> 'deleted')
+// means a foreign, unknown or deleted id never matches: the UPDATE affects zero
+// rows and the method answers ErrNotFound, so the API cannot not touch another
+// consumer's endpoint or a deleted one (AC-39).
+//
+// An already-verified endpoint is refused with ErrConflict, no state change: a
+// re-issue is a recovery for an unverified endpoint, and the requirement keeps
+// verified as one-way. Because the predicate carries verified_at is null only at
+// the API's two write call sites, a zero-row update is resolved by a read-first
+// policy: the method reads the row first so "identity exists and is verified"
+// answers 409 instead of 404, and "identity does not exist" answers 404.
+func (s *Store) ReissueEndpointChallenge(ctx context.Context, sc Scope, consumerID, endpointID string) (EndpointChallenge, error) {
+	token, hint := mintChallenge()
+	var verifiedAt *time.Time
+	err := s.scoped(ctx, sc, func(tx pgx.Tx) error {
+		// Read the row first so a verified endpoint answers 409 rather than 404,
+		// and a foreign/unknown/deleted id answers 404 rather than minting a token.
+		// The UPDATE predicate (producer_id, env, consumer_id, id, status <> 'deleted')
+		// must not mint a token for an id outside this consumer's own unverified
+		// endpoints.
+		row := tx.QueryRow(ctx, `
+			select verified_at
+			from endpoints
+			where producer_id = $1 and env = $2 and consumer_id = $3 and id = $4 and status <> 'deleted'`,
+			sc.ProducerID, sc.Env, consumerID, endpointID)
+		if err := row.Scan(&verifiedAt); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if verifiedAt != nil {
+			return ErrConflict
+		}
+		_, err := tx.Exec(ctx, `
+			update endpoints
+			set verification_token_hash = $5, verification_hint = $6
+			where producer_id = $1 and env = $2 and consumer_id = $3 and id = $4 and status <> 'deleted'`,
+			sc.ProducerID, sc.Env, consumerID, endpointID, tokenHash(token), hint)
+		if err != nil {
+			return mapPgError(err, ErrConflict, ErrNotFound)
+		}
+		return nil
+	})
+	if err != nil {
+		return EndpointChallenge{}, err
+	}
+	return EndpointChallenge{Token: token, Hint: hint}, nil
 }
 
 // DeleteConsumerEndpoint is FR-407's soft delete, consumer-scoped: the row is

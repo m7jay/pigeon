@@ -110,6 +110,13 @@ type endpointDetail struct {
 	Paused            bool
 	NotificationEmail string
 	CreatedAt         string
+	// ReissuedToken and ReissuedHint are FR-409's one-time re-issue response:
+	// each call to the ownership-challenge re-issue route mints a fresh token and
+	// hint and answers 201; the page that follows shows the token exactly once,
+	// with a copy warning and a Verify now button. They are empty until the
+	// re-issue handler sets them from the API's response.
+	ReissuedToken string
+	ReissuedHint  string
 	// RotatedSecret is set only on the render that follows a rotation (UI-13):
 	// the new signing secret exists in exactly one API response, so the page that
 	// shows it is rendered from that response rather than redirected to.
@@ -531,6 +538,40 @@ func (h *Handler) endpointRotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detail.RotatedSecret = rotated.SigningSecret
+	h.renderPage(w, r, "endpoint", detail.Name, "endpoints", detail)
+}
+
+// endpointReissue is UI-13's re-issue: it asks the API for a fresh ownership
+// challenge token and hint for one of the caller's own endpoints. The API answers
+// 201 with the creation response's field names, so this handler renders the
+// detail page from that response, showing the new token exactly once, with a
+// copy warning and a Verify now button.
+func (h *Handler) endpointReissue(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	resp, err := h.coreReq(r, http.MethodPost, "/v1/consumer/endpoints/"+id+"/challenge", nil)
+	if notAuthed(resp, err, w, r, h) {
+		return
+	}
+	if resp.Status != http.StatusCreated {
+		h.setFlash(w, "error", coreErrorMessage(resp))
+		http.Redirect(w, r, "/endpoints/"+id, http.StatusSeeOther)
+		return
+	}
+	var chal struct {
+		VerificationToken string `json:"verification_token"`
+		VerificationHint  string `json:"verification_hint"`
+	}
+	if err := json.Unmarshal(resp.Body, &chal); err != nil {
+		h.setFlash(w, "error", "The re-issued token could not be read.")
+		http.Redirect(w, r, "/endpoints/"+id, http.StatusSeeOther)
+		return
+	}
+	detail, ok := h.endpointDetailView(w, r, id)
+	if !ok {
+		return
+	}
+	detail.ReissuedToken = chal.VerificationToken
+	detail.ReissuedHint = chal.VerificationHint
 	h.renderPage(w, r, "endpoint", detail.Name, "endpoints", detail)
 }
 

@@ -230,16 +230,39 @@ func (s *Server) handleConsumerRotateEndpointSecret(w http.ResponseWriter, r *ht
 		s.storeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, endpointRotatedJSON{
-		SigningSecret:     sec.Secret,
-		SigningSecretHint: sec.Hint,
-	})
-}
+		writeJSON(w, http.StatusCreated, endpointRotatedJSON{
+			SigningSecret:     sec.Secret,
+			SigningSecretHint: sec.Hint,
+		})
+	}
 
-// endpointRotatedJSON is the 201 body of a rotation: the new secret and its safe
-// hint, returned exactly once. It is deliberately not an endpointJSON: the row did
-// not change, only the credential did.
-type endpointRotatedJSON struct {
+	// handleConsumerReissueEndpointChallenge is POST
+	// /v1/consumer/endpoints/{endpointID}/challenge (FR-409, SPEC.md A-12). A member
+	// re-issues the ownership challenge for one of the caller's own endpoints. Each
+	// call mints a fresh token and hint, and answers 201 with the creation
+	// response's own field names (verification_token, verification_hint). The route
+	// is therefore not idempotent. A foreign or deleted id is a 404 (AC-39); an
+	// already-verified endpoint is a 409 (AC-54).
+	func (s *Server) handleConsumerReissueEndpointChallenge(w http.ResponseWriter, r *http.Request) {
+		sc, cid := s.consumerScopeOrNotFound(w, r)
+		if cid == "" {
+			return
+		}
+		challenge, err := s.deps.Data.ReissueEndpointChallenge(r.Context(), sc, cid, r.PathValue("endpointID"))
+		if err != nil {
+			s.storeError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, endpointReissuedJSON{
+			VerificationToken: challenge.Token,
+			VerificationHint:  challenge.Hint,
+		})
+	}
+
+	// endpointRotatedJSON is the 201 body of a rotation: the new secret and its safe
+	// hint, returned exactly once. It is deliberately not an endpointJSON: the row did
+	// not change, only the credential did.
+	type endpointRotatedJSON struct {
 	SigningSecret     string `json:"signing_secret"`
 	SigningSecretHint string `json:"signing_secret_hint"`
 }

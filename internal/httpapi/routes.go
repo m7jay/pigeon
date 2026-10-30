@@ -152,6 +152,12 @@ func (s *Server) routes() []route {
 		{http.MethodPatch, "/v1/producer/consumers/{consumerID}/endpoints/{endpointID}", kindMember, s.handlePatchEndpoint},
 		{http.MethodDelete, "/v1/producer/consumers/{consumerID}/endpoints/{endpointID}", kindMember, s.handleDeleteEndpoint},
 		{http.MethodPost, "/v1/producer/consumers/{consumerID}/endpoints/{endpointID}/verify", kindMember, s.handleVerifyEndpoint},
+		// FR-409/AC-54: the ownership challenge is re-issuable until it is
+		// answered. A member re-issues it; each call mints a new token and hint
+		// and answers 201 with the creation response's own field names, so it is
+		// not idempotent. A foreign, unknown or deleted id is 404 (AC-39); an
+		// already-verified endpoint is 409.
+		{http.MethodPost, "/v1/producer/consumers/{consumerID}/endpoints/{endpointID}/challenge", kindMember, s.handleReissueEndpointChallenge},
 		// FR-501..FR-512: the (endpoint, event_type) subscriptions.
 		{http.MethodGet, "/v1/producer/endpoints/{endpointID}/subscriptions", kindMember, s.handleListSubscriptions},
 		{http.MethodPost, "/v1/producer/endpoints/{endpointID}/subscriptions", kindMember, s.handleCreateSubscription},
@@ -188,8 +194,9 @@ func (s *Server) routes() []route {
 		{http.MethodPatch, "/v1/consumer/endpoints/{endpointID}", kindConsumer, s.handleConsumerPatchEndpoint},
 		{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/rotate", kindConsumer, s.handleConsumerRotateEndpointSecret},
 		{http.MethodDelete, "/v1/consumer/endpoints/{endpointID}", kindConsumer, s.handleConsumerDeleteEndpoint},
-		{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/verify", kindConsumer, s.handleConsumerVerifyEndpoint},
-		{http.MethodGet, "/v1/consumer/endpoints/{endpointID}/subscriptions", kindConsumer, s.handleConsumerListSubscriptions},
+				{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/verify", kindConsumer, s.handleConsumerVerifyEndpoint},
+				{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/challenge", kindConsumer, s.handleConsumerReissueEndpointChallenge},
+				{http.MethodGet, "/v1/consumer/endpoints/{endpointID}/subscriptions", kindConsumer, s.handleConsumerListSubscriptions},
 		{http.MethodPost, "/v1/consumer/endpoints/{endpointID}/subscriptions", kindConsumer, s.handleConsumerCreateSubscription},
 		{http.MethodDelete, "/v1/consumer/endpoints/{endpointID}/subscriptions/{eventType}", kindConsumer, s.handleConsumerDeleteSubscription},
 

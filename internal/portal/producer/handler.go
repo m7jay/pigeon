@@ -187,6 +187,7 @@ func (h *Handler) Handler() http.Handler {
 	mux.HandleFunc("GET /endpoints/{id}", h.member(h.endpointDetail))
 	mux.HandleFunc("POST /endpoints/{id}/verify", h.member(h.endpointVerify))
 	mux.HandleFunc("POST /endpoints/{id}/rotate", h.member(h.endpointRotate))
+	mux.HandleFunc("POST /endpoints/{id}/challenge", h.member(h.endpointReissue))
 	mux.HandleFunc("POST /endpoints/{id}/pause", h.member(h.endpointSetPaused(true)))
 	mux.HandleFunc("POST /endpoints/{id}/resume", h.member(h.endpointSetPaused(false)))
 

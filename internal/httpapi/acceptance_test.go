@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -629,18 +630,151 @@ func TestTestAndLivePlanesAreSeparate(t *testing.T) {
 	if got := errorCode(t, raw); got != "env_required" {
 		t.Fatalf("error code = %q, want env_required", got)
 	}
-	code, raw = e.do(http.MethodGet, "/v1/producer/consumers?env=staging", tn.OwnerToken, nil)
-	mustStatus(t, code, raw, http.StatusBadRequest)
-	if got := errorCode(t, raw); got != "invalid_env" {
-		t.Fatalf("error code = %q, want invalid_env", got)
+		code, raw = e.do(http.MethodGet, "/v1/producer/consumers?env=staging", tn.OwnerToken, nil)
+		mustStatus(t, code, raw, http.StatusBadRequest)
+		if got := errorCode(t, raw); got != "invalid_env" {
+			t.Fatalf("error code = %q, want invalid_env", got)
+		}
+
+		// A key is scoped to one environment and cannot address the other.
+		code, raw = e.do(http.MethodGet, "/v1/whoami", tn.KeyPlain, nil)
+		mustStatus(t, code, raw, http.StatusOK)
+		if who := decode[struct {
+			Env string `json:"env"`
+		}](t, raw); who.Env != "live" {
+			t.Fatalf("key env = %q, want live", who.Env)
+		}
 	}
 
-	// A key is scoped to one environment and cannot address the other.
-	code, raw = e.do(http.MethodGet, "/v1/whoami", tn.KeyPlain, nil)
+	// TestAC54ReIssueEndpointChallenge is AC-54's acceptance test, asserted at the
+	// acceptance layer: a member re-issues the ownership challenge for an endpoint
+	// that has not yet been verified. Each call mints a fresh token and hint and
+	// answers 201 with the creation response's own field names. The fresh token is
+	// the only value that verifies; the registration token is retired. A foreign,
+	// unknown or deleted id is 404 (AC-39); a verified endpoint is 409. No read
+	// route returns the token or its hash, and an unverified endpoint keeps its
+	// not_delivered:endpoint_unverified delivery row.
+	func TestAC54ReIssueEndpointChallenge(t *testing.T) {
+	e := setup(t)
+	tn := e.seedTenant(t, "ac54-reissue")
+	seedCrossProducerEventType(t, e, tn)
+
+	// Register an endpoint through the producer path: the token is shown exactly
+	// once, at registration.
+	code, raw := e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints?env=live", tn.OwnerToken,
+		map[string]string{"name": "ac54", "url": "https://8.8.8.8/hook"})
+	mustStatus(t, code, raw, http.StatusCreated)
+	created := decode[endpointCreatedJSON](t, raw)
+	regToken := created.VerificationToken
+	if regToken == "" {
+		t.Fatalf("registration did not reveal a token: %s", raw)
+	}
+
+	// A member re-issues the challenge: 201 with the token and hint.
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/challenge?env=live",
+		tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusCreated)
+	frac := decode[endpointReissuedJSON](t, raw)
+	if frac.VerificationToken == "" || frac.VerificationHint == "" {
+		t.Fatalf("re-issue did not return the token and hint: %s", raw)
+	}
+	if frac.VerificationToken == regToken {
+		t.Fatal("re-issue minted the registration token again; the new value is stale")
+	}
+	if !strings.HasPrefix(frac.VerificationToken, frac.VerificationHint) || len(frac.VerificationHint) != 8 {
+		t.Fatalf("hint %q is not the first 8 characters of the token", frac.VerificationHint)
+	}
+
+	// The endpoint is still unverified: verified_at is untouched by the reissue.
+	var nullFlag bool
+	if err := e.admin.QueryRow(context.Background(),
+		"select verified_at is null from endpoints where id = $1", created.ID).Scan(&nullFlag); err != nil {
+		t.Fatalf("read verified_at: %v", err)
+	}
+	if !nullFlag {
+		t.Fatal("re-issue changed verified_at")
+	}
+
+	// The fresh token verifies; the registration token does not (the hash was
+	// replaced, so the old value is 422).
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/verify?env=live",
+		tn.OwnerToken, map[string]string{"token": frac.VerificationToken})
+	mustStatus(t, code, raw, http.StatusNoContent)
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/verify?env=live",
+		tn.OwnerToken, map[string]string{"token": regToken})
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("registration token still verifies after reissue: %d (%s)", code, raw)
+	}
+
+	// A consumer re-issues its own endpoint: 201.
+	tc := e.seedTenant(t, "ac54-consumer")
+	seedCrossProducerEventType(t, e, tc)
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tc.ConsumerID+"/endpoints?env=live", tc.OwnerToken,
+		map[string]string{"name": "cc", "url": "https://8.8.8.8/hook"})
+	mustStatus(t, code, raw, http.StatusCreated)
+	cc := decode[endpointCreatedJSON](t, raw)
+	code, raw = e.do(http.MethodPost,
+		"/v1/consumer/endpoints/"+cc.ID+"/challenge", tc.ConsumerToken, nil)
+	mustStatus(t, code, raw, http.StatusCreated)
+	frac = decode[endpointReissuedJSON](t, raw)
+	if frac.VerificationToken == "" || frac.VerificationHint == "" {
+		t.Fatalf("consumer re-issue did not return the token and hint: %s", raw)
+	}
+
+	// 404 for a foreign, unknown and deleted id, on both routes.
+	tn2 := e.seedTenant(t, "ac54-other")
+	seedCrossProducerEventType(t, e, tn2)
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn2.ConsumerID+"/endpoints?env=live", tn2.OwnerToken,
+		map[string]string{"name": "other", "url": "https://8.8.8.8/hook"})
+	mustStatus(t, code, raw, http.StatusCreated)
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn2.ConsumerID+"/endpoints/"+created.ID+"/challenge?env=live",
+		tn2.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusNotFound)
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/nope999/challenge?env=live",
+		tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusNotFound)
+	e.admin.Exec(context.Background(),
+		"update endpoints set status = 'deleted' where id = $1", created.ID)
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/challenge?env=live",
+		tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusNotFound)
+	e.admin.Exec(context.Background(), "update endpoints set status = 'active' where id = $1", created.ID)
+
+	// 409 on an already-verified endpoint, with verified_at unchanged.
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/challenge?env=live",
+		tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusConflict)
+	code, raw = e.do(http.MethodPost,
+		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/challenge?env=live",
+		tn.OwnerToken, nil)
+	mustStatus(t, code, raw, http.StatusConflict)
+
+	// No read route returns the token or its hash.
+	code, raw = e.do(http.MethodGet,
+		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"?env=live",
+		tn.OwnerToken, nil)
 	mustStatus(t, code, raw, http.StatusOK)
-	if who := decode[struct {
-		Env string `json:"env"`
-	}](t, raw); who.Env != "live" {
-		t.Fatalf("key env = %q, want live", who.Env)
+	if strings.Contains(string(raw), regToken) || strings.Contains(string(raw), frac.VerificationToken) {
+		t.Fatalf("read route returns a challenge token: %s", raw)
+	}
+
+	// The instance admin has no such route: the re-issue route lives on the
+	// member and consumer planes, never on the admin surface.
+	code, raw = e.do(http.MethodPost,
+		"/v1/admin/producers/"+tn.ID+"/endpoints/"+created.ID+"/challenge", e.adminToken, nil)
+	if code != http.StatusNotFound {
+		t.Fatalf("instance admin should not have a challenge re-issue route: %d", code)
 	}
 }
+
+

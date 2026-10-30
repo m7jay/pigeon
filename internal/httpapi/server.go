@@ -88,10 +88,11 @@ type Data interface {
 	CreateConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID string, in store.NewConsumerEndpoint) (store.EndpointCreated, error)
 	GetConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.Endpoint, error)
 	UpdateConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string, p store.ConsumerEndpointPatch) (store.Endpoint, error)
-	RotateConsumerEndpointSecret(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.EndpointSecret, error)
-	DeleteConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string) error
-	VerifyConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID, token string) error
-	ListSubscribableEventTypes(ctx context.Context, sc store.Scope) ([]store.SubscribableEventType, error)
+			RotateConsumerEndpointSecret(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.EndpointSecret, error)
+			DeleteConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID string) error
+			VerifyConsumerEndpoint(ctx context.Context, sc store.Scope, consumerID, endpointID, token string) error
+			ReissueEndpointChallenge(ctx context.Context, sc store.Scope, consumerID, endpointID string) (store.EndpointChallenge, error)
+			ListSubscribableEventTypes(ctx context.Context, sc store.Scope) ([]store.SubscribableEventType, error)
 	ListConsumerSubscriptions(ctx context.Context, sc store.Scope, consumerID, endpointID string) ([]store.Subscription, error)
 	CreateConsumerSubscription(ctx context.Context, sc store.Scope, consumerID, endpointID, eventType string) (store.Subscription, error)
 	DeleteConsumerSubscription(ctx context.Context, sc store.Scope, consumerID, endpointID, eventType string) error

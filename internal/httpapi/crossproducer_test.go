@@ -529,9 +529,20 @@ var crossProducerCases = map[string]cpCase{
 		},
 		want: http.StatusNotFound,
 	},
+	"POST /v1/producer/consumers/{consumerID}/endpoints/{endpointID}/challenge": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/producer/consumers/" + b.ConsumerID + "/endpoints/" + b.EndpointID + "/challenge?env=live", nil
+		},
+		want: http.StatusNotFound,
+	},
+	"POST /v1/consumer/endpoints/{endpointID}/challenge": {
+		build: func(a, b *tenant) (string, any) {
+			return "/v1/consumer/endpoints/" + b.EndpointID + "/challenge", nil
+		},
+		want: http.StatusNotFound,
+	},
 
 	// --- S7: the inspect and replay surface (§11, FR-1101..FR-1111) --------
-
 	"GET /v1/producer/deliveries": {
 		build: func(a, b *tenant) (string, any) { return "/v1/producer/deliveries?env=live", nil },
 		want:  http.StatusOK,
