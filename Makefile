@@ -29,8 +29,11 @@ build:
 # - -count=1 because the test cache cannot see the database: a PASS cached
 #   before a migration or a fixture change is not evidence.
 #
-# The database's name must contain "test": every harness refuses to touch any
-# other. PIGEON_TEST_REDIS_URL is optional here (unlike CI, which sets it): the
+# The database's name must contain "test": internal/httpapi and internal/relay
+# refuse any other name, and the other DB-backed harnesses - store, delivery,
+# identity, db, faults - have no such check: they migrate and truncate whatever
+# database the DSN names. Point the DSN at a disposable database you do not care
+# about. PIGEON_TEST_REDIS_URL is optional here (unlike CI, which sets it): the
 # Redis-backed packages fall back to an in-process miniredis when it is unset.
 test:
 	@test -n "$$PIGEON_TEST_DATABASE_URL" || { \
