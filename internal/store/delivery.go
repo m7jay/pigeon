@@ -19,10 +19,10 @@ import (
 // evidence, FR-812) lives here in one layer rather than in the worker.
 
 // LeasedDelivery is one delivery row the worker has claimed. The claim returns
-// the envelope fields, the endpoint's signing secret, and the attempt
-// bookkeeping in one round trip, so the worker can sign and POST from a single
-// read. The signing secret travels out only to the sign call: it is never logged,
-// stored in an attempt row, or returned by any API (FR-1008).
+// the envelope fields, the endpoint's signing secret and FR-402 flag, and the
+// attempt bookkeeping in one round trip, so the worker can sign and POST from a
+// single read. The signing secret travels out only to the sign call: it is never
+// logged, stored in an attempt row, or returned by any API (FR-1008).
 type LeasedDelivery struct {
 	DeliveryID    int64
 	EventID       string
@@ -30,6 +30,15 @@ type LeasedDelivery struct {
 	Env           string
 	EndpointID    string
 	EndpointURL   string
+	// EndpointInternal is FR-402's escape hatch for this endpoint: the operator's
+	// explicit opt-in to a private, loopback or link-local URL. It comes back
+	// with the claim because FR-1005's request-time SSRF check needs it before an
+	// attempt, and this is the only endpoint read the worker makes (0022). A
+	// separate read by endpoint id cannot work: the runtime pool is
+	// RLS-constrained, the endpoints policies are tenant-scoped, and the worker
+	// has no tenant at that point - the flag would read as absent and the
+	// endpoint would be treated as public, which makes the hatch inert.
+	EndpointInternal bool
 	SigningSecret string
 	// PreviousSigningSecret is the secret this endpoint used before its most
 	// recent rotation, and PreviousSecretExpiresAt is when the 24 h overlap ends
@@ -197,7 +206,8 @@ func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow tim
 		occurred_at, payload, prior_attempts, row_attempts, first_attempt_at,
 		next_attempt_at, retry_deadline,
 		max_retries, retry_backoff_base_s, retry_backoff_max_s, retry_window_s,
-		delivery_timeout_ms, max_concurrency, max_rps, held_back, custom_headers
+		delivery_timeout_ms, max_concurrency, max_rps, held_back, custom_headers,
+		endpoint_internal
 		from pigeon_claim_delivery($1, $2, $3)`, lease, defaultRetryWindow, string(class),
 	).Scan(&d.DeliveryID, &d.EventID, &d.ProducerID, &d.Env, &d.EndpointID,
 		&d.EndpointURL, &d.SigningSecret, &previousSecret, &d.PreviousSecretExpiresAt,
@@ -205,7 +215,8 @@ func (s *Store) ClaimDelivery(ctx context.Context, lease, defaultRetryWindow tim
 		&d.ConsumerRef, &d.OccurredAt, &d.Payload, &d.PriorAttempts, &d.RowAttempts, &d.FirstAttemptAt,
 		&d.NextAttemptAt, &d.RetryDeadline,
 		&d.Endpoint.MaxRetries, &backoffBaseS, &backoffMaxS, &retryWindowS,
-		&timeoutMS, &d.Endpoint.MaxConcurrency, &d.Endpoint.MaxRPS, &d.HeldBack, &sealedHeaders)
+		&timeoutMS, &d.Endpoint.MaxConcurrency, &d.Endpoint.MaxRPS, &d.HeldBack, &sealedHeaders,
+		&d.EndpointInternal)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return d, false, nil
 	}

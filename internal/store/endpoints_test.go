@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/m7jay/pigeon/internal/ssrf"
 )
@@ -110,6 +112,99 @@ func TestCreateEndpointInternalAllowsPrivate(t *testing.T) {
 	}
 	if !created.Endpoint.Internal {
 		t.Fatalf("endpoint not marked internal")
+	}
+}
+
+// mustEndpointWithFlag registers and verifies an endpoint with FR-402's flag set
+// as asked. The shared mustVerifiedEndpoint always registers public, and a private
+// URL cannot be registered without the flag (FR-402 refuses it before the row
+// exists), so the flag is the only variable here.
+func mustEndpointWithFlag(t *testing.T, st *Store, sc Scope, consumerID, name, url string, internal bool) Endpoint {
+	t.Helper()
+	created, err := st.CreateEndpoint(context.Background(), sc, NewEndpoint{
+		ConsumerID: consumerID, Name: name, URL: url, Internal: internal,
+	})
+	if err != nil {
+		t.Fatalf("CreateEndpoint(%s): %v", name, err)
+	}
+	if err := st.VerifyEndpoint(context.Background(), sc, created.Endpoint.ID, created.VerificationToken); err != nil {
+		t.Fatalf("VerifyEndpoint(%s): %v", name, err)
+	}
+	return created.Endpoint
+}
+
+// TestClaimCarriesTheEndpointInternalFlag is FR-402's escape hatch at the boundary
+// FR-1005's request-time check reads it from (0022): the claim reports the
+// endpoint's own opt-in, so the worker never has to read `endpoints` itself.
+//
+// That read cannot work and is no longer attempted. This store is on the runtime
+// pool, exactly as the worker's is, and the endpoints policies are scoped by
+// producer and env - the worker holds no scope when it judges an attempt, so a
+// read by id finds no row. It then fails in the direction that silently disables
+// the hatch: the flag reads false, an endpoint the operator opted into is treated
+// as public, and every attempt to it ends terminally at the SSRF check before a
+// socket is opened.
+//
+// Both directions are asserted, because a claim that answered only one of them
+// would satisfy a single-direction test while breaking a requirement: the `true`
+// is what lets the opted-in endpoint be dialled at all, and the `false` is what
+// keeps AC-19's refusal in place.
+func TestClaimCarriesTheEndpointInternalFlag(t *testing.T) {
+	admin := testPool(t)
+	resetRoutingTables(t, admin)
+	st := New(appPool(t, admin))
+	ctx := context.Background()
+	pid := seedRoutingProducer(t, admin, "fr402claim")
+	sc := Scope{ProducerID: pid, Env: "test"}
+
+	et := mustConsumerEvent(t, st, sc, "probe.created")
+	con := mustConsumer(t, st, sc, "loop", "Loopback")
+
+	// The public endpoint is registered at a public literal rather than at a
+	// private one with the flag cleared: FR-402 refuses a private URL at
+	// registration without the flag, so the flag is the only thing that differs.
+	optIn := mustEndpointWithFlag(t, st, sc, con.ID, "sink", "http://127.0.0.1:9001/hook", true)
+	public := mustEndpointWithFlag(t, st, sc, con.ID, "receiver", "https://8.8.8.8/hook", false)
+	mustSubscribe(t, st, sc, optIn.ID, et.Name)
+	mustSubscribe(t, st, sc, public.ID, et.Name)
+
+	pub, err := st.PublishEvent(ctx, sc, PublishInput{
+		EventType:   et.Name,
+		Payload:     json.RawMessage(`{}`),
+		ConsumerRef: ptr(con.Ref),
+	})
+	if err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	if _, err := st.FanOutEvent(ctx, sc, pub.ID); err != nil {
+		t.Fatalf("FanOutEvent: %v", err)
+	}
+
+	claimed := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		d, ok, err := st.ClaimDelivery(ctx, 40*time.Second, 72*time.Hour, AttemptClassAny)
+		if err != nil {
+			t.Fatalf("claim %d: %v", i+1, err)
+		}
+		if !ok {
+			t.Fatalf("claim %d found nothing, want one delivery per subscribed endpoint", i+1)
+		}
+		claimed[d.EndpointID] = d.EndpointInternal
+	}
+
+	got, ok := claimed[optIn.ID]
+	if !ok {
+		t.Fatalf("no delivery was claimed for the opted-in endpoint %s", optIn.ID)
+	}
+	if !got {
+		t.Error("the claim reported the opted-in endpoint as public, so FR-402's hatch cannot reach FR-1005's request-time check")
+	}
+	got, ok = claimed[public.ID]
+	if !ok {
+		t.Fatalf("no delivery was claimed for endpoint %s", public.ID)
+	}
+	if got {
+		t.Error("the claim reported an endpoint without the flag as internal, which widens what the worker may dial (FR-402/AC-19)")
 	}
 }
 

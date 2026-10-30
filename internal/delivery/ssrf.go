@@ -1,9 +1,7 @@
 package delivery
 
 import (
-	"context"
 	"fmt"
-	"sync"
 
 	"github.com/m7jay/pigeon/internal/ssrf"
 	"github.com/m7jay/pigeon/internal/store"
@@ -21,8 +19,18 @@ import (
 //     connection, and the dial hook has no such gap because it sees the resolved
 //     address immediately before connect(2).
 //
-// Both take the endpoint's FR-402 escape hatch from its own row, never from
-// anything the endpoint can influence at request time.
+// Both take the endpoint's FR-402 escape hatch from the claim row, never from
+// anything the endpoint can influence at request time, and never from a read of
+// their own: the flag arrives beside the URL and the signing secret, read by
+// pigeon_claim_delivery under its own definer rights (0022). A worker-side read by
+// endpoint id cannot work - the runtime pool is RLS-constrained, the policies on
+// `endpoints` are scoped by producer and env, and the worker has no tenant at that
+// point. Worse, it fails in the direction that silently disables the hatch: the
+// read finds no row, the flag reads false, and an endpoint the operator explicitly
+// opted in is treated as public and refused, terminally, before a socket is
+// opened. Carrying the flag in the claim removes that failure mode rather than
+// handling it - a claim that cannot return the flag yields no delivery to attempt -
+// and it costs no extra query, because the claim already reads this row.
 
 // ssrfRefusal returns the terminal attempt result for a URL that must not be
 // called, and whether it refused. A terminal result is the right classification:
@@ -43,57 +51,4 @@ func ssrfRefusal(d store.LeasedDelivery, allowPrivate bool) (attemptResult, bool
 		}, true
 	}
 	return attemptResult{}, false
-}
-
-// endpointInternalCache remembers FR-402's flag per endpoint. The claim path does
-// not carry it, and reading it per attempt would put a query on the hot path for a
-// value that changes only when an operator changes it.
-//
-// A lookup that fails is cached as "not internal": a database that cannot answer
-// must not be able to widen what the worker may dial, so the failure mode is the
-// restrictive one.
-type endpointInternalCache struct {
-	mu sync.RWMutex
-	m  map[string]bool
-}
-
-func newEndpointInternalCache() *endpointInternalCache {
-	return &endpointInternalCache{m: map[string]bool{}}
-}
-
-func (c *endpointInternalCache) get(endpointID string) (bool, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	v, ok := c.m[endpointID]
-	return v, ok
-}
-
-func (c *endpointInternalCache) set(endpointID string, internal bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.m[endpointID] = internal
-}
-
-// endpointAllowsPrivate reports whether the attempt may dial a private address.
-//
-// A lookup error is logged at debug and treated as "not internal". Refusing to
-// deliver because a flag could not be read would be a worse failure than
-// delivering to a public address, and the dial-time control still blocks the
-// private one - so the only outcome of a failed lookup is that an internal
-// endpoint's delivery fails closed.
-func (w *Worker) endpointAllowsPrivate(ctx context.Context, endpointID string) bool {
-	if v, ok := w.internalFlags.get(endpointID); ok {
-		return v
-	}
-	internal, err := w.store.EndpointIsInternal(ctx, endpointID)
-	if err != nil {
-		w.log.Debug("delivery: endpoint internal flag unreadable; treating as public (FR-402)",
-			"endpoint_id", endpointID, "error", err)
-		// Cache the restrictive answer: a broken read should not cost a query per
-		// attempt for a value that is probably still false.
-		w.internalFlags.set(endpointID, false)
-		return false
-	}
-	w.internalFlags.set(endpointID, internal)
-	return internal
 }
