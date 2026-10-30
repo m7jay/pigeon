@@ -1268,8 +1268,9 @@ rotation of the signing secret:
   overlap: the overlap exists because a receiver holds the outgoing secret and verifies
   signatures with it, and no counterparty holds a challenge token - only the registrant, who
   is the one asking for a new one.
-- **an already verified endpoint is refused** (`409`, no state change). Verified is one-way in
-  v1.0: FR-403 has no de-verification clause. Clearing `verified_at` would add an un-verify
+- **an already verified endpoint is refused** (`409`, no state change, with a body that names the
+  state rather than the generic `conflict` message the store's other 409s carry). Verified is
+  one-way in v1.0: FR-403 has no de-verification clause. Clearing `verified_at` would add an un-verify
   lever no requirement asks for, and minting a token that cannot change anything would be a
   dead credential that a support conversation would read as meaningful. Pause and delete
   remain the ways to take an endpoint out of service.
@@ -1277,10 +1278,14 @@ rotation of the signing secret:
   (`0007_routing.sql:45-46`), the token is minted by the helper creation already uses
   (`id.New("vrf")`, `vrf_` plus 24 hex), and the answer path is untouched: constant-time
   compare against the stored digest plus FR-1005's URL re-check.
-- **log-only record**: the action is logged with actor and request id (LOG-1…LOG-4) like every
-  other mutation. It writes no `admin_audit_log` row, which is MT-5's instance-admin log rather
-  than a tenant table, and per-tenant audit history stays deferred to v1.1 (§17.1, Q5). When it
-  lands, re-issue joins it as rotation will.
+- **no audit row, and no per-mutation log line of its own**: like FR-404's rotation, a re-issue
+  writes no `admin_audit_log` row, because that table is MT-5's instance-admin log rather than a
+  tenant table, and it adds no log line where the rotation adds none. v1.0's audit story is
+  log-only - §20's Q5 resolution is the record, and per-tenant audit history is deferred to v1.1
+  (§17.1). When it lands, re-issue joins it as rotation will. This is a deliberate deviation from
+  the wording of the option that required "an audit event": in v1.0 there is no tenant audit table
+  to record one in, and gating the recovery of a P0 flow on a deferred v1.1 feature is not a trade
+  this amendment makes.
 - **it arms an endpoint, not its events**: a re-issue re-fans-out nothing and touches no
   delivery row. Events published during the unverified window stay `skipped` and
   un-replayable, so they are recovered by re-publishing. Stated so "recoverable" is not read
