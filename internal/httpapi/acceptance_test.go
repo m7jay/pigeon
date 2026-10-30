@@ -659,11 +659,17 @@ func TestTestAndLivePlanesAreSeparate(t *testing.T) {
 func TestAC54ReIssueEndpointChallenge(t *testing.T) {
 	e := setup(t)
 	tn := e.seedTenant(t, "ac54-reissue")
-	seedCrossProducerEventType(t, e, tn)
+	tn.EventTypeName = strings.ReplaceAll(tn.Slug, "-", "") + ".order"
+	code, raw := e.do(http.MethodPost, "/v1/event-types", tn.KeyPlain, map[string]any{
+		"name":           tn.EventTypeName,
+		"payload_schema": map[string]any{"type": "object"},
+		"routing_mode":   "consumer",
+	})
+	mustStatus(t, code, raw, http.StatusCreated)
 
 	// Register an endpoint through the producer path: the token is shown exactly
 	// once, at registration.
-	code, raw := e.do(http.MethodPost,
+	code, raw = e.do(http.MethodPost,
 		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints?env=live", tn.OwnerToken,
 		map[string]string{"name": "ac54", "url": "https://8.8.8.8/hook"})
 	mustStatus(t, code, raw, http.StatusCreated)
@@ -707,6 +713,17 @@ func TestAC54ReIssueEndpointChallenge(t *testing.T) {
 	evt := decode[publishResponse](t, raw)
 	if evt.ID == "" {
 		t.Fatalf("publish returned no event id: %s", raw)
+	}
+
+	// Deliver the event synchronously through the store so the acceptance test
+	// can assert on the delivery set produced by the fan-out: the endpoint is
+	// unverified, so fan-out records a not_delivered:endpoint_unverified skip
+	// row (the re-issue arms the endpoint; it does not re-deliver the window).
+	if _, err := e.st.FanOutEvent(context.Background(), store.Scope{
+		ProducerID: tn.ID,
+		Env:        "live",
+	}, evt.ID); err != nil {
+		t.Fatalf("fan-out: %v", err)
 	}
 
 	// The endpoint is still unverified: verified_at is untouched by the reissue.
@@ -769,17 +786,53 @@ func TestAC54ReIssueEndpointChallenge(t *testing.T) {
 		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/challenge?env=live",
 		tn.OwnerToken, nil)
 	mustStatus(t, code, raw, http.StatusNotFound)
+	e.admin.Exec(context.Background(), "update endpoints set status = 'deleted' where id = $1", created.ID)
+	code, raw = e.do(http.MethodPost,
+		"/v1/consumer/endpoints/"+created.ID+"/challenge", tn.ConsumerToken, nil)
+	mustStatus(t, code, raw, http.StatusNotFound)
 	e.admin.Exec(context.Background(), "update endpoints set status = 'active' where id = $1", created.ID)
 
-	// 409 on an already-verified endpoint, with verified_at unchanged.
+	// The consumer-plane challenge route refuses the same names as the producer plane: a foreign consumer's endpoint id, an unknown id and a deleted id.
+	code, raw = e.do(http.MethodPost,
+		"/v1/consumer/endpoints/"+created.ID+"/challenge", tn2.ConsumerToken, nil)
+	mustStatus(t, code, raw, http.StatusNotFound)
+	code, raw = e.do(http.MethodPost,
+		"/v1/consumer/endpoints/nope999/challenge", tn.ConsumerToken, nil)
+	mustStatus(t, code, raw, http.StatusNotFound)
+
+	// 409 on an already-verified endpoint, with verified_at unchanged. A-12
+	// requires the refusal to name the state: code already_verified with the
+	// message "this endpoint is already verified; the challenge has been
+	// answered" - not the generic conflict wording the store's other 409s carry.
 	code, raw = e.do(http.MethodPost,
 		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/challenge?env=live",
 		tn.OwnerToken, nil)
 	mustStatus(t, code, raw, http.StatusConflict)
+	if got := errorCode(t, raw); got != "already_verified" {
+		t.Fatalf("producer-plane re-issue of a verified endpoint error code = %q, want already_verified", got)
+	}
+	if !strings.Contains(string(raw), "already verified") {
+		t.Fatalf("producer-plane re-issue of a verified endpoint message = %q, want 'already verified; the challenge has been answered'", raw)
+	}
+	code, raw = e.do(http.MethodPost,
+		"/v1/consumer/endpoints/"+created.ID+"/challenge", tn.ConsumerToken, nil)
+	mustStatus(t, code, raw, http.StatusConflict)
+	if got := errorCode(t, raw); got != "already_verified" {
+		t.Fatalf("consumer-plane re-issue of a verified endpoint error code = %q, want already_verified", got)
+	}
+	if !strings.Contains(string(raw), "already verified") {
+		t.Fatalf("consumer-plane re-issue of a verified endpoint message = %q, want 'already verified; the challenge has been answered'", raw)
+	}
 	code, raw = e.do(http.MethodPost,
 		"/v1/producer/consumers/"+tn.ConsumerID+"/endpoints/"+created.ID+"/challenge?env=live",
 		tn.OwnerToken, nil)
 	mustStatus(t, code, raw, http.StatusConflict)
+	if got := errorCode(t, raw); got != "already_verified" {
+		t.Fatalf("producer-plane re-issue of a verified endpoint error code = %q, want already_verified", got)
+	}
+	if !strings.Contains(string(raw), "already verified") {
+		t.Fatalf("producer-plane re-issue of a verified endpoint message = %q, want 'already verified; the challenge has been answered'", raw)
+	}
 
 	// No read route returns the token or its hash.
 	code, raw = e.do(http.MethodGet,
