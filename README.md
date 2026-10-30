@@ -230,6 +230,100 @@ Postgres and Redis reachability, Redis `appendonly`, clock skew, disk headroom,
 `ulimit -n`, the OPS-8 budget - one line per check under a stable id, with
 `--json` and an exit code (OPS-11).
 
+## Configuration checklist
+
+[`.env.example`](.env.example) is the complete list of settings, and `go test
+./internal/config` enforces that (OPS-3): `TestEnvExampleDocumentsEveryKnob` fails
+the build when a knob this module reads, or one `compose.yaml` interpolates
+itself, has no entry there, and `TestComposeRunsEachDeployableWithItsOwnKnobs`
+fails when a portal's knob is not forwarded to its container. The file carries
+every knob's default, clamp and ceiling; this checklist carries the decisions.
+
+Work through it once per environment. "Shipped" is the literal value in
+`.env.example`; **refused at boot** means the value is checked where it is read, so
+the process exits non-zero with one line naming the variable instead of starting
+misconfigured (OPS-7) - `pigeon doctor` reports the same validation without
+exiting (OPS-11).
+
+| Variable | What it is | Dev | Prod | Refused at boot at the shipped value? |
+|---|---|---|---|---|
+| `PIGEON_HEADERS_KEY` | at-rest key for endpoint custom header values: 32 bytes of base64 (FR-1006) | generated once: `openssl rand -base64 32` | same, generated once and kept - there is no rotation yet | **Yes** - the shipped placeholder is not base64 |
+| `PIGEON_INSTANCE_ADMIN_PASSWORD` | the first-run instance-admin credential (FR-101) | any value of 8+ characters that is not one of the six weak words | a long random value; used only on the first run, but validated on every boot | No - the shipped placeholder boots; empty, under 8 characters, or one of `password`, `changeme`, `admin`, `pigeon`, `secret`, `test` is refused |
+| `PIGEON_DATABASE_URL` | the runtime role's DSN: serves requests, must not own the tables (a table owner is exempt from RLS) | your local Postgres - the shipped value names the compose service host, so a `make run` outside compose needs your own | the `pigeon_app` role | No at the shipped value; **yes if empty** |
+| `PIGEON_MIGRATE_DATABASE_URL` | the owning role's DSN, used only by the migration path | empty is accepted: migrations then run on the runtime connection, which for a single-role dev database means the runtime role owns the tables and RLS is inert for it | `pigeon_migrator`, a second role | **Yes if it names the same role as `PIGEON_DATABASE_URL`** |
+| `PIGEON_REDIS_URL` | the event bus and the attempt-evidence buffer (D-1) | your local Redis | required | No at the shipped value; **yes if empty while `PIGEON_ATTEMPT_LOG_MODE=buffered`** |
+| `PIGEON_MIGRATIONS_ON_BOOT` | OPS-9: exactly one migrator per deployment | `true` | `true` on replica 1, `false` on replicas 2..N | No |
+| `PIGEON_EGRESS_IPS` | the delivery-source allowlist `GET /v1/meta/egress-ips` publishes (FR-1007) | empty - a flat network reads its own interfaces | **must be set** behind NAT, a load balancer, a proxy or a container network: the address a receiver sees is not the one the process can discover | An entry that is neither an IP nor a CIDR block |
+| `PIGEON_DISK_DIR` / `PIGEON_DISK_BYTES` | where SB-3's disk budget is measured from | empty: `GET /v1/meta/usage` reports source `none`, and ingest never sheds | one of them - `PIGEON_DISK_DIR` when core and Postgres share a volume, `PIGEON_DISK_BYTES` when core cannot see that filesystem | No - empty is a documented degraded mode |
+| `PIGEON_SELF_REGISTRATION` | lets `POST /v1/producers` create a tenant and its first owner with no instance admin (FR-102) | `false` | `false`, and never on an internet-facing instance | No |
+| `PIGEON_PASSWORD_RESET_LOG_TOKENS` | writes the password-reset token to the core's own log (FR-111) | `false` | `false` anywhere the logs leave the host: it is a reset link in a shared log | No |
+| `POSTGRES_PASSWORD` | the migrator role's password; compose builds both DSNs from it | any non-empty value | a real secret, different from the others | `compose.yaml` declares it `${POSTGRES_PASSWORD:?}`, so compose refuses to resolve while it is absent or empty |
+| `PIGEON_APP_PASSWORD` | the `pigeon_app` runtime role's password; `deploy/postgres/01-roles.sql` creates the role with it | any non-empty value | a real secret, different from the others | Same, `${PIGEON_APP_PASSWORD:?}` in `compose.yaml` |
+| `PIGEON_CORE_API_URL` | the core's base URL as a portal sees it | `http://localhost:8080` (`make run-portal` and `make run-producer-portal` default it) | `http://core:8080` on the compose network - `compose.yaml` hardcodes it, so it is not an operator input there | **Yes if empty** - both portals refuse to start without it |
+| `PORTAL_SESSION_SECRET` | encrypts the consumer session cookie and keys its CSRF token | `make run-portal` falls back to `dev-insecure-secret` | generated, and kept stable: changing it logs every portal user out | `compose.yaml` declares it `${...:?}`; the portal process itself refuses to start without it |
+| `PIGEON_PRODUCER_PORTAL_SESSION_SECRET` | the same for the producer portal | `make run-producer-portal` falls back to `dev-insecure-secret` | generated, and kept stable | Same, `${...:?}` in `compose.yaml` |
+| `PIGEON_PRODUCER_PORTAL_ENV` | the plane a fresh producer-portal visitor starts in (the signed-in human switches, and every call carries the plane, FR-103) | `test` | whatever you want as the landing plane | Anything other than `test` or `live` refuses the portal |
+| `PIGEON_OIDC_ISSUER` / `PIGEON_OIDC_CLIENT_ID` | FR-106's optional OIDC login, the core's half (it verifies the id_token) | leave both empty: the feature is off and `POST /v1/session/oidc` answers 404 | set together, with the portal's half below | **Yes when only one of the two is set** |
+| `PIGEON_OIDC_CLIENT_SECRET` / `PIGEON_OIDC_REDIRECT_URL` / `PIGEON_OIDC_SCOPES` | the relying-party half, read by the producer portal only - the core never holds the secret (FR-106) | leave empty while OIDC is off | the value registered at your issuer, and the portal's callback URL | No |
+| `PIGEON_LOADGEN_DB` / `PIGEON_LOADGEN_KEY` | the load harness's DSN and API key; `cmd/loadgen` is not a deployment component (§12) | empty | empty - the grader sets them per run | No |
+
+Everything else in the file is a knob whose shipped default the reference
+deployment runs with, and `.env.example` documents each one's default, clamp and
+ceiling next to it. The groups, so you can find the one you want:
+
+| Group | Names | Verdict |
+|---|---|---|
+| HTTP | `PIGEON_HTTP_ADDR`, `PIGEON_SHUTDOWN_GRACE`, `PIGEON_SESSION_TTL` | leave as shipped |
+| Connection budget (OPS-8) | `PIGEON_DB_MAX_CONNS`, `PIGEON_DB_RESERVED_CONNS`, `PIGEON_CORE_REPLICAS` | one arithmetic, checked against the server's `max_connections` at boot: replicas x pool + reserved <= `max_connections` |
+| Rate limits (FR-207) | `PIGEON_RATE_LIMIT_PER_KEY_RPS`, `PIGEON_RATE_LIMIT_PER_KEY_BURST`, `PIGEON_RATE_LIMIT_PER_PRODUCER_RPS`, `PIGEON_RATE_LIMIT_PER_PRODUCER_BURST` | leave as shipped; per process, so N replicas allow N times the rate |
+| Delivery worker | `PIGEON_DELIVERY_WORKERS`, `PIGEON_DELIVERY_LEASE`, `PIGEON_DELIVERY_TIMEOUT`, `PIGEON_DELIVERY_MAX_BODY_BYTES`, `PIGEON_DELIVERY_BACKOFF_BASE`, `PIGEON_DELIVERY_BACKOFF_MAX`, `PIGEON_DELIVERY_MAX_RETRIES`, `PIGEON_DELIVERY_RETRY_WINDOW`, `PIGEON_DELIVERY_JITTER`, `PIGEON_DELIVERY_CONCURRENCY`, `PIGEON_DELIVERY_RETRY_CONCURRENCY`, `PIGEON_DELIVERY_SLOT_TTL`, `PIGEON_DELIVERY_MAX_CONNS_PER_HOST`, `PIGEON_DELIVERY_POLL_INTERVAL`, `PIGEON_DELIVERY_USER_AGENT` | leave as shipped; the 5 s timeout is FR-802's ceiling and a larger value is clamped to it |
+| Sweeper | `PIGEON_SWEEPER_INTERVAL`, `PIGEON_SWEEPER_LOCK_URL`, `PIGEON_SWEEPER_LOCK_WAIT` | leave as shipped |
+| Write budget (S12) | `PIGEON_WRITE_QUEUE_DEPTH`, `PIGEON_WRITE_QUEUE_WORKERS`, `PIGEON_INGEST_ADMIT_TIMEOUT` | leave as shipped |
+| Attempt evidence | `PIGEON_ATTEMPT_LOG_MODE`, `PIGEON_ATTEMPT_FLUSH_BATCH`, `PIGEON_ATTEMPT_FLUSH_INTERVAL`, `PIGEON_ATTEMPT_FLUSH_STALE`, `PIGEON_SUCCESS_LOG_RPS` | leave as shipped |
+| Retention (SB-3, SB-5) | `PIGEON_RETENTION_DELIVERIES`, `PIGEON_RETENTION_ATTEMPTS`, `PIGEON_RETENTION_EVENTS`, `PIGEON_RETENTION_DEDUPE`, `PIGEON_RETENTION_MAX_DISK_PCT` | size them for your own disk; [`docs/retention.md`](docs/retention.md) has the per-row numbers |
+| Observability | `PIGEON_LOG_LEVEL`, `PIGEON_LOG_JSON` | leave as shipped |
+| Portal cosmetics | `PIGEON_PORTAL_ADDR`, `PORTAL_SESSION_COOKIE_NAME`, `PORTAL_BRAND_NAME`, `PORTAL_BRAND_ACCENT`, `PORTAL_BRAND_LOGO_URL`, `PORTAL_BRAND_COMPANY`, `PIGEON_PRODUCER_PORTAL_ADDR`, `PIGEON_PRODUCER_PORTAL_COOKIE_NAME`, `PIGEON_PASSWORD_RESET_TTL` | leave as shipped; a portal's published port in `compose.yaml` and its listen address move together |
+
+**Secrets** - never committed, and different in every environment:
+`PIGEON_HEADERS_KEY`, `PIGEON_INSTANCE_ADMIN_PASSWORD`, `POSTGRES_PASSWORD`,
+`PIGEON_APP_PASSWORD`, `PORTAL_SESSION_SECRET`,
+`PIGEON_PRODUCER_PORTAL_SESSION_SECRET`, `PIGEON_OIDC_CLIENT_SECRET`,
+`PIGEON_LOADGEN_KEY`, and the two database URLs, which carry a password each.
+`.env` is in `.gitignore`; `.env.example` holds published placeholders, which are
+not secrets and must not be shipped as if they were.
+
+**Running the suite locally** needs two variables of its own, neither of which is
+in `.env.example` (no deployment process reads them):
+
+- `PIGEON_TEST_DATABASE_URL` - the disposable Postgres the DB-backed packages use.
+  `make test` refuses to run without it, because `internal/httpapi`'s harness
+  refuses to skip (an unset DSN would otherwise red sixty acceptance tests at
+  0.00 s and read like a regression). **Its database name must contain `test` by
+  design**: `internal/httpapi` refuses to truncate any other name and
+  `internal/relay` refuses any other DSN, while `internal/store`, `internal/delivery`,
+  `internal/identity`, `internal/db` and `internal/faults` migrate and truncate
+  whatever database the DSN names. Point it at a database you are willing to lose.
+- `PIGEON_TEST_REDIS_URL` - optional locally: the Redis-backed packages fall back
+  to an in-process miniredis. CI sets it from a `redis:7` service container, and
+  the job fails on any `--- SKIP`, so a real Redis leg is what CI measures.
+
+Checklist:
+
+- [ ] `cp .env.example .env`, and `.env` is not committed.
+- [ ] `PIGEON_HEADERS_KEY=$(openssl rand -base64 32)` - the core refuses any other shape.
+- [ ] `PIGEON_INSTANCE_ADMIN_PASSWORD` is 8+ characters and not one of the six weak words.
+- [ ] The five values `compose.yaml` requires are non-empty: `POSTGRES_PASSWORD`, `PIGEON_APP_PASSWORD`, `PIGEON_HEADERS_KEY`, `PORTAL_SESSION_SECRET`, `PIGEON_PRODUCER_PORTAL_SESSION_SECRET`.
+- [ ] `PIGEON_DATABASE_URL` and `PIGEON_MIGRATE_DATABASE_URL` name different roles.
+- [ ] `PIGEON_REDIS_URL` is set, or `PIGEON_ATTEMPT_LOG_MODE=sync` if you have no Redis.
+- [ ] Behind NAT, a load balancer, a proxy or a container network: `PIGEON_EGRESS_IPS` is set.
+- [ ] `PIGEON_DISK_DIR` or `PIGEON_DISK_BYTES` is set, or you accept that usage reports `none` and ingest never sheds.
+- [ ] `PIGEON_CORE_REPLICAS` x `PIGEON_DB_MAX_CONNS` + `PIGEON_DB_RESERVED_CONNS` <= the server's `max_connections` (OPS-8).
+- [ ] On replicas 2..N: `PIGEON_MIGRATIONS_ON_BOOT=false`.
+- [ ] `PIGEON_SELF_REGISTRATION=false` and `PIGEON_PASSWORD_RESET_LOG_TOKENS=false`.
+- [ ] OIDC is either entirely off or entirely configured (issuer and client id together).
+- [ ] Every secret above differs between dev and prod, and none is in git.
+- [ ] On the machine that runs the suite: `PIGEON_TEST_DATABASE_URL` names a database you can lose, and its name contains `test`.
+
 ## Where the rules live
 
 | Document | What it is |
