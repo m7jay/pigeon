@@ -111,7 +111,7 @@ go build -o /tmp/loadgen ./cmd/loadgen
   -key "$PIGEON_LOADGEN_KEY" \
   -event-type load.created -consumer-ref load-consumer \
   -rate 250 -subs 10 -warmup 5m -measure 30m -evaluate 10m -settle 60s \
-  -concurrency 512 -label "2vCPU-4GB-1replica-defaults" -out run.json
+  -concurrency 512 -label "reference-box-1replica-defaults" -out run.json
 
 # 4. The artifact's own verdicts. This run declares no class, so `grade` refuses
 #    AC-30's third clause by name (exit 1) rather than comparing a number against a
