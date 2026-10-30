@@ -214,8 +214,10 @@ Not landed, and not to be read as green:
 
 - Conventional Commits, one slice per PR, branched from the default branch
   (`feat/m0-skeleton`) - never from another slice's branch.
-- `make vet test` before pushing; `make test-integration` runs the suite that needs
-  a disposable Postgres and refuses to run without `PIGEON_TEST_DATABASE_URL`.
+- `make vet test` before pushing, with `PIGEON_TEST_DATABASE_URL` pointing at a
+  disposable Postgres: `make test` runs the DB-backed suite and refuses to run
+  without that DSN (its `-p 1` is CI's, for the same reason). `make test-integration`
+  is the same target under its older name.
 - CI (`.github/workflows/ci.yml`) runs the `test` job on `ubuntu-24.04` with
   Postgres 16 and Redis 7 service containers:
   `go test -count=1 -race -p 1 -v -timeout 25m ./...`. A `--- SKIP` fails the job,
