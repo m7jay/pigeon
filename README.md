@@ -138,11 +138,13 @@ pages also carry the signing-secret **Rotate** action, behind a confirm.
 Lost the token before you answered it? The endpoint is inert rather than broken: it
 keeps its subscriptions and its history, and each delivery it was skipped for is
 recorded with the reason `not_delivered:endpoint_unverified`, but it receives
-nothing. Recover by registering a replacement endpoint from the consumer portal's
-**Endpoints** page, subscribing it to the same event types, verifying it, and
-publishing the missed events again - the producer portal's Deliveries page has the
-replay panel (UI-5), and it refuses a skipped row on purpose, because replaying one
-would POST to an endpoint FR-403 still holds unverified.
+nothing. The endpoint's own page - in both the consumer and the producer portal -
+carries a **Re-issue the verification token** control: it mints a fresh token, shown
+once like the original, and the old one stops verifying immediately (FR-409).
+Re-issuing arms the endpoint; it does not re-deliver what was published while the
+endpoint was unverified, and a `skipped` row is refused on purpose (FR-1106), so the
+missed window is recovered by publishing the events again - the producer portal's
+Deliveries page has the replay panel (UI-5).
 
 ### 8. Subscribe the endpoint to the event type
 
