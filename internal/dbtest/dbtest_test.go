@@ -3,6 +3,7 @@ package dbtest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
@@ -19,19 +20,28 @@ import (
 // thing under test - so they need the same superuser DSN every integration
 // harness gets (PIGEON_TEST_DATABASE_URL; CI's postgres user).
 //
-// The probe roles are named per test and dropped again: a role is cluster-wide,
-// so a leftover would be another worker's problem.
+// The probe roles carry this test binary's pid and are dropped again: they are
+// cluster-wide objects and these tests drop theirs, so a fixed name would be a
+// live singleton that a second concurrent run of this package - two workers'
+// `./...` suites overlapping is enough - drops out from under the first. The
+// failures that produced read as the fixture's race tolerance being broken,
+// which is the opposite of the truth.
 
 const (
-	raceRole    = "pigeon_probe_race"
-	targetRole  = "pigeon_probe_target"
-	limitedRole = "pigeon_probe_nocreate"
-	probePass   = "pigeon_probe"
+	probePass = "pigeon_probe"
 	// limitedRoleFormat is the same create as the fixture's, minus CREATEROLE.
 	limitedRoleFormat = `create role %I login password %L nocreatedb nocreaterole nosuperuser nobypassrls`
 	grantUsageQ       = `select has_schema_privilege($1, 'public', 'USAGE')`
 	waitersQuery      = `select count(*) from pg_stat_activity
 		where datname = current_database() and wait_event_type = 'Lock'`
+)
+
+// The three roles below are per process, not per test: the name has to be unique
+// to this run rather than unique to this test, because a role is cluster-wide.
+var (
+	raceRole    = fmt.Sprintf("pigeon_probe_race_%d", os.Getpid())
+	targetRole  = fmt.Sprintf("pigeon_probe_target_%d", os.Getpid())
+	limitedRole = fmt.Sprintf("pigeon_probe_nocreate_%d", os.Getpid())
 )
 
 func adminPool(t *testing.T) *pgxpool.Pool {
