@@ -67,8 +67,9 @@ build:
 #
 # - the database comes from PIGEON_TEST_DATABASE_URL. Left unset, `test-env`
 #   starts compose.yaml's `test` profile and the DSN is the address that profile
-#   publishes, so a clean checkout needs no exported variable and no second
-#   terminal. It is not optional in the sense that matters: internal/httpapi's
+#   publishes, so a clean checkout with a `.env` (the five values compose.yaml
+#   marks ${VAR:?}) needs no exported variable and no second terminal. It is not
+#   optional in the sense that matters: internal/httpapi's
 #   harness refuses to skip ("refusing to skip, the AC-15/AC-20 suite must run")
 #   by design since S0, so a database that is not reachable reds its 60
 #   acceptance tests at 0.00 s and reads like a mass regression.
