@@ -117,6 +117,17 @@ func tokenHash(token string) []byte {
 	return sum[:]
 }
 
+// mintChallenge mints the ownership-challenge token and its safe-to-display
+// hint exactly as the creation paths do (endpoints.go:155 / internal/store
+// consumerportal.go:133): vrf_ plus 24 hex, and the first 8 characters. It is
+// shared by CreateEndpoint, CreateConsumerEndpoint and ReissueEndpointChallenge
+// so the format cannot drift between them. It only produces the values, and
+// never writes them.
+func mintChallenge() (token, hint string) {
+	token = id.New("vrf")
+	return token, token[:8]
+}
+
 // CreateEndpoint registers an endpoint for a consumer (FR-401). It rejects a
 // non-https live URL or an internal-range address before any row is written
 // (FR-402, AC-19), applies FR-405 to the custom headers it was given, generates
@@ -152,7 +163,7 @@ func (s *Store) CreateEndpoint(ctx context.Context, sc Scope, in NewEndpoint) (E
 	if err != nil {
 		return EndpointCreated{}, err
 	}
-	token := id.New("vrf") // high-entropy challenge, shown once
+	token, challengeHint := mintChallenge()
 	// The row id is minted here rather than in the INSERT because it is the AAD
 	// the values are sealed under: the endpoint must know its own id before it
 	// can encrypt anything.
@@ -170,7 +181,7 @@ func (s *Store) CreateEndpoint(ctx context.Context, sc Scope, in NewEndpoint) (E
 			values ($1,$2,$3,$4,$5,$6,$7,$8, $9, $10, $11, $12)
 			returning `+endpointSelectCols,
 			endpointID, sc.ProducerID, sc.Env, in.ConsumerID, in.Name, in.URL, in.Internal, sealed,
-			tokenHash(token), token[:8], secret, hint,
+					tokenHash(token), challengeHint, secret, hint,
 		)
 		var err error
 		ep, err = scanEndpoint(row)

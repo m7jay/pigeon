@@ -54,6 +54,30 @@
   </form>
 </div>
 {{end}}
+{{if not .Data.Verified}}
+<div class="card">
+  <h2>Re-issue the verification token</h2>
+  <p class="page-sub">The ownership token is shown once and cannot be retrieved again. Re-issue it when the original token is lost. Each re-issue mints a new token; the new token is shown once, with a copy warning and a Verify now button.</p>
+  <form method="post" action="/endpoints/{{.Data.ID}}/challenge" onsubmit="return confirm('Re-issue the verification token? The old token stops verifying.')">
+    {{template "csrf_field" .}}
+    <button class="btn btn-sm btn-secondary" type="submit">Re-issue</button>
+  </form>
+</div>
+{{end}}
+{{if .Data.ReissuedToken}}
+<div class="notice">
+  <strong>Verification token (re-issued).</strong> Copy it now - the API never returns it again. The old token stops verifying.
+  <div class="kv" style="margin-top:0.5rem">
+    <dt>Verification token</dt><dd class="mono">{{.Data.ReissuedToken}}</dd>
+    <dt>Hint</dt><dd class="mono">{{.Data.ReissuedHint}}</dd>
+  </div>
+  <form method="post" action="/endpoints/{{.Data.ID}}/verify" class="inline" style="margin-top:0.5rem">
+    {{template "csrf_field" .}}
+    <input type="hidden" name="token" value="{{.Data.ReissuedToken}}">
+    <button class="btn btn-sm" type="submit">Verify now</button>
+  </form>
+</div>
+{{end}}
 
 <div class="card">
   <h2>Signing secret</h2>

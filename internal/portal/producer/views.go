@@ -105,6 +105,14 @@ type endpointRotatedJSON struct {
 	OverlapSeconds          int     `json:"overlap_seconds"`
 }
 
+// endpointReissuedJSON is the 201 body of an ownership-challenge re-issue (FR-409):
+// the new token and its safe-to-display prefix, named exactly as the creation
+// response. Each call mints a fresh value, so the route is not idempotent.
+type endpointReissuedJSON struct {
+	VerificationToken string `json:"verification_token"`
+	VerificationHint  string `json:"verification_hint"`
+}
+
 type deliveryJSON struct {
 	ID                 int64   `json:"id"`
 	EventID            string  `json:"event_id"`
@@ -260,8 +268,8 @@ type endpointRow struct {
 	Verified          bool
 	NotificationEmail string
 	FailureStreak     int
-	LastStatus        string
-	LastDeliveryAt    string
+		LastStatus        string
+		LastDeliveryAt    string
 	// RotatedSecret and RotatedOverlap carry UI-6's one-time response: the new
 	// secret is shown where the rotation happened, with the window the API
 	// reported, so the page can explain the overlap with the API's own number.
@@ -272,7 +280,14 @@ type endpointRow struct {
 	// VerificationToken is UI-1's step-4 value, shown once when an endpoint is
 	// created (and only then: the API never returns it again).
 	VerificationToken string
-}
+	// ReissuedToken and ReissuedHint are FR-409's one-time re-issue response:
+	// each call to the ownership-challenge re-issue route mints a fresh token and
+	// hint and answers 201; the page that follows shows the token exactly once,
+	// with a copy warning and a Verify now button. They are nil/empty until the
+	// re-issue handler sets them from the API's response.
+	ReissuedToken string
+	ReissuedHint  string
+	}
 
 type consumerRow struct {
 	ID          string

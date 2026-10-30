@@ -577,10 +577,43 @@ func (h *Handler) endpointRotate(w http.ResponseWriter, r *http.Request, sess me
 	if rot.PreviousSecretExpiresAt != nil {
 		view.Endpoint.RotatedUntil = *rot.PreviousSecretExpiresAt
 	}
-	h.renderPage(w, r, sess, "endpoint", view.Endpoint.Name, "consumers", view)
-}
+		h.renderPage(w, r, sess, "endpoint", view.Endpoint.Name, "consumers", view)
+	}
 
-// endpointSetPaused is UI-2's pause/resume control (FR-408 and S5's pause).
+	// endpointReissue is UI-11's membership re-issue: it asks the API for a fresh
+	// ownership-challenge token and hint for one of its endpoints, and renders the
+	// endpoint page from that response so the token is shown exactly once, with a
+	// copy warning and a Verify now button.
+	func (h *Handler) endpointReissue(w http.ResponseWriter, r *http.Request, sess memberSession) {
+		view, ok := h.endpointView(w, r, sess, r.PathValue("id"))
+		if !ok {
+			return
+		}
+		resp, err := h.coreReq(r, http.MethodPost,
+			h.envPath(r, "/v1/producer/consumers/"+view.Endpoint.ConsumerID+"/endpoints/"+view.Endpoint.ID+"/challenge"),
+			nil)
+		if err != nil {
+			view.Error = "The token could not be re-issued: the API could not be reached."
+			h.renderPage(w, r, sess, "endpoint", view.Endpoint.Name, "consumers", view)
+			return
+		}
+		if resp.Status != http.StatusCreated {
+			view.Error = coreError(resp)
+			h.renderPage(w, r, sess, "endpoint", view.Endpoint.Name, "consumers", view)
+			return
+		}
+		var chal endpointReissuedJSON
+		if err := json.Unmarshal(resp.Body, &chal); err != nil {
+			view.Error = "The re-issued token could not be read."
+			h.renderPage(w, r, sess, "endpoint", view.Endpoint.Name, "consumers", view)
+			return
+		}
+		view.Endpoint.ReissuedToken = chal.VerificationToken
+		view.Endpoint.ReissuedHint = chal.VerificationHint
+		h.renderPage(w, r, sess, "endpoint", view.Endpoint.Name, "consumers", view)
+	}
+
+	// endpointSetPaused is UI-2's pause/resume control (FR-408 and S5's pause).
 func (h *Handler) endpointSetPaused(paused bool) memberHandler {
 	return func(w http.ResponseWriter, r *http.Request, sess memberSession) {
 		view, ok := h.endpointView(w, r, sess, r.PathValue("id"))

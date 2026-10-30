@@ -430,6 +430,7 @@ jobs:
             TestPasswordResetTokenIsStoredHashedAndBurnable \
             TestPasswordResetAcceptChangesOnlyTheCredential \
             TestEndpointHealthCountsTheFailureStreak \
+            TestAC54ReIssueEndpointChallenge \
             TestProducerPortalSeesOnlyItsOwnProducerEvents \
             TestTestPublishMarkerRidesTheEventToTheDeliveryLog \
             TestSubscribableEventTypesCarryTheirSchema \
