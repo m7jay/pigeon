@@ -32,6 +32,7 @@ disagree, the requirements win and this file is wrong.
 | S10 | Hardening: SSRF at three points, secret rotation, `doctor`, load test, fault-injection matrix in CI; **portal session security (FR-1009)** — `HttpOnly`/`Secure`/`SameSite=Lax` on every portal cookie, a CSRF token on every state-changing POST, cookie lifetime read from the core's `expires_at` | AC-19, AC-22, AC-34, AC-49, AC-50, AC-51 (AC-30 → S12, its graded run `t_0bf3effa`; AC-31's honest-reporting clause here, its 245/250 + NFR-1 leg → `t_b9850e1b` and S12; AC-43 → the operator on a rated host) | S5…S9 | — |
 | S11 | Delivery fairness (**FR-1303**, **FR-1304**): stop parking the dispatch path on a capped endpoint, split the attempt budget into a first-attempt lane and a retry lane, and make a hold visible | AC-52, AC-53 | S5 | — |
 | S12 | Bounded write budget (**FR-818**, amended by `SPEC.md` A-11): one fixed-capacity write budget per process with a fixed worker pool, batched control-state writes (the fan-out insert and the delivery completion/terminal updates), and an ingest admission deadline that sheds `429`/`over_capacity` instead of parking on the pgx pool; `PIGEON_DB_MAX_CONNS` 10 → 40 | AC-30 (its mechanism - the graded run is card `t_0bf3effa`), FR-815's control-state leg, FR-818 | S5…S8, and `t_b9850e1b`'s relay loop for the fan-out batch | — |
+| S13 | Challenge re-issue (**FR-409**, `SPEC.md` A-12): the ownership challenge a registration shows once can be minted again from either portal, replacing the stored hash and hint and stopping the previous token (no overlap window), refused once the endpoint is verified | AC-54 | S3, S9 | — |
 
 Two items are in S2/S3 rather than later, for the reason §17 gives: the outbox
 changes the ingest transaction, and per-endpoint throttling changes the queue
@@ -55,6 +56,17 @@ submitted through. The contract change is `SPEC.md` A-11. `t_b9850e1b` fixed it:
 delivery rows, the §7.5a routing outcomes and the outbox marks - in one write-budget
 transaction per pack that fills FR-815's row bound, which took the drain from 41.5
 events/s to 496.7 events/s on the box that measured it (`docs/load-test.md`).
+
+**S13 is not a new feature either.** It exists because FR-403's challenge was the only
+one-time credential in the tree with no mint-again path (card `t_30fac425`, raised by Jay
+reviewing the getting-started flow): a producer whose endpoint token was lost between
+registration and the answer could never verify it, and the only recovery was a replacement
+endpoint that orphans its subscriptions and history - while the events it skipped were
+`skipped` rows FR-1106 refuses to replay. `SPEC.md` A-12 rules the challenge re-issuable at
+parity with FR-404's rotation, by the same two actor classes, on the same scoping, with the
+instance admin excluded; FR-409 and AC-54 are the contract, and the mechanism slice is card
+`t_af2fb85c`. The boundary is explicit in both documents: a re-issue arms an endpoint, it
+does not re-deliver the window that was skipped before it.
 
 **S9 is split.** `t_0eea0b84` landed the consumer portal (M2b); the producer portal
 (M2a) is S9a, card `t_c0144baa`, and AC-01 moved with it. The S9 row above still

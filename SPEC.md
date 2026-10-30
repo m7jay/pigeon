@@ -1228,7 +1228,104 @@ row, §19's decision row; `internal/store`'s claim, `internal/delivery`'s dispat
 
 **Encoded by.** FR-818 (rewritten), §19's decision row; `internal/config` (`PIGEON_DB_MAX_CONNS`, `PIGEON_WRITE_QUEUE_DEPTH`, `PIGEON_WRITE_QUEUE_WORKERS`, `PIGEON_INGEST_ADMIT_TIMEOUT`), `internal/httpapi`'s publish admission, `internal/metrics`'s shed counter, `.env.example`, `docs/topology.md`; `cmd/loadgen`'s `run -class`/`-sut-cpus`/`-sut-mem-gib` and `grade` (AC-30's third clause); slice S12, cards `t_c6afa452` (mechanism) and `t_0bf3effa` (the §8.1 class comparison in `cmd/loadgen`; its graded run is the operator's, on a host that carries the class).
 
-## Gap list — twelve decided, one open
+### A-12 — The ownership challenge is re-issuable, and "shown once" survives it
+
+**Found** by Jay while reviewing the getting-started flow (card `t_30fac425`): "after
+registering the consumer endpoint, there is a verification step, how does the consumer /
+the onboarding team get this verification token?" The answer is that they get it exactly
+once, in the creation response (`id.New("vrf")` at `internal/store/endpoints.go:155` and
+`internal/store/consumerportal.go:133`; `:169` stores only the SHA-256 and `token[:8]`, and
+no read path carries either), and that nothing in the store, the API or the two portals can
+mint another. An endpoint whose token is lost between registration and the answer can never
+be verified and never receives a live event: at fan-out it becomes a `skipped` row with
+reason `not_delivered:endpoint_unverified` (`internal/store/fanout.go:199-200`, `:293-320`),
+and the only recovery in the tree is a replacement endpoint, which orphans the first one's
+subscriptions and history. Two measurements sharpen the gap. The 8-character
+`verification_hint` is readable nowhere after creation (`endpointCreatedJSON` is its only
+carrier and no portal template renders it), so the loss is total rather than partial. And the
+events an unverified endpoint skipped are `skipped` delivery rows, which FR-1106 deliberately
+refuses to replay (`internal/store/inspect.go:697`, `selectionWhere` excludes `skipped`), so
+the shipped recovery costs the endpoint, its subscriptions, its history, a receiver-side
+signing-secret change **and** every event published while it was unverified.
+
+**Decision.** The challenge is re-issuable until it is answered, at parity with FR-404's
+rotation of the signing secret:
+
+- **who may mint**: exactly the actors who may answer the challenge - a member of the owning
+  producer (`POST /v1/producer/consumers/{consumerID}/endpoints/{endpointID}/challenge`) and
+  a user bound to the owning consumer (`POST /v1/consumer/endpoints/{endpointID}/challenge`),
+  each answering `201` with the creation response's own field names (`verification_token`,
+  `verification_hint`), because each call mints a new value and is therefore not idempotent.
+  The store predicate carries `producer_id`, `env`, `consumer_id` and `status <> 'deleted'`,
+  so a foreign, unknown or deleted id is `404` and never `403` (AC-39), exactly as `/rotate`
+  and `/verify` answer.
+- **the instance admin may not**: no admin route and no admin store path. An operator-minted
+  challenge would be a credential the operator holds and can answer, which is the one thing
+  "shown once, never read back" exists to prevent.
+- **one write replaces both columns**: `verification_token_hash` and `verification_hint` move
+  in the same statement and `verified_at` is untouched, so the previous token stops verifying
+  when that write commits. There is **no overlap window**, unlike FR-1004's 24 h secret
+  overlap: the overlap exists because a receiver holds the outgoing secret and verifies
+  signatures with it, and no counterparty holds a challenge token - only the registrant, who
+  is the one asking for a new one.
+- **an already verified endpoint is refused** (`409`, no state change). Verified is one-way in
+  v1.0: FR-403 has no de-verification clause. Clearing `verified_at` would add an un-verify
+  lever no requirement asks for, and minting a token that cannot change anything would be a
+  dead credential that a support conversation would read as meaningful. Pause and delete
+  remain the ways to take an endpoint out of service.
+- **no schema change and no new credential type**: both columns exist
+  (`0007_routing.sql:45-46`), the token is minted by the helper creation already uses
+  (`id.New("vrf")`, `vrf_` plus 24 hex), and the answer path is untouched: constant-time
+  compare against the stored digest plus FR-1005's URL re-check.
+- **log-only record**: the action is logged with actor and request id (LOG-1…LOG-4) like every
+  other mutation. It writes no `admin_audit_log` row, which is MT-5's instance-admin log rather
+  than a tenant table, and per-tenant audit history stays deferred to v1.1 (§17.1, Q5). When it
+  lands, re-issue joins it as rotation will.
+- **it arms an endpoint, not its events**: a re-issue re-fans-out nothing and touches no
+  delivery row. Events published during the unverified window stay `skipped` and
+  un-replayable, so they are recovered by re-publishing. Stated so "recoverable" is not read
+  as "nothing was lost".
+
+**Trade-off, stated.** A challenge token can now be replaced by exactly the people who could
+already arm the endpoint another way: they may register a replacement endpoint and verify it
+themselves (`internal/httpapi/routes.go:150` for a member, `:186` for a consumer user), rotate
+its secret, change its URL, pause it and delete it - and a re-issue preserves the endpoint id,
+its subscriptions and its history where the replacement does not. What the ruling gives up is
+the claim that the token the registrant first held is the only token that ever verifies the
+endpoint: a claim FR-403 never made and nothing observes. What it keeps is the property that
+matters - the challenge is still never read back, and it is still answered by its own
+registrant rather than by an operator. The cost that remains is the event window: a re-issue
+does not bring back what was published while the endpoint was unverified.
+
+**Rejected.** Ruling the loss final, on the ground that "shown once" is a security property: it
+protects no capability, it contradicts the shape of every other one-time credential in this
+tree (an API key is revoked and re-issued, FR-201; a signing secret is rotated, FR-404; an
+invitation is revoked and re-sent, FR-104/FR-105), and it would make the README teach a closed
+tab as an endpoint loss. An instance-admin re-issue action: excluded for the reason above.
+Restricting re-issue to producer owners: registration, verification and rotation are all
+`kindMember`, so an owner-only recovery would strand the onboarding case this ruling exists for.
+A re-issue that clears `verified_at`: an un-verify lever with no requirement behind it. A
+re-issue that leaves it set: a dead credential. A 24 h overlap for the outgoing challenge:
+nothing holds the old token, so an overlap would only leave a known-lost token valid for a day.
+Exposing the stored hash or the hint on a read: the hash is not a credential and the hint is
+not a recovery path, and either would make "shown once" ambiguous without adding a way to
+answer the challenge.
+
+**Priority.** FR-409 is P1, and that is a statement about its class rather than a deferral: it is
+a recovery affordance on a P0 flow, not a delivery guarantee, and the shipped flow - the token
+shown once at creation - is correct without it. The ruling does not defer it: card `t_af2fb85c`
+implements it, and the slice exists because the alternative recovery in the tree today destroys an
+endpoint.
+
+**Encoded by.** FR-409 and AC-54; §6's `not_delivered:endpoint_unverified` row; §11's API
+surface; UI-13 (§14.2) and §14.3's producer data paths; §19's decision row; slice S13, card
+`t_af2fb85c` (store method, both routes and handlers, both portals' controls, AC-54's tests and
+their registration in `ci.yml`'s required-names list). No code changes land with this
+amendment, and no new UI id is added: the control extends two surfaces that already exist - the
+producer portal's endpoint page (UI-1 step 4, UI-11) and the consumer portal's, which UI-13
+this amendment extends.
+
+## Gap list — thirteen decided, one open
 
 Six gaps, each now a decision with a mechanism and a named trade-off. Row 4b is a
 seventh contradiction found while resolving the fourth, recorded here instead of being
@@ -1248,7 +1345,12 @@ acknowledgement, while that branch was unlanded, so each row keeps the number it
 A-9 has since landed into row 10, and the heading's count is now eleven.
 Row 12 is A-11, found by S10's load test: FR-818 was a P0 with no slice, no
 implementation and no shed path - the instance queued on the pgx pool - and AC-30's third clause
-had no harness behind it at all, so the heading's count is now twelve. A-11 was extended afterwards, by the review of `t_b9850e1b` (card `t_194e6caf`): FR-703 still read as a per-event transaction boundary for the mechanism A-11 had just given a batched one, so row 12's contract-change cell carries that reading too, and no new row or count is claimed for it.
+had no harness behind it at all, so the heading's count was twelve at that point - row 13 below takes it to thirteen. A-11 was extended afterwards, by the review of `t_b9850e1b` (card `t_194e6caf`): FR-703 still read as a per-event transaction boundary for the mechanism A-11 had just given a batched one, so row 12's contract-change cell carries that reading too, and no new row or count is claimed for it. Row 13 is A-12, found by Jay while reviewing the
+getting-started flow (card `t_30fac425`): FR-403's challenge is shown once and had no way to mint
+another, so an endpoint whose token was lost before the challenge was answered could never be
+verified - and the events it skipped were `skipped` rows FR-1106 refuses to replay, so the only
+recovery in the tree cost the endpoint, its subscriptions and its history. A-12 rules the challenge
+re-issuable at parity with FR-404's rotation, so the heading's count is now thirteen.
 
 | # | Gap | Decision | Contract changed | Unblocks |
 |---|---|---|---|---|
@@ -1264,6 +1366,7 @@ had no harness behind it at all, so the heading's count is now twelve. A-11 was 
 | 10 | The acknowledgement could be revoked midway (a batch the flusher cannot hand back), and nothing retired an entry that lost its removal | A-9 | D-9 added; §6's attempt-evidence row states an acknowledgement after the commit that is one transaction and is not revocable by the cancellation ending a pass | S6's flusher (implementation routed separately) |
 | 11 | §7.13's FR-1301, FR-1303 and FR-1304 had no slice, no AC and no implementation, and FR-1303's "separate budget" contradicted FR-1308 read as an endpoint limit | A-10 | FR-1303 and FR-1304 rewritten with the lane and hold mechanisms; FR-1301's halves named (publish = FR-207, delivery deferred to v1.1); AC-52, AC-53 and OBS-13 added; §17's M3 exit and §17.1 amended | S11 (card `t_558a9f59`), and AC-16's NFR-2 leg in S10 |
 | 12 | FR-818 (P0) had no owning slice, no implementation and no mechanism that could shed - the instance queues on the pgx pool - and its literal text (every database write batched through one queue) cannot hold for the publish transaction, which is `202`-on-commit (FR-604) inside NFR-1's 100 ms budget. AC-30's third clause is implemented nowhere in the harness | A-11 | FR-818 rewritten as a bounded write budget with an ingest admission deadline and an `over_capacity` shed; FR-815's floor read as §8.1's binding rows; `PIGEON_DB_MAX_CONNS` 10 → 40; `PLAN.md` slice S12 added; FR-703's transaction boundary read at the batch rather than the event - an event's fan-out set is never split across transactions (follow-up card `t_194e6caf`) | S12 (card `t_c6afa452`) and the graded AC-30 run (card `t_0bf3effa`) |
+| 13 | FR-403's challenge is shown once and cannot be re-issued, so an endpoint whose token is lost before the challenge is answered can never be verified and never receives a live event; the only in-tree recovery is a replacement endpoint, and the events the unverified endpoint skipped are `skipped` rows FR-1106 refuses to replay (found by Jay reviewing the getting-started flow, card `t_30fac425`) | A-12 | FR-409 and AC-54 added; §6's unverified-state row, §11's API surface, UI-13, §14.3's producer data paths and §19's decision row amended; `PLAN.md` slice S13 added | S13 (card `t_af2fb85c`), and the README's verification step (card `t_5a78686f`) |
 
 **They do not contradict each other**, checked pairwise where they touch: A-1's pause
 flags and A-4's archive both ride the control/evidence split in §6 (D-8, FR-812); A-2's
@@ -1295,7 +1398,19 @@ commit, FR-812's class split and D-1's buffer are untouched, FR-815's floor is r
 (the rows that bind) rather than as a floor on every path, and FR-816's cap is respected because the
 write budget's worker pool is fixed at boot. FR-703 is the second row A-11 changes, and only in its transaction boundary: one event's fan-out set is never split, and the batch the write budget forms is what carries it, which `PackFanOut` already enforces by never splitting a plan. A-11's one configuration change, `PIGEON_DB_MAX_CONNS` 10 →
 40, is a value OPS-8's arithmetic already constrains (`1 × 40 + 5 ≤ 100` at one replica, 85 at two),
-so it moves no topology decision and no requirement's number.
+so it moves no topology decision and no requirement's number. A-12 reaches the endpoints row and
+nothing else, and its contract change is a new affordance (FR-409) rather
+than a reading of an existing row: it moves no counter, no write class and no delivery state, so
+A-7's counter, A-8's gate, A-9's acknowledgement, A-10's lanes and A-11's write budget are
+untouched, and §6's `not_delivered:endpoint_unverified` row keeps its meaning - its fix cell gains
+a pointer to FR-409 and nothing else. It deliberately does not amend FR-404: the signing secret's
+24 h overlap exists because a receiver holds the outgoing secret and verifies signatures with it,
+while no counterparty holds a challenge token, which is why re-issue has no overlap window. It also
+does not amend FR-1106, and that is the boundary the ruling states rather than leaves to be
+discovered: `skipped` rows stay un-replayable (`internal/store/inspect.go:697`), so a re-issue arms
+an endpoint and never resurrects an event, and the recovery path for the events published before
+verification stays re-publish. FR-403 itself is unchanged: verification is still a precondition of
+live delivery, and FR-409 says only who may mint the challenge that answers it.
 
 One thing this list no longer leaves open: whether the endpoint pause threshold scales
 with subscription count. It does - `N = min(active, max(3, ceil(active/4)))` in FR-1203
