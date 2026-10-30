@@ -1000,9 +1000,13 @@ definition have no session yet.
 
 `member` is FR-104's producer member session (an owner or a developer) and `owner`
 is the same session with the owner role; both are FR-112's opaque bearer, not a
-producer API key (FR-201). Every `member` route also names the plane explicitly as
-`?env=test|live` (FR-103): the producer comes from the session claim and the
-environment from the query, and nothing in a body can move either. `POST /v1/events`
+producer API key (FR-201). Every `member` route that addresses plane-scoped data
+also names the plane explicitly as `?env=test|live` (FR-103): the producer comes
+from the session claim and the environment from the query, and nothing in a body can
+move either. The producer-wide routes are the exception by design - `GET
+/v1/producer/members` and the invitation routes resolve a producer scope with no
+environment (`producerScope`), because a membership and a producer invitation
+belong to no plane. `POST /v1/events`
 stays key-only - it is the ingest path a producer's own infrastructure uses - while
 the portal publishes through `POST /v1/producer/events`, which is the same work
 through the same `servePublish` under a member credential, so the two cannot drift.

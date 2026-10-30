@@ -204,8 +204,8 @@ func (s *Server) routes() []route {
 
 		// S9a's producer-portal surface (M2a, §14). A producer portal session is not
 		// a producer key (FR-112 vs FR-201), so these are member routes under their
-		// own prefix: the environment comes from the session's `env` claim, the
-		// producer and the user from the session, never from a request field.
+		// own prefix: the producer and the user come from the session claim and the
+		// environment from `?env=test|live` (memberScope), never from a body field.
 		{http.MethodGet, "/v1/producer/event-types", kindMember, s.handleMemberListEventTypes},
 		{http.MethodPost, "/v1/producer/event-types", kindMember, s.handleMemberCreateEventType},
 		{http.MethodPost, "/v1/producer/events", kindMember, s.handleMemberPublish},
