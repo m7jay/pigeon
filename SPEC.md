@@ -1316,11 +1316,17 @@ Exposing the stored hash or the hint on a read: the hash is not a credential and
 not a recovery path, and either would make "shown once" ambiguous without adding a way to
 answer the challenge.
 
-**Priority.** FR-409 is P1, and that is a statement about its class rather than a deferral: it is
-a recovery affordance on a P0 flow, not a delivery guarantee, and the shipped flow - the token
-shown once at creation - is correct without it. The ruling does not defer it: card `t_af2fb85c`
-implements it, and the slice exists because the alternative recovery in the tree today destroys an
-endpoint.
+**Priority.** FR-409 is P0, at parity with FR-404's rotation, and that is a statement about its
+class rather than an accident of phrasing: the recovery it adds is the only non-destructive path
+back from a lost challenge, and the flow it recovers is the P0 onboarding flow itself, whose UI
+surface (UI-13, §14.2) is a P0 row that names this capability. It cannot be P1 on its own terms:
+§7 defines P1 as "cuttable under time pressure", so a P1 FR-409 would make the P0 flow's only
+recovery cuttable and leave the P0 UI-13 row mandating a mechanism the plan is allowed to drop -
+the contract's only cross-priority dependency, introduced by this amendment. Stating it as a bare
+permission would have the same effect one level down, so FR-409 states the capability as `MUST`
+("MUST be re-issuable until it is answered") exactly as FR-404 states rotation. The ruling does not
+defer it either: card `t_af2fb85c` implements it in slice S13, and the slice exists because the
+alternative recovery in the tree today destroys an endpoint.
 
 **Encoded by.** FR-409 and AC-54; §6's `not_delivered:endpoint_unverified` row; §11's API
 surface; UI-13 (§14.2) and §14.3's producer data paths; §19's decision row; slice S13, card
@@ -1371,7 +1377,7 @@ re-issuable at parity with FR-404's rotation, so the heading's count is now thir
 | 10 | The acknowledgement could be revoked midway (a batch the flusher cannot hand back), and nothing retired an entry that lost its removal | A-9 | D-9 added; §6's attempt-evidence row states an acknowledgement after the commit that is one transaction and is not revocable by the cancellation ending a pass | S6's flusher (implementation routed separately) |
 | 11 | §7.13's FR-1301, FR-1303 and FR-1304 had no slice, no AC and no implementation, and FR-1303's "separate budget" contradicted FR-1308 read as an endpoint limit | A-10 | FR-1303 and FR-1304 rewritten with the lane and hold mechanisms; FR-1301's halves named (publish = FR-207, delivery deferred to v1.1); AC-52, AC-53 and OBS-13 added; §17's M3 exit and §17.1 amended | S11 (card `t_558a9f59`), and AC-16's NFR-2 leg in S10 |
 | 12 | FR-818 (P0) had no owning slice, no implementation and no mechanism that could shed - the instance queues on the pgx pool - and its literal text (every database write batched through one queue) cannot hold for the publish transaction, which is `202`-on-commit (FR-604) inside NFR-1's 100 ms budget. AC-30's third clause is implemented nowhere in the harness | A-11 | FR-818 rewritten as a bounded write budget with an ingest admission deadline and an `over_capacity` shed; FR-815's floor read as §8.1's binding rows; `PIGEON_DB_MAX_CONNS` 10 → 40; `PLAN.md` slice S12 added; FR-703's transaction boundary read at the batch rather than the event - an event's fan-out set is never split across transactions (follow-up card `t_194e6caf`) | S12 (card `t_c6afa452`) and the graded AC-30 run (card `t_0bf3effa`) |
-| 13 | FR-403's challenge is shown once and cannot be re-issued, so an endpoint whose token is lost before the challenge is answered can never be verified and never receives a live event; the only in-tree recovery is a replacement endpoint, and the events the unverified endpoint skipped are `skipped` rows FR-1106 refuses to replay (found by Jay reviewing the getting-started flow, card `t_30fac425`) | A-12 | FR-409 and AC-54 added; §6's unverified-state row, §11's API surface, UI-13, §14.3's producer data paths and §19's decision row amended; `PLAN.md` slice S13 added | S13 (card `t_af2fb85c`), and the README's verification step (card `t_5a78686f`) |
+| 13 | FR-403's challenge is shown once and cannot be re-issued, so an endpoint whose token is lost before the challenge is answered can never be verified and never receives a live event; the only in-tree recovery is a replacement endpoint, and the events the unverified endpoint skipped are `skipped` rows FR-1106 refuses to replay (found by Jay reviewing the getting-started flow, card `t_30fac425`) | A-12 | FR-409 (P0, at parity with FR-404) and AC-54 added; §6's unverified-state row, §11's API surface, UI-13, §14.3's producer data paths and §19's decision row amended; `PLAN.md` slice S13 added | S13 (card `t_af2fb85c`), and the README's verification step (card `t_5a78686f`) |
 
 **They do not contradict each other**, checked pairwise where they touch: A-1's pause
 flags and A-4's archive both ride the control/evidence split in §6 (D-8, FR-812); A-2's
