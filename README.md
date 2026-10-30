@@ -135,6 +135,15 @@ endpoint receives no live events (FR-403)" - and the producer portal's endpoint
 page carries the same ownership form for an endpoint it can see. Both endpoint
 pages also carry the signing-secret **Rotate** action, behind a confirm.
 
+Lost the token before you answered it? The endpoint is inert rather than broken: it
+keeps its subscriptions and its history, and each delivery it was skipped for is
+recorded with the reason `not_delivered:endpoint_unverified`, but it receives
+nothing. Recover by registering a replacement endpoint from the consumer portal's
+**Endpoints** page, subscribing it to the same event types, verifying it, and
+publishing the missed events again - the producer portal's Deliveries page has the
+replay panel (UI-5), and it refuses a skipped row on purpose, because replaying one
+would POST to an endpoint FR-403 still holds unverified.
+
 ### 8. Subscribe the endpoint to the event type
 
 Endpoint page -> **Subscriptions** -> choose `acme.created` -> **Subscribe**. The
