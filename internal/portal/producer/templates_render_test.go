@@ -385,8 +385,7 @@ func populatedPages() map[string]pageCase {
 				u.Disk.UsedBytes = 12_000_000
 				u.Disk.TotalBytes = 100_000_000
 				u.Disk.UsedPct = 12.5
-				u.Disk.Source = "statfs"
-				u.Disk.Path = "/var/lib/pigeon"
+				u.Disk.Source = "statfs:/var/lib/pigeon"
 				u.MaxDiskPct = 80
 				u.OverBudget = true
 				u.RetentionDays = map[string]int{"deliveries": 30, "events": 7}

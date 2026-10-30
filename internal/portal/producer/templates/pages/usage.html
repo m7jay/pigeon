@@ -20,7 +20,6 @@
     <dt>Budget</dt><dd>{{.Data.Usage.MaxDiskPct}}% of the volume</dd>
     <dt>Against the budget</dt><dd>{{if .Data.Usage.OverBudget}}{{template "badge" "warning"}} over budget - publishes are shed with a 429 rather than accepted and dropped (SB-7){{else}}{{template "badge" "active"}} inside the budget{{end}}</dd>
     <dt>Reading source</dt><dd class="mono">{{if .Data.Usage.Disk.Source}}{{.Data.Usage.Disk.Source}}{{else}}<span class="muted">not reported</span>{{end}}</dd>
-    <dt>Path</dt><dd class="mono">{{if .Data.Usage.Disk.Path}}{{.Data.Usage.Disk.Path}}{{else}}<span class="muted">not reported</span>{{end}}</dd>
     <dt>Checked</dt><dd class="muted">{{if .Data.Usage.CheckedAt}}{{.Data.Usage.CheckedAt}}{{else}}<span class="muted">not reported</span>{{end}}</dd>
   </dl>
   {{if .Data.Usage.ReadError}}<p class="flash flash-error">The figure above is the last good reading: {{.Data.Usage.ReadError}}</p>{{end}}
