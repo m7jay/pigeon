@@ -642,13 +642,22 @@ func rate(n int64, sec float64) float64 {
 // recorded phase data (not read back from the verdicts array the artifact carries,
 // which a doctored artifact could have written).
 type gradeResult struct {
-	Report     string          `json:"report"`
-	Label      string          `json:"label"`
-	Revision   string          `json:"revision,omitempty"`
-	Machine    machine         `json:"machine"`
-	Comparison classComparison `json:"comparison"`
-	Verdicts   []verdict       `json:"verdicts"`
-	OK         bool            `json:"ok"`
+	Report string `json:"report"`
+	Label  string `json:"label"`
+	// Revision is the tree the artifact was produced from, read from the generator's
+	// machine block (the block describes the generator on every §12 run).
+	Revision string `json:"revision,omitempty"`
+	// Machine is the generator's machine, as the artifact's block recorded it. The
+	// machine the class is checked against is MachineUnderTest, not this: see
+	// classComparison.MachineUnderTest.
+	Machine machine `json:"machine"`
+	// MachineUnderTest is the machine the clause was decided against - the same one as
+	// comparison.machine_under_test, lifted here so a verdict can be read without
+	// digging into the comparison.
+	MachineUnderTest *machine        `json:"machine_under_test,omitempty"`
+	Comparison       classComparison `json:"comparison"`
+	Verdicts         []verdict       `json:"verdicts"`
+	OK               bool            `json:"ok"`
 }
 
 func cmdGrade(args []string) error {
@@ -687,6 +696,7 @@ func cmdGrade(args []string) error {
 		Machine:  r.Machine,
 	}
 	res.Comparison = compareClass(&r)
+	res.MachineUnderTest = res.Comparison.MachineUnderTest
 	// Clauses 1 and 2 are decided by the run's own numbers, recomputed here from the
 	// artifact so the verdicts array is not the evidence.
 	c := config{Rate: r.Config.TargetRate, Subs: r.Config.Subs}
