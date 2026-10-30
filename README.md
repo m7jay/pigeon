@@ -396,11 +396,12 @@ Not landed, and not to be read as green:
 
 - Conventional Commits, one slice per PR, branched from the default branch
   (`feat/m0-skeleton`) - never from another slice's branch.
-- `make vet test` before pushing. `make test` needs no exported variables and no
-  second terminal: it starts compose.yaml's `test` profile (Postgres and Redis,
-  published on 55432 and 56379), waits for both containers to be healthy, creates
-  the database the DSN names if it is missing, and runs the DB-backed suite (`-p 1`
-  is CI's, for the same reason).
+- `make vet test` before pushing. `make test` needs no second terminal: given a
+  `.env` with the five values `compose.yaml` requires (the Configuration
+  checklist's first item creates it), it starts compose.yaml's `test` profile
+  (Postgres and Redis, published on 55432 and 56379), waits for both containers
+  to be healthy, creates the database the DSN names if it is missing, and runs the
+  DB-backed suite (`-p 1` is CI's, for the same reason).
 
   ```sh
   make test       # start the test containers, create the test database, run the suite
