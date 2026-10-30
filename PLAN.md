@@ -9,7 +9,9 @@ disagree, the requirements win and this file is wrong.
 1. The slice names the acceptance criteria it turns green, before any code.
 2. Test first: the failing test encodes the criterion, not the implementation.
 3. One commit per slice, Conventional Commits, no signing required.
-4. A slice is done when its ACs are green **and** `make vet test` passes.
+4. A slice is done when its ACs are green **and** `make vet test` passes against a
+   disposable Postgres - `make test` requires `PIGEON_TEST_DATABASE_URL` and refuses
+   to run without one, because the AC-15/AC-20 harness no longer skips.
 5. Anything learned that changes a requirement goes into `SPEC.md`'s gap list, not
    silently into the code.
 
@@ -286,7 +288,9 @@ Honest limits — the next slices own these:
 
 ## Definition of done for M0
 
-- `make vet test` green on a clean checkout.
+- `make vet test` green, with `PIGEON_TEST_DATABASE_URL` pointing at a disposable
+  Postgres: `make test` requires it and refuses to run without one (a clean checkout
+  has no such DSN, so the target, not the checkout, is the thing that is clean).
 - `PIGEON_TEST_DATABASE_URL` set in CI, harness green, AC-20 in the pipeline.
 - `pigeon` refuses to boot with a missing or weak admin password (OPS-7) —
   verified by hand.

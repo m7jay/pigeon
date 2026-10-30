@@ -11,16 +11,41 @@ build:
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(PRODUCER_PORTAL) ./cmd/producer-portal
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(PORTAL) ./cmd/consumer-portal
 
-test:
-	go test ./...
-
-# AC-20's harness: needs a disposable Postgres. The tests skip without it, so
-# `make test` stays green on a laptop and CI fails loudly if the DB is missing.
+# The local gate: the whole suite, as CI runs it, minus -race and -v. It is
+# DB-backed, so it NEEDS a disposable Postgres - the packages do not all skip
+# without one any more:
 #
-# -p 1 because the integration packages share one database.
-test-integration:
-	@test -n "$$PIGEON_TEST_DATABASE_URL" || (echo "set PIGEON_TEST_DATABASE_URL" && exit 1)
+# - PIGEON_TEST_DATABASE_URL is required, not optional. internal/httpapi's
+#   harness refuses to skip ("refusing to skip, the AC-15/AC-20 suite must run")
+#   by design since S0, so an unset DSN reds its 60 acceptance tests at 0.00 s
+#   and reads like a mass regression. The guard below says so in one line
+#   instead, before anything is built.
+# - -p 1 because every DB-backed package in this tree shares that one database:
+#   in parallel, one package's fixtures truncate the tables under another - store
+#   and relay run together red 25 store tests on `tuple concurrently updated`
+#   (SQLSTATE XX000) - and internal/delivery's test binary has been seen to sit
+#   past Go's 10 m default until it is killed. ci.yml's test step runs -p 1 for
+#   the same reason.
+# - -count=1 because the test cache cannot see the database: a PASS cached
+#   before a migration or a fixture change is not evidence.
+#
+# The database's name must contain "test": every harness refuses to touch any
+# other. PIGEON_TEST_REDIS_URL is optional here (unlike CI, which sets it): the
+# Redis-backed packages fall back to an in-process miniredis when it is unset.
+test:
+	@test -n "$$PIGEON_TEST_DATABASE_URL" || { \
+	  echo "PIGEON_TEST_DATABASE_URL is not set, so make test cannot pass:"; \
+	  echo "the AC-15/AC-20 harness (internal/httpapi) refuses to skip without a"; \
+	  echo "disposable Postgres, so an unset DSN reds its acceptance suite at 0.00s."; \
+	  echo "Point it at one whose name contains \"test\", e.g."; \
+	  echo "  PIGEON_TEST_DATABASE_URL=postgres://user@host:5432/pigeon_test?sslmode=disable"; \
+	  exit 1; \
+	}
 	go test -count=1 -p 1 ./...
+
+# The same DB-backed suite under its older name, so notes that name it keep
+# working. It is exactly `test`: PIGEON_TEST_DATABASE_URL is just as required.
+test-integration: test
 
 vet:
 	go vet ./...
@@ -48,7 +73,8 @@ compose-down:
 	docker compose down
 
 # Migrations are embedded and checksummed; a changed file that already ran is a
-# hard error at boot, and this catches it before a deploy does.
+# hard error at boot, and this catches it before a deploy does. It is `test`, so
+# it needs the same disposable Postgres that target requires.
 migrate-check: test
 
 clean:
