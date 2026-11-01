@@ -1,5 +1,46 @@
 # The load test
 
+Load testing is an operator-started activity. Builds and the routine test suite do
+not start it. The load generator records the CPU and memory visible on the machine
+where it runs; its report also records the instance's accepted rate, shed requests,
+and latency. There is no automatic run across the §8.1 CPU/memory rows. Those rows
+remain reference targets for the capacity model and grader.
+
+For an empirical maximum on the machine you have, run `make load-test` against a
+provisioned instance. It starts at a rate based on the available CPU count, increases
+the offered rate by 50% after each safe stage, and stops at the first shed request,
+request error, p99 above 100 ms, or generator pacing limit. It requires each stage's
+accepted count to reconcile against the database's events and outbox rows. Once it
+finds a service pressure point, it tests between that rate and the highest safe rate
+up to four times to refine the boundary. The report identifies the first pressure
+point and highest safe rate. Keep payload size, subscriber count, database, and
+instance configuration fixed for comparisons. The ramp summary is written to
+`load-test.json`.
+
+```sh
+make load-test LOAD_EVENT_TYPE=load.created
+```
+
+Run this from a local terminal at the repository root. The target starts the
+isolated `core-test`, `postgres-test`, `redis-test`, and `sink-test` services from
+`test.compose.yaml`; the core listens at `127.0.0.1:18080`, separate from the
+product core on port 8080. It seeds the disposable database and generates a
+producer API key automatically. That key is the load generator's credential for
+publishing events; you do not need to provide one yourself. The load generator
+runs on the host, not through `docker exec`. Run `make test-down` when finished;
+the Postgres and Redis test data are temporary.
+
+The isolated core raises its per-key and per-producer rate-limit buckets above the
+ramp's safety cap and uses a 40-connection database pool. This prevents the shipped
+50-per-key / 200-per-producer abuse limits from being mistaken for the instance's
+capacity ceiling. These overrides exist only in `test.compose.yaml`.
+
+The starting rate and in-flight concurrency use the resources visible to the load
+generator. Override `LOAD_START_RATE`, `LOAD_MAX_RATE`, and `LOAD_RATE_STEP` to tune
+the search. The short default stages are for finding the ceiling; after locating it,
+run the normal 5-minute warm-up and 30-minute measurement protocol at the selected
+rate before recording a formal result.
+
 This document is the measured half of the throughput claim. §8.1 is a capacity
 model - a row-level arithmetic argument for what 2 vCPU / 4 GB should hold - and
 NFR-4 makes the rated load a property of the machine class rather than one number

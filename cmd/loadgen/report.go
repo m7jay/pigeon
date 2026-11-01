@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -488,6 +489,19 @@ func describeMachine() machine {
 			}
 		}
 	}
+	if m.MemHostMiB == 0 {
+		// macOS and other non-Linux hosts do not expose /proc/meminfo. Read the
+		// host's physical-memory value where sysctl is available so the artifact
+		// still describes the resources this manual run actually had.
+		for _, key := range []string{"hw.memsize", "hw.physmem"} {
+			if b, err := exec.Command("sysctl", "-n", key).Output(); err == nil {
+				if bytes, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && bytes > 0 {
+					m.MemHostMiB = bytes / (1024 * 1024)
+					break
+				}
+			}
+		}
+	}
 	m.MemMiB = m.MemHostMiB
 	if cg := cgroupMemoryMiB(); cg > 0 {
 		m.MemCgroupMiB = cg
@@ -497,6 +511,8 @@ func describeMachine() machine {
 	}
 	if b, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
 		m.Kernel = "linux " + strings.TrimSpace(string(b))
+	} else if b, err := exec.Command("uname", "-sr").Output(); err == nil {
+		m.Kernel = strings.TrimSpace(string(b))
 	}
 	if dir, err := os.Getwd(); err == nil {
 		m.DiskGiB, m.DiskFreeGiB = diskUsage(dir)

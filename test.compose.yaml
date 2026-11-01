@@ -1,0 +1,78 @@
+name: pigeon-test
+
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pigeon_test
+      POSTGRES_PASSWORD: pigeon_test
+      POSTGRES_DB: pigeon_test
+      PIGEON_APP_PASSWORD: pigeon_app
+    ports:
+      - "127.0.0.1:55432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ./deploy/postgres/test-roles.sql:/docker-entrypoint-initdb.d/01-test-roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pigeon_test -d pigeon_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-test:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:56379:6379"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  core-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["/pigeon"]
+    environment:
+      # The application role and migration role are separate, just as in the
+      # product stack. Both credentials and this entire database are disposable.
+      PIGEON_DATABASE_URL: postgres://pigeon_app:pigeon_app@postgres-test:5432/pigeon_test?sslmode=disable
+      PIGEON_MIGRATE_DATABASE_URL: postgres://pigeon_test:pigeon_test@postgres-test:5432/pigeon_test?sslmode=disable
+      PIGEON_REDIS_URL: redis://redis-test:6379/0
+      PIGEON_INSTANCE_ADMIN_PASSWORD: Load-Test-Only-Admin-Password-42
+      PIGEON_HEADERS_KEY: /mxm1i7pxOA1RGvIcQHGx1EPyWXCuUTPrG9l0DtCza4=
+      # Keep the abuse-protection buckets above the ramp's 100,000 events/s
+      # ceiling so their 429s measure service backpressure rather than a policy
+      # limit. The separate test stack is ephemeral and carries only load data.
+      PIGEON_RATE_LIMIT_PER_KEY_RPS: "1000000"
+      PIGEON_RATE_LIMIT_PER_KEY_BURST: "2000000"
+      PIGEON_RATE_LIMIT_PER_PRODUCER_RPS: "1000000"
+      PIGEON_RATE_LIMIT_PER_PRODUCER_BURST: "2000000"
+      PIGEON_DB_MAX_CONNS: "40"
+    ports:
+      - "127.0.0.1:18080:8080"
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+      redis-test:
+        condition: service_healthy
+      sink-test:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/pigeon", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  sink-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: loadgen-sink
+    command: ["sink", "-addr", ":9001"]
+    expose:
+      - "9001"

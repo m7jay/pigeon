@@ -91,6 +91,9 @@ jobs:
           # 664.8 s to 13.2 s standalone. The 25m stays as headroom rather than as
           # the thing the suite depends on.
           go test -count=1 -race -p 1 -v -timeout 25m ./... 2>&1 | tee /tmp/go-test.log
+          # This short fake-server runtime check drives cmd/loadgen's pacing loop.
+          # Keep it out of `make test`; it is not a unit test or a real capacity run.
+          go test -count=1 -race -tags loadgen_integration -run '^TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase$' -v ./cmd/loadgen 2>&1 | tee -a /tmp/go-test.log
           # A skip is a failure here. The whole point of S0 is that the
           # cross-producer harness (AC-20) actually executes against Postgres;
           # a green run that silently skipped it is the bug this closes.

@@ -106,6 +106,8 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "max":
+		err = cmdMax(os.Args[2:])
 	case "compare":
 		err = cmdCompare(os.Args[2:])
 	case "grade":
@@ -131,6 +133,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `loadgen - Pigeon load generator (§16 load protocol)
 
   loadgen run     -base URL -key KEY -event-type NAME -rate N [-subs N] [-db DSN] [-out FILE] [-class NAME]
+  loadgen max     -base URL -key KEY -event-type NAME [-db DSN] [-out FILE]
   loadgen grade   -label FILE [-out FILE] [-class NAME]
   loadgen compare -label FILE -label FILE [-label FILE ...]
 
@@ -165,6 +168,8 @@ grade flags:
   -class           assert the artifact declares this class
 
 "compare" is AC-43's replica-scaling comparison; "grade" is AC-30 clause 3's.
+"max" ramps the offered rate on this machine until service pressure or a generator
+limit is reached; it writes a ramp summary JSON artifact.
 `)
 }
 

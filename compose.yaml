@@ -1,31 +1,3 @@
-# Pigeon — reference deployment (OPS-1, §2.1).
-#
-# Five containers on one modest host: core, producer portal, consumer portal,
-# Postgres, Redis. The portals are separate deployables (§14, M2a and M2b) that
-# may each be omitted (AC-40): the core keeps serving both APIs with the same
-# scoping, and whoever had a UI simply has none. The image builds all three
-# binaries (§14, AC-40), so a deployment starts the containers it wants and this
-# file brings up all five.
-#
-# Two more services - postgres-test and redis-test - sit behind the `test`
-# profile: `make test` starts them, a plain `docker compose up` never does. They
-# are scratch (tmpfs, no volume, no `pigeon` database) and are not part of the
-# five above.
-#
-# Two rules this file keeps, both checked by `go test ./internal/config`:
-#
-#   - Every service built from this repository names the binary it runs. The
-#     image's own ENTRYPOINT is the core, so a portal container that does not
-#     override it runs the core, whatever the service is called.
-#   - The core is handed .env wholesale (`env_file`) and a portal is not: each
-#     portal lists the names its own code reads. That is deliberately noisier
-#     than giving the portals `env_file: .env` too - it keeps visible which knobs
-#     a deployable actually carries, and it keeps core-only settings (the
-#     database URLs, the pool arithmetic, the retention windows) out of a
-#     container that has no reader for them. The cost is that a name a portal
-#     reads and this list omits is a knob .env.example documents and the
-#     deployment ignores, which is what the check refuses.
-
 name: pigeon
 
 services:
@@ -77,65 +49,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-
-  # ---- The test backend (profile `test`) --------------------------------------
-  #
-  # `make test` starts these two; a plain `docker compose up` never does, which is
-  # what the profile is for. They are scratch: their data lives on tmpfs, so no
-  # volume holds anything, and neither of them names the product's pgdata/redisdata
-  # volumes or its `pigeon` database.
-  #
-  # The host ports are the product's (5432, 6379) with a 5 in front, because the
-  # suite runs on the host rather than on this network - so the test pair must be
-  # reachable there - and it has to be able to run beside a stack that is already
-  # publishing 5432/6379. Both are bound to the loopback address: this is a
-  # scratch superuser with a published password, and the only client either of
-  # them has is the suite on this host. The Makefile writes exactly these ports
-  # into its default DSNs; PIGEON_TEST_DATABASE_URL and PIGEON_TEST_REDIS_URL
-  # point the suite at a backend of your own instead, and then this profile is
-  # not started at all.
-  postgres-test:
-    image: postgres:16-alpine
-    profiles: ["test"]
-    environment:
-      # The suite's superuser, not the product's roles: the harnesses provision
-      # their own runtime role (internal/dbtest) and need CREATEROLE and CREATE
-      # DATABASE, and this cluster is disposable and empty.
-      POSTGRES_USER: pigeon_test
-      POSTGRES_PASSWORD: pigeon_test
-      # `pigeon_test` is created by `make create-test-db`, not by this image, so
-      # the create-if-missing step is the same statement here as it is against a
-      # Postgres the developer brought themselves - instead of a step that only
-      # ever runs on a machine whose database is already there.
-      POSTGRES_DB: postgres
-    ports:
-      - "127.0.0.1:55432:5432"
-    # tmpfs, not the product's pgdata volume: a test database is thrown away with
-    # the container, and `make test-down` must not be able to leave a half-used one
-    # behind for the next run to inherit.
-    tmpfs:
-      - /var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pigeon_test -d postgres"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-
-  redis-test:
-    image: redis:7-alpine
-    profiles: ["test"]
-    ports:
-      - "127.0.0.1:56379:6379"
-    # No AOF and no volume: this is the suite's scratch broker. D-5's appendonly
-    # requirement is a property of the deployment's Redis above, which ci.yml
-    # asserts by name on this file.
-    tmpfs:
-      - /data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
 
   core:
     build:

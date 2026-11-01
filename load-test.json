@@ -1,0 +1,40 @@
+{
+  "started_at": "2026-11-01T10:55:28.234915Z",
+  "finished_at": "2026-11-01T10:56:38.606353Z",
+  "machine": {
+    "hostname": "MacBook-Pro-von-Jayachandra.local",
+    "cpus": 12,
+    "cpu_affinity": 12,
+    "mem_mib": 18432,
+    "mem_host_mib": 18432,
+    "disk_gib": 926.3517189025879,
+    "disk_free_gib": 543.6250152587891,
+    "kernel": "Darwin 27.0.0",
+    "go_version": "go1.26.0",
+    "database": "PostgreSQL 16.15"
+  },
+  "sustainable_events_per_s": 0,
+  "accepted_events_per_s": 0,
+  "first_pressure_events_per_s": 0,
+  "maximum_found": false,
+  "stop_reason": "database reconciliation did not match accepted events and outbox rows",
+  "stages": [
+    {
+      "offered_events_per_s": 300,
+      "accepted_events_per_s": 299.93333333333334,
+      "shed_events_per_s": 0,
+      "errors": 0,
+      "p99_ms": 4.467,
+      "pacer_lag": 0,
+      "db_reconciled": true,
+      "db_generator_accepted": 17998,
+      "db_events": 17999,
+      "db_outbox": 17999,
+      "db_events_match": false,
+      "db_outbox_match": false,
+      "safe": false,
+      "pressure": false,
+      "reason": "database reconciliation did not match accepted events and outbox rows"
+    }
+  ]
+}

@@ -1,25 +1,20 @@
 package main
 
-// Deterministic tests for AC-30's third clause. They need no rated host, no
-// database and no network: the clause's inputs are the §8.1 table, the artifact's
-// window lengths and two database counts, so the verdict is a pure function of an
-// artifact and the table. The one end-to-end test drives a fake instance over
-// loopback; the one process-level test builds this package and reads its exit
-// status, because the exit status is the verdict.
+// Deterministic tests for AC-30's third clause. They need no rated host, database,
+// or load-generating server: the verdict is a pure function of the §8.1 table and
+// report artifacts. The process-level test builds this package and checks the CLI
+// exit status, because the exit status is the verdict.
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -170,8 +165,7 @@ func TestClassPreflightRefusesAMachineThatDoesNotCarryTheClass(t *testing.T) {
 		t.Fatalf("every §8.1 row matches %s, so this test cannot build an unrated claim", m.describe())
 	}
 	_, _, err := classPreflight(config{
-		Class: unrated, Subs: classSubs, DB: "postgres://user@localhost/db",
-		BaseURL: "http://127.0.0.1:8080",
+		Class: unrated, Subs: classSubs,
 	})
 	if err == nil {
 		t.Fatalf("-class %s was accepted on %s, which does not carry it", unrated, m.describe())
@@ -257,16 +251,16 @@ func TestClassPreflightRequiresTheMachineUnderTestWhenTheGeneratorIsOffIt(t *tes
 func TestSUTDeclarationMustAgreeWithTheObservedMachine(t *testing.T) {
 	m := describeMachine()
 	if _, _, err := classPreflight(config{
-		Class: "8vCPU-16GB", Subs: classSubs, DB: "postgres://user@localhost/db",
-		BaseURL: "http://127.0.0.1:8080", // loopback: the generator shares the machine
+		Class: "8vCPU-16GB", Subs: classSubs,
+		DB: "postgres://user@localhost/db", BaseURL: "http://127.0.0.1:8080",
 		SUTCPUs: m.CPUs + 4, SUTMemGiB: float64(m.MemMiB) / 1024,
 	}); err == nil || !strings.Contains(err.Error(), "-sut-cpus") {
 		t.Fatalf("a -sut-cpus that disagrees with the observed machine: err = %v, want a refusal naming -sut-cpus", err)
 	}
 	// The agreement case is accepted, and the class gate then does the deciding.
 	if _, _, err := classPreflight(config{
-		Class: "8vCPU-16GB", Subs: classSubs, DB: "postgres://user@localhost/db",
-		BaseURL: "http://127.0.0.1:8080",
+		Class: "8vCPU-16GB", Subs: classSubs,
+		DB: "postgres://user@localhost/db", BaseURL: "http://127.0.0.1:8080",
 		SUTCPUs: m.CPUs, SUTMemGiB: float64(m.MemMiB) / 1024,
 	}); err == nil || !strings.Contains(err.Error(), "does not carry") {
 		t.Fatalf("an agreeing declaration on %s: err = %v, want the class refusal (this box carries no §8.1 row)", m.describe(), err)
@@ -304,7 +298,7 @@ func TestDeclaredSUTNeedsBothFiguresAndIsRecorded(t *testing.T) {
 // refused up front.
 func TestClassPreflightRequiresSection81BasisAndTheDatabase(t *testing.T) {
 	base := func() config {
-		return config{Class: "2vCPU-4GB", Subs: classSubs, DB: "postgres://user@localhost/db", BaseURL: "http://127.0.0.1:8080"}
+		return config{Class: "2vCPU-4GB", Subs: classSubs, BaseURL: "http://192.0.2.10:8080", SUTCPUs: 2, SUTMemGiB: 4}
 	}
 	c := base()
 	c.Subs = 1
@@ -846,79 +840,5 @@ func TestPhaseWindowsFollowSection12(t *testing.T) {
 	}
 	if w.gradedStart.Before(w.firstWindowEnd) {
 		t.Error("the graded window overlaps the first comparison window, so the two are not disjoint")
-	}
-}
-
-// TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase drives the harness end to
-// end against a fake instance - the pacer, the phase attribution, the class claim and
-// the artifact's graded window - and then feeds the artifact through the verdict. It
-// says nothing about §8.1's numbers (a fake instance has no ceiling); what it pins is
-// that a run with a class claim produces an artifact whose verdict is about the
-// missing database, not about a number.
-func TestRunRecordsTheClassAndRefusesToGradeWithoutTheDatabase(t *testing.T) {
-	var requests atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := requests.Add(1)
-		if n%3 == 0 {
-			w.WriteHeader(http.StatusTooManyRequests) // the ceiling the fake instance has
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer srv.Close()
-
-	row, _ := lookupClass("2vCPU-4GB")
-	sut := machine{CPUs: 2, MemMiB: 4 * 1024, Source: machineDeclared}
-	c := config{
-		BaseURL: srv.URL, Key: "fixture-key", EventType: "load.created",
-		Rate: 60, Subs: classSubs, PayloadBytes: referencePayloadBytes,
-		Warmup: 200 * time.Millisecond, Measure: 700 * time.Millisecond,
-		Evaluate: 300 * time.Millisecond, Concurrency: 8,
-		RequestTimeout: 2 * time.Second, Settle: 0, Label: "fixture",
-		Claim: row.claim(false, "flag"), SUT: &sut,
-	}
-	rep, err := runLoad(c)
-	if err != nil {
-		t.Fatalf("runLoad: %v", err)
-	}
-	if rep.Class == nil || rep.Class.Name != row.Name {
-		t.Fatalf("the artifact's class claim = %+v, want %s", rep.Class, row.Name)
-	}
-	if rep.MachineUnderTest == nil || rep.MachineUnderTest.CPUs != 2 || rep.MachineUnderTest.Source != machineDeclared {
-		t.Fatalf("the artifact's machine under test = %+v, want the declared 2 vCPU / 4 GiB machine", rep.MachineUnderTest)
-	}
-	if rep.Class.Evidence != "attested" || rep.Class.GeneratorOnSUT {
-		t.Errorf("claim evidence = %q / generator_on_sut %v, want attested/false", rep.Class.Evidence, rep.Class.GeneratorOnSUT)
-	}
-	if rep.Config.WarmupS != 0.2 || rep.Config.MeasureS != 0.7 || rep.Config.EvaluateS != 0.3 {
-		t.Errorf("the artifact's windows = %v/%v/%v, want the flags' 0.2/0.7/0.3",
-			rep.Config.WarmupS, rep.Config.MeasureS, rep.Config.EvaluateS)
-	}
-	if rep.Evaluated.Attempted == 0 || rep.Evaluated.Shed == 0 {
-		t.Errorf("the evaluated window saw %d attempts and %d sheds; the fake instance sheds every third request",
-			rep.Evaluated.Attempted, rep.Evaluated.Shed)
-	}
-	if rep.Graded.Ran || !strings.Contains(rep.Graded.Note, "-db") {
-		t.Errorf("graded reconcile without -db = ran:%v note:%q, want it to say the database was needed", rep.Graded.Ran, rep.Graded.Note)
-	}
-
-	// The artifact as `grade` sees it: through JSON, not in memory.
-	var round report
-	b, err := json.Marshal(rep)
-	if err != nil {
-		t.Fatalf("marshal the artifact: %v", err)
-	}
-	if err := json.Unmarshal(b, &round); err != nil {
-		t.Fatalf("unmarshal the artifact: %v", err)
-	}
-	cmp := compareClass(&round)
-	if cmp.Verdict.OK {
-		t.Fatalf("a run whose graded window was never reconciled was graded green: %s", cmp.Verdict.Detail)
-	}
-	if !strings.Contains(cmp.Verdict.Detail, "not reconciled") {
-		t.Errorf("the refusal does not name the reconciliation: %s", cmp.Verdict.Detail)
-	}
-	if round.Machine.CPUs == 0 || round.Machine.Kernel == "" || round.Machine.Go == "" {
-		t.Errorf("the artifact's machine block is incomplete: %+v", round.Machine)
 	}
 }

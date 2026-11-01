@@ -398,25 +398,32 @@ Not landed, and not to be read as green:
 
 - Conventional Commits, one slice per PR, branched from the default branch
   (`feat/m0-skeleton`) - never from another slice's branch.
-- `make vet test` before pushing. `make test` needs no second terminal: given a
-  `.env` with the five values `compose.yaml` requires (the Configuration
-  checklist's first item creates it), it starts compose.yaml's `test` profile
-  (Postgres and Redis, published on 55432 and 56379), waits for both containers
-  to be healthy, creates the database the DSN names if it is missing, and runs the
-  DB-backed suite (`-p 1` is CI's, for the same reason).
+- `make vet test` before pushing. `make build` and Docker image builds run the
+  self-contained Go suite first. `make test` / `make unit-test` runs that same
+  suite without Docker. Database-backed acceptance tests skip
+  when no test DSN is provided. Run those separately with `make test-integration`,
+  which starts the isolated Postgres and Redis test services and runs the full suite.
 
   ```sh
-  make test       # start the test containers, create the test database, run the suite
-  make test-env   # the same setup without the suite
-  make test-down  # stop the test containers again
+  make test                # unit tests; no containers required
+  make test-integration    # full suite, including database-backed integration tests
+  make loadgen-integration-test # opt-in short fake-server check of the loadgen loop
+  make load-test            # manual capacity ramp against isolated Docker services
+  make test-down           # stop the isolated integration-test containers
   ```
 
   With a Postgres and a Redis of your own - service containers, another compose
   project, a server in the next room - set both DSNs instead and nothing needs
   docker: `PIGEON_TEST_DATABASE_URL=postgres://user@host:5432/pigeon_test?sslmode=disable
-  PIGEON_TEST_REDIS_URL=redis://host:6379/0 make test`. The database's name must
-  contain `test` (`internal/httpapi` and `internal/relay` refuse any other name),
-  and `make test-integration` is the same target under its older name.
+  PIGEON_TEST_REDIS_URL=redis://host:6379/0 make test-integration`. The database's name must
+  contain `test` (`internal/httpapi` and `internal/relay` refuse any other name).
+  Load testing is separate and manual; `make load-test` starts `core-test` against
+  the disposable Postgres and Redis in `test.compose.yaml`, seeds a load producer,
+  then ramps traffic from the local terminal. It never targets the product `core`,
+  `postgres`, or `redis` services in `compose.yaml`. The ramp uses available CPUs
+  for its starting rate and concurrency, records CPU and memory, and refines the
+  highest safe rate before the first pressure point. Run `make test-down` afterward
+  to stop the isolated stack. No hardware class matrix runs automatically.
 - CI (`.github/workflows/ci.yml`) runs the `test` job on `ubuntu-24.04` with
   Postgres 16 and Redis 7 service containers:
   `go test -count=1 -race -p 1 -v -timeout 25m ./...`. A `--- SKIP` fails the job,

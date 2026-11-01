@@ -105,6 +105,9 @@ var (
 // setup returns the shared environment, provisioning it on first use.
 func setup(t *testing.T) *env {
 	t.Helper()
+	if os.Getenv("PIGEON_TEST_DATABASE_URL") == "" {
+		t.Skip("PIGEON_TEST_DATABASE_URL not set; run make test-integration for the database-backed acceptance suite")
+	}
 	sharedOnce.Do(func() { sharedEnv, sharedErr = buildEnv() })
 	if sharedErr != nil {
 		t.Fatalf("harness: %v", sharedErr)

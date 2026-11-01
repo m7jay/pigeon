@@ -2,7 +2,7 @@
 # The builder is only ever a build-time dependency; nothing from it ships except
 # the static binary and the CA bundle the delivery worker needs for HTTPS.
 
-FROM golang:1.23-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 # Dependency layer first so a source edit does not re-download the module cache.
@@ -11,6 +11,10 @@ RUN go mod download
 
 COPY . .
 ARG VERSION=dev
+# Image builds gate deployable binaries on the self-contained unit suite. The
+# database-backed acceptance tests are only enabled when their explicit DSNs are
+# supplied by CI or `make test-integration`.
+RUN go test -count=1 -p 1 ./...
 RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags "-s -w -X main.version=${VERSION}" \
       -o /out/pigeon ./cmd/pigeon
@@ -26,9 +30,19 @@ RUN CGO_ENABLED=0 go build -trimpath \
 RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags "-s -w -X main.version=${VERSION}" \
       -o /out/producer-portal ./cmd/producer-portal
+RUN CGO_ENABLED=0 go build -trimpath \
+      -ldflags "-s -w -X main.version=${VERSION}" \
+      -o /out/loadgen ./cmd/loadgen
 
 FROM alpine:3.20 AS certs
 RUN apk add --no-cache ca-certificates
+
+FROM scratch AS loadgen-sink
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/loadgen /loadgen
+USER 65532:65532
+EXPOSE 9001
+ENTRYPOINT ["/loadgen"]
 
 FROM scratch
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt

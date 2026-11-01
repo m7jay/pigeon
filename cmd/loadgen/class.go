@@ -399,8 +399,8 @@ func classPreflight(c config) (*classClaim, machine, error) {
 	if c.Subs != classSubs {
 		return nil, machine{}, fmt.Errorf("§8.1's event column is stated at %d subscriptions per event and -class grades that workload; -subs is %d", classSubs, c.Subs)
 	}
-	if c.DB == "" {
-		return nil, machine{}, errors.New("§12 counts accepted events in events and outbox rather than from the generator's own counter; -class requires -db")
+	if c.BaseURL == "" {
+		c.BaseURL = "http://127.0.0.1:8080"
 	}
 	onSUT, source, err := generatorIsOnSUT(c.GeneratorOnSUT, c.BaseURL)
 	if err != nil {
@@ -425,6 +425,9 @@ func classPreflight(c config) (*classClaim, machine, error) {
 	if reason := classMatch(sut, row); reason != "" {
 		return nil, machine{}, fmt.Errorf("the machine under test does not carry -class %s: %s (§8.1 rates %s). A graded number on a machine that does not carry the class is the failure mode AC-30's third clause exists to prevent, so this run is refused rather than graded",
 			row.Name, reason, classNames())
+	}
+	if c.DB == "" {
+		return nil, machine{}, errors.New("§12 counts accepted events in events and outbox rather than from the generator's own counter; -class requires -db")
 	}
 	return claim, sut, nil
 }

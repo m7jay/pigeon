@@ -4,160 +4,102 @@ PRODUCER_PORTAL := bin/producer-portal
 VERSION    := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS    := -s -w -X main.version=$(VERSION)
 
-# ---- The test backend -------------------------------------------------------
-#
-# `make test` runs the whole DB-backed suite against a disposable Postgres and
-# Redis, and needs nothing exported: it brings up compose.yaml's `test` profile
-# (postgres-test + redis-test, published on the ports below), waits for both
-# healthchecks, creates the database the DSN names if it is not there yet, and
-# runs the suite. `make test-down` stops the two containers again; neither target
-# touches the product stack.
-#
-# The ports are the product stack's own (5432, 6379) with a 5 in front, so the
-# test pair runs beside a `docker compose up` of the product instead of competing
-# with it for a host port. They are written literally, here and in compose.yaml,
-# and deliberately not as knobs: a port the Makefile moved without moving the
-# published one builds a DSN for a port nothing serves, and a `${NAME}` a
-# test-only service interpolates is a setting `.env.example` owes the operator
-# (internal/config's OPS-3 guard).
-#
-# A developer who already has a Postgres and a Redis - service containers,
-# another compose project, a server in the next room - sets *both* DSNs and
-# nothing here needs docker:
-#
-#   PIGEON_TEST_DATABASE_URL=postgres://user@host:5432/pigeon_test?sslmode=disable \
-#   PIGEON_TEST_REDIS_URL=redis://host:6379/0 make test
-#
-# Setting one of the two is not half a backend: `test-env` starts the profile for
-# the half that is unset, and only that half, and uses the DSN you gave for the
-# other. So a developer whose own Postgres already listens on the port the test
-# profile publishes is fine - set that DSN and compose starts only redis-test.
-# The database name is a knob because nothing else has to agree on it: it travels
-# in the DSN, and `create-test-db` creates exactly that name.
 TEST_DB_NAME ?= pigeon_test
-
-# The DSNs are the developer's where they set them and the test profile's where
-# they did not. make reads them from the environment itself, so nothing has to be
-# exported for the suite to see them.
 PIGEON_TEST_DATABASE_URL ?=
-PIGEON_TEST_REDIS_URL    ?=
-
-COMPOSE_TEST_DATABASE_URL ?= postgres://pigeon_test:pigeon_test@127.0.0.1:55432/$(TEST_DB_NAME)?sslmode=disable
-COMPOSE_TEST_REDIS_URL    ?= redis://127.0.0.1:56379/0
-
-TEST_DATABASE_URL := $(if $(strip $(PIGEON_TEST_DATABASE_URL)),$(PIGEON_TEST_DATABASE_URL),$(COMPOSE_TEST_DATABASE_URL))
-TEST_REDIS_URL    := $(if $(strip $(PIGEON_TEST_REDIS_URL)),$(PIGEON_TEST_REDIS_URL),$(COMPOSE_TEST_REDIS_URL))
-
-# The services the target has to start, which is exactly the half of the backend
-# the developer did not provide. Empty (both DSNs set) means it starts nothing and
-# needs no docker at all.
+PIGEON_TEST_REDIS_URL ?=
+TEST_DATABASE_URL := $(if $(strip $(PIGEON_TEST_DATABASE_URL)),$(PIGEON_TEST_DATABASE_URL),postgres://pigeon_test:pigeon_test@127.0.0.1:55432/$(TEST_DB_NAME)?sslmode=disable)
+TEST_REDIS_URL := $(if $(strip $(PIGEON_TEST_REDIS_URL)),$(PIGEON_TEST_REDIS_URL),redis://127.0.0.1:56379/0)
 TEST_SERVICES := $(strip $(if $(strip $(PIGEON_TEST_DATABASE_URL)),,postgres-test) $(if $(strip $(PIGEON_TEST_REDIS_URL)),,redis-test))
 
-.PHONY: build test test-integration test-env test-up test-down create-test-db \
+.PHONY: build test unit-test test-integration loadgen-integration-test test-up test-down load-test-up load-test \
         vet lint run run-portal run-producer-portal compose-up compose-down \
         migrate-check clean
 
-build:
+build: unit-test
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/pigeon
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(PRODUCER_PORTAL) ./cmd/producer-portal
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o $(PORTAL) ./cmd/consumer-portal
 
-# The local gate: the whole suite, as CI runs it, minus -race and -v. It is
-# DB-backed, so it NEEDS a disposable Postgres; `test-env` is what gives it one:
-#
-# - the database comes from PIGEON_TEST_DATABASE_URL. Left unset, `test-env`
-#   starts compose.yaml's `test` profile and the DSN is the address that profile
-#   publishes, so a clean checkout with a `.env` (the five values compose.yaml
-#   marks ${VAR:?}) needs no exported variable and no second terminal. It is not
-#   optional in the sense that matters: internal/httpapi's
-#   harness refuses to skip ("refusing to skip, the AC-15/AC-20 suite must run")
-#   by design since S0, so a database that is not reachable reds its 60
-#   acceptance tests at 0.00 s and reads like a mass regression.
-# - -p 1 because every DB-backed package in this tree shares that one database:
-#   in parallel, one package's fixtures truncate the tables under another - store
-#   and relay run together red 25 store tests on `tuple concurrently updated`
-#   (SQLSTATE XX000) - and internal/delivery's test binary has been seen to sit
-#   past Go's 10 m default until it is killed. ci.yml's test step runs -p 1 for
-#   the same reason.
-# - -count=1 because the test cache cannot see the database: a PASS cached
-#   before a migration or a fixture change is not evidence.
-#
-# The database's name must contain "test": internal/httpapi and internal/relay
-# refuse any other name, and the other DB-backed harnesses - store, delivery,
-# identity, db, faults - have no such check: they migrate and truncate whatever
-# database the DSN names. Point the DSN at a disposable database you do not care
-# about. PIGEON_TEST_REDIS_URL is optional here (unlike CI, which sets it): the
-# Redis-backed packages fall back to an in-process miniredis when it is unset, so
-# `test-env` sets it rather than leaving a run that proves nothing about Redis.
-test: test-env
+# The routine suite is self-contained. Database-backed acceptance tests skip
+# unless `test-integration` supplies their explicit disposable backend.
+test: unit-test
+
+unit-test:
+	go test -count=1 -p 1 ./...
+
+# Run database-backed integration tests explicitly; this is not part of `test`.
+test-integration: test-up
 	@echo "==> go test -count=1 -p 1 ./... against $(TEST_DATABASE_URL)" | sed -E 's#(//[^:/@]+):[^@]*@#\1:***@#'
-	@export PIGEON_TEST_DATABASE_URL='$(TEST_DATABASE_URL)'; \
-	 export PIGEON_TEST_REDIS_URL='$(TEST_REDIS_URL)'; \
-	 go test -count=1 -p 1 ./...
+	PIGEON_TEST_DATABASE_URL='$(TEST_DATABASE_URL)' PIGEON_TEST_REDIS_URL='$(TEST_REDIS_URL)' PIGEON_LOADGEN_DB='$(TEST_DATABASE_URL)' go test -count=1 -p 1 ./...
 
-# The same DB-backed suite under its older name, so notes that name it keep
-# working. It is exactly `test`, setup and all: neither name needs an exported
-# DSN, and both start the test containers when it is left unset.
-test-integration: test
+# Opt-in runtime test for the loadgen loop against a fake server. It sends a
+# short synthetic request stream, so it is separate from ordinary unit tests.
+loadgen-integration-test:
+	go test -tags loadgen_integration -count=1 ./cmd/loadgen
 
-# The test backend without the suite: start what is missing, wait for it, create
-# the database if it is not there. A target of its own so a developer iterating on
-# one package pays for the compose round trip once, and so `make test` is setup
-# plus the suite rather than one recipe with the setup hidden inside it.
-test-env: $(if $(TEST_SERVICES),test-up) create-test-db
-
-# Start compose.yaml's `test` profile - or the half of it the developer did not
-# provide - and block until those containers report healthy. `--wait` is the
-# readiness check: a container that never becomes healthy fails here, with its own
-# healthcheck output, instead of in whichever test reaches it first. `up -d` on a
-# container that is already running is a no-op, so this is safe to re-run.
+# Start any missing disposable test services and wait for healthchecks. Developers
+# who supplied both test DSNs can use their existing backend without Docker.
 test-up:
-	@command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 || { \
-	  echo "make test needs a test backend, and this box has no usable 'docker compose':"; \
-	  echo "  with docker and the compose plugin, this target starts compose.yaml's 'test' profile"; \
+	@if [ -n "$(TEST_SERVICES)" ]; then \
+	command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 || { \
+	  echo "make test-integration needs a test backend, and this box has no usable 'docker compose':"; \
+	  echo "  with docker and the compose plugin, this target starts test.compose.yaml"; \
 	  echo "  (postgres-test + redis-test) and waits for it; without them, point the suite at"; \
 	  echo "  servers you already have:"; \
 	  echo "      PIGEON_TEST_DATABASE_URL=postgres://user@host:5432/pigeon_test?sslmode=disable"; \
 	  echo "      PIGEON_TEST_REDIS_URL=redis://host:6379/0"; \
 	  exit 1; \
-	}
-	docker compose --profile test up -d --wait $(TEST_SERVICES)
+	}; \
+	docker compose -f test.compose.yaml up -d --wait $(TEST_SERVICES); \
+	fi
 
-# Stop the test containers. Both are named on purpose: `docker compose down` takes
-# the product stack with it, and so does a `rm` with no service argument.
+# Stop the isolated test and load-test containers. This file never controls the
+# product stack in compose.yaml.
 test-down:
-	docker compose --profile test rm -s -f postgres-test redis-test
+	docker compose -f test.compose.yaml down
 
-# Create the database the DSN names, if it is not there. Idempotent: the second
-# run reports that it exists and changes nothing, so `make test` is safe to
-# re-run. It assumes no client and no admin connection beyond the DSN the
-# developer already gave - cmd/dbcreate opens the DSN's own server as the DSN's
-# own user, on the `postgres` maintenance database, and touches no other database
-# - so psql does not have to be installed and a DSN for a disposable database is
-# all it takes. The DSN arrives over stdin rather than argv, so a password in it
-# stays out of the process list.
-create-test-db:
-	@printf '%s' '$(TEST_DATABASE_URL)' | go run ./cmd/dbcreate
+# Manual saturation ramp against the isolated test core. Starting rate and
+# concurrency use resources visible to the host load generator.
+LOAD_EVENT_TYPE ?= load.created
+LOAD_TEST_BASE_URL ?= http://127.0.0.1:18080
+LOAD_TEST_DATABASE_URL ?= postgres://pigeon_test:pigeon_test@127.0.0.1:55432/pigeon_test?sslmode=disable
+LOAD_TEST_SINK_URL ?= http://sink-test:9001/hook
+LOAD_START_RATE ?= 0
+LOAD_MAX_RATE ?= 100000
+LOAD_RATE_STEP ?= 1.5
+LOAD_MAX_STAGES ?= 20
+LOAD_REFINE_STAGES ?= 4
+LOAD_SUBS ?= 10
+LOAD_CONCURRENCY ?= 0
+LOAD_WARMUP ?= 15s
+LOAD_MEASURE ?= 45s
+LOAD_EVALUATE ?= 15s
+LOAD_SETTLE ?= 10s
+load-test-up:
+	docker compose -f test.compose.yaml up -d --build --wait core-test sink-test
+
+load-test: load-test-up
+	@set -eu; \
+	seed_output=$$(go run ./cmd/loadgen seed -db '$(LOAD_TEST_DATABASE_URL)' \
+	  -producer loadtest -event-type '$(LOAD_EVENT_TYPE)' -routing consumer \
+	  -endpoints '$(LOAD_SUBS)' -url '$(LOAD_TEST_SINK_URL)'); \
+	printf '%s\n' "$$seed_output" | sed '/^PIGEON_LOADGEN_KEY=/d'; \
+	loadgen_key=$$(printf '%s\n' "$$seed_output" | sed -n 's/^PIGEON_LOADGEN_KEY=//p'); \
+	test -n "$$loadgen_key" || { echo "loadgen seed did not return an API key"; exit 2; }; \
+	PIGEON_LOADGEN_KEY="$$loadgen_key" PIGEON_LOADGEN_DB='$(LOAD_TEST_DATABASE_URL)' \
+	  go run ./cmd/loadgen max -base '$(LOAD_TEST_BASE_URL)' \
+	  -event-type '$(LOAD_EVENT_TYPE)' -consumer-ref load-consumer -start-rate '$(LOAD_START_RATE)' \
+	  -max-rate '$(LOAD_MAX_RATE)' -step '$(LOAD_RATE_STEP)' \
+	  -max-stages '$(LOAD_MAX_STAGES)' -refine-stages '$(LOAD_REFINE_STAGES)' -subs '$(LOAD_SUBS)' \
+	  -concurrency '$(LOAD_CONCURRENCY)' -warmup '$(LOAD_WARMUP)' \
+	  -measure '$(LOAD_MEASURE)' -evaluate '$(LOAD_EVALUATE)' -settle '$(LOAD_SETTLE)' \
+	  -db '$(LOAD_TEST_DATABASE_URL)' -out load-test.json
 
 vet:
 	go vet ./...
 
 lint: vet
 	@command -v golangci-lint >/dev/null && golangci-lint run ./... || echo "golangci-lint not installed; ran vet only"
-
-run:
-	CGO_ENABLED=0 go run ./cmd/pigeon
-
-# Run the consumer portal locally. It needs a reachable core and a session secret;
-# sensible local defaults are used when the env is unset.
-run-portal:
-	CGO_ENABLED=0 PIGEON_CORE_API_URL=$${PIGEON_CORE_API_URL:-http://localhost:8080} PORTAL_SESSION_SECRET=$${PORTAL_SESSION_SECRET:-dev-insecure-secret} go run ./cmd/consumer-portal
-
-# Run the producer portal locally. Same shape as run-portal: it needs a reachable
-# core and a session secret; sensible local defaults are used when the env is
-# unset.
-run-producer-portal:
-	CGO_ENABLED=0 PIGEON_CORE_API_URL=$${PIGEON_CORE_API_URL:-http://localhost:8080} PIGEON_PRODUCER_PORTAL_SESSION_SECRET=$${PIGEON_PRODUCER_PORTAL_SESSION_SECRET:-dev-insecure-secret} go run ./cmd/producer-portal
 
 compose-up:
 	docker compose up -d --build
@@ -166,9 +108,8 @@ compose-down:
 	docker compose down
 
 # Migrations are embedded and checksummed; a changed file that already ran is a
-# hard error at boot, and this catches it before a deploy does. It is `test`, so
-# it needs the same disposable Postgres that target requires.
-migrate-check: test
+# hard error at boot, and this catches it before a deploy does.
+migrate-check: test-integration
 
 clean:
 	rm -rf bin
