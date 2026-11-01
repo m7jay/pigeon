@@ -4,6 +4,12 @@ How an agent worker publishes work on `m7jay/pigeon` without a human in the loop
 Every card that changes code follows this file. If a card and this file disagree,
 this file is wrong only after it is changed in a PR.
 
+**The base branch is `master`.** `master` is the line of record for this repo and where
+reviewed changes land; it is what this file means by the default branch. The rule in §3
+names it, and every command here passes it explicitly - an explicit base is a readable
+instruction, not something to infer from whatever the repository's settings happen to say.
+§3 also has the frozen branch.
+
 ## 1. What is provisioned, and where
 
 | Thing | Location | Notes |
@@ -53,14 +59,14 @@ their work. Use a worktree per card:
 ```bash
 cd /opt/data/workspace/projects/pigeon
 git fetch origin
-git worktree add "$HERMES_KANBAN_WORKSPACE/wt" -b wt/<card-id>-<slug> origin/<default-branch>
+git worktree add "$HERMES_KANBAN_WORKSPACE/wt" -b wt/<card-id>-<slug> origin/master
 cd "$HERMES_KANBAN_WORKSPACE/wt"
 ```
 
 **Second and later rounds take the existing branch, not a new one.** The branch outlives
 the worktree - `git worktree remove` deletes the directory, not the ref - so `-b` fails
 with `fatal: a branch named 'wt/<card-id>-<slug>' already exists`, and re-cutting it from
-`origin/<default-branch>` would leave you without the commits under review and make your
+`origin/master` would leave you without the commits under review and make your
 push non-fast-forward. Re-create the worktree on the branch as the remote has it - `-B`
 resets the local ref to `origin/`, so a local ref that lagged (a failed push last round,
 or a push from somewhere else) cannot leave you reviewing a stale base:
@@ -94,13 +100,19 @@ wt/<card-id>-<slug>
 
 Examples: `wt/t_8b5d4ad0-worker-git-docs`, `wt/t_f78a96c3-s0-postgres-evidence`.
 
-Rules: one branch per card, branched from the repo's current default branch
-(`/opt/data/toolchain/gh repo view m7jay/pigeon --json defaultBranchRef` — today
-`feat/m0-skeleton`).
-Never push to `master` or the default branch directly. Never force-push a branch
-under review, and never rewrite one that another person has looked at.
+Rules: one branch per card, branched from `master` - the line of record, and the repo's
+default branch (`/opt/data/toolchain/gh repo view m7jay/pigeon --json defaultBranchRef`).
+Never push to `master` directly. The promotion merge that landed `master` from
+`feat/m0-skeleton` (merge commit `d47f1f74`, tree byte-identical to `feat/m0-skeleton`'s)
+was a one-off maintainer action, not a route a worker may use - workers publish through a
+PR and the review loop (§7). Never force-push a branch under review, and never rewrite one
+that another person has looked at.
 
-**Every slice branches from the default branch - never from another slice's PR
+**`feat/m0-skeleton` is frozen and legacy.** It is the old line, kept only until nothing
+references it, and it will be deleted. Never branch from it, never base a PR on it, never
+merge into it.
+
+**Every slice branches from `master` - never from another slice's PR
 branch.** Stacking looks convenient (the slice needs the previous slice's code) and
 it is a trap: a rebase merge rewrites the parent's commits onto a new base, so the
 child is instantly `CONFLICTING` against a base that no longer exists, and merging
@@ -114,7 +126,7 @@ from its history. Do it by deleting and re-pushing the branch (the command guard
 refuses `git push --force`), then open the replacement PR and say in it why the
 old history was dropped; the new PR gets a new number, because a closed PR cannot
 be reopened against a rewritten head. Scan before pushing:
-`git log -p origin/<default>..HEAD | grep -c <token-prefix>` must print `0`.
+`git log -p origin/master..HEAD | grep -c <token-prefix>` must print `0`.
 
 ## 4. Commits
 
@@ -144,10 +156,15 @@ and never persisted. RLS policy limits reads to the owning producer.
 ```bash
 GH=/opt/data/toolchain/gh
 git push -u origin wt/<card-id>-<slug>      # credential helper supplies the token
-$GH pr create --base <default-branch> \
+$GH pr create --base master \
   --title "feat(api): issue producer API keys (FR-201)" \
   --body-file /tmp/pr-body.md
 ```
+
+**Always pass `--base master`.** Naming the base is part of the command, not something to
+leave to inference or to a UI's default: read the base selector before you submit a PR
+from the web, and if a PR was opened against the wrong base, move it with
+`gh pr edit <n> --base master`.
 
 One open PR per card at a time. The PR body states what changed and any item that needs a human
 decision, plus how the change was verified.
@@ -378,8 +395,8 @@ own.
 §3 forbids rewriting a branch another worker has reviewed, §4's "unless the card asks
 for it" exception stops applying once a verdict names the head, and the force-push
 either would need is refused by the guard (§8). Send it back with `kanban_request_changes`: the
-implementer merges the default branch **into** its own branch
-(`git merge origin/<default-branch>`), resolves, and pushes forward. That resolution is a
+implementer merges `master` **into** its own branch
+(`git merge origin/master`), resolves, and pushes forward. That resolution is a
 merge commit, so the PR head becomes un-rebasable: GitHub forbids `--rebase` merges and
 rejects `--merge`/`--squash`, and `gh pr merge --match-head-commit` refuses it with
 `GraphQL: This branch can't be rebased`. The verdict therefore carries over **by tree
@@ -389,11 +406,11 @@ instead of the dead-end merge:
 
 ```bash
 git checkout -B <branch> <pre-merge-head>   # same tree as the merge-commit head
-git rebase --onto origin/<default> <old-tip-of-this-slice>   # e.g. e90c9615f above
+git rebase --onto origin/master <old-tip-of-this-slice>   # e.g. e90c9615f above
 git push --force-with-lease origin <branch>
 ```
 
-A plain `git rebase origin/<default>` is NOT equivalent when the branch predates a base
+A plain `git rebase origin/master` is NOT equivalent when the branch predates a base
 rewrite: it replays the stale sibling commits and conflicts (reproduced: `CONFLICT
 (add/add) internal/store/ingest_test.go`). The verdict still carries over: the recovered
 head has the same tree as the merge-commit head, so the reviewer does not re-review it —
@@ -413,8 +430,8 @@ left on a PR by a human is invisible to the loop until it is copied into the car
 `kanban_comment` - which is also how a human redirects an in-flight card.
 
 This replaces the earlier "never merge" rule (changed 26 Oct 2026). Nothing changes
-about **where** work lands: a worker still never pushes to `master` or the default
-branch directly, and it still does not merge a PR whose review or CI it has not seen.
+about **where** work lands: a worker still never pushes to `master` directly, and it still
+does not merge a PR whose review or CI it has not seen.
 
 ## 8. What does not work here (measured, not guessed)
 
@@ -459,11 +476,11 @@ branch directly, and it still does not merge a PR whose review or CI it has not 
 | helper prints nothing | `gh` unresolvable inside the git helper | keep the helper path absolute in `.gitconfig` |
 | commits show `Jayachandra` | repo-local `user.name` wins over `~/.gitconfig` | set `GIT_AUTHOR_*`/`GIT_COMMITTER_*` for the command (§6) |
 | `403` on `check-runs` | token has no `checks:read` | expected — verify CI by hand (§5) |
-| an open PR turns `CLOSED` by itself, right after a merge, and cannot be reopened | its `baseRefName` was the branch that merge deleted — GitHub closes children of a deleted base | open a replacement PR from the same head SHA (`gh pr create --base feat/m0-skeleton --head <branch>`); the old PR is dead. Give the child a real base next time (§3), and never delete a branch that is someone's base (§7 step 7) |
+| an open PR turns `CLOSED` by itself, right after a merge, and cannot be reopened | its `baseRefName` was the branch that merge deleted — GitHub closes children of a deleted base | open a replacement PR from the same head SHA (`gh pr create --base master --head <branch>`); the old PR is dead. Give the child a real base next time (§3), and never delete a branch that is someone's base (§7 step 7) |
 | a card sits in `review` for hours and no reviewer process appears | the dispatcher refuses the spawn: `task_events` shows `respawn_guarded` with `reason: blocker_auth` about once a minute | the guard matches `tasks.last_failure_error`, and a run's rate-limit text (`exited rate-limited (quota wall)`) is never cleared by the requeue that follows it, so the stale string blocks every later spawn — clear it with the stdlib driver (there is no `sqlite3` CLI on these hosts, only Python's module): `python3 -c "import sqlite3;c=sqlite3.connect('/opt/data/kanban/boards/pigeon/kanban.db');c.execute('UPDATE tasks SET last_failure_error=NULL, consecutive_failures=0 WHERE id=?',('<card-id>',));c.commit()"`; the dispatcher picks the card up on its next tick |
 | `GraphQL: Head branch was modified` on `pr merge` | `--match-head-commit` found the head was not the SHA you supplied — usually a push landed between your read and the merge, occasionally a stale cached head right after a fast push | Read the head without a checkout: `GH=/opt/data/toolchain/gh; $GH api repos/m7jay/pigeon/git/ref/heads/<branch> --jq .object.sha`. **If it equals the SHA you supplied**, retry the merge once. **If it does not**, stop — the head moved: go back to §7 step 1 and review the new head. Never retry against a SHA that is no longer the head, and never drop `--match-head-commit` to get past the error |
-| `GraphQL: This branch can't be rebased` on `pr merge --rebase` | `--rebase` (`--match-head-commit`) on a PR whose head is a merge commit produced by a DIRTY merge-forward: GitHub disables rebase-merges for heads with two parents, and `--merge`/`--squash` are not allowed here | Use the `--onto` recovery instead of merge-forward: `git checkout -B <branch> <pre-merge-head>`, then `git rebase --onto origin/<default> <old-tip-of-this-slice>`, then `git push --force-with-lease origin <branch>` |
-| CI is red on a test my diff does not touch | the `--- FAIL:` names a package the diff never touches: a flake, not your change | read the failing package out of the log (`gh run view <run-id> --log`, the `FAIL <pkg>` line), prove the diff cannot reach it (`git diff --name-only origin/<default-branch>...HEAD` lists no path under that package), **check the board before you card it** - if a card is *about* that test (its title names the test, or its own diagnosis is that test), `kanban_comment` your failing run id, the head and your measurement onto *that* card instead of filing anything (the command under this table lists the candidates); a card that only mentions the test in passing is not a match. Card the flake to its owner with the failing test and the code path only when no card on the board is about it, and only then push a retry head (a red run cannot be re-run, §8). If the base has moved, merging it into your branch is a legitimate new head (§7 `BEHIND`/`DIRTY`); if it has not, you have no lever at all and say so in the handoff instead of calling the flake a pass. Worked example: `t_1090fb6e` (`internal/attemptbuf` `TestRunRetriesAStuckBatch` failed run 40653425306 at head `b7327759`, on the docs-only PR #27) |
+| `GraphQL: This branch can't be rebased` on `pr merge --rebase` | `--rebase` (`--match-head-commit`) on a PR whose head is a merge commit produced by a DIRTY merge-forward: GitHub disables rebase-merges for heads with two parents, and `--merge`/`--squash` are not allowed here | Use the `--onto` recovery instead of merge-forward: `git checkout -B <branch> <pre-merge-head>`, then `git rebase --onto origin/master <old-tip-of-this-slice>`, then `git push --force-with-lease origin <branch>` |
+| CI is red on a test my diff does not touch | the `--- FAIL:` names a package the diff never touches: a flake, not your change | read the failing package out of the log (`gh run view <run-id> --log`, the `FAIL <pkg>` line), prove the diff cannot reach it (`git diff --name-only origin/master...HEAD` lists no path under that package), **check the board before you card it** - if a card is *about* that test (its title names the test, or its own diagnosis is that test), `kanban_comment` your failing run id, the head and your measurement onto *that* card instead of filing anything (the command under this table lists the candidates); a card that only mentions the test in passing is not a match. Card the flake to its owner with the failing test and the code path only when no card on the board is about it, and only then push a retry head (a red run cannot be re-run, §8). If the base has moved, merging it into your branch is a legitimate new head (§7 `BEHIND`/`DIRTY`); if it has not, you have no lever at all and say so in the handoff instead of calling the flake a pass. Worked example: `t_1090fb6e` (`internal/attemptbuf` `TestRunRetriesAStuckBatch` failed run 40653425306 at head `b7327759`, on the docs-only PR #27) |
 
 **One flake, one card: comment on the existing card, do not file a second.** The check
 above is not a formality. On 28 Oct 2026 `internal/attemptbuf` `TestRunRetriesAStuckBatch`
